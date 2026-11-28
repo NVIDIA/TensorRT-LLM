@@ -106,10 +106,20 @@ def _decode(args, kwargs, requests=None):
 @pytest.mark.parametrize("bucket, real", [(12, 11), (16, 13), (12, 0)])
 def test_the_real_rows_are_bitwise_and_the_padding_rows_zero(bucket, real):
     args, kwargs, requests = _case(bucket, real)
-    scales = [
-        kwargs[k] for k in ("k_block_scale", "v_block_scale", "k_global_scale", "v_global_scale")
-    ]
-    assert lc2_decode.decline_reason(*args, _output(args), ROWS, None, *scales, None) is None
+    assert (
+        lc2_decode.decline_reason(
+            *args,
+            output=_output(args),
+            decode_query_len=ROWS,
+            kv_scale=None,
+            k_block_scale=kwargs["k_block_scale"],
+            v_block_scale=kwargs["v_block_scale"],
+            k_global_scale=kwargs["k_global_scale"],
+            v_global_scale=kwargs["v_global_scale"],
+            num_topk_chunks=None,
+        )
+        is None
+    )
     stock = _decode(args, kwargs)
     skip = _decode(args, kwargs, requests)
     torch.cuda.synchronize()

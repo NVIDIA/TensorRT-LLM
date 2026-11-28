@@ -29,6 +29,7 @@ from unittest.mock import Mock, create_autospec
 import pytest
 import torch
 from safetensors import safe_open
+from test_common.interface_checks import mock_target, verify_instance
 from torch import nn
 from torch._dynamo.backends.common import aot_autograd
 from torch._functorch.aot_autograd import make_boxed_func
@@ -40,8 +41,9 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs, AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3MsaSparseAttention,
     MiniMaxM3SparseRuntimeBackend,
@@ -107,7 +109,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
-from tensorrt_llm._torch.utils import AuxStreamType, EventType
+from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -357,11 +359,6 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
         torch.testing.assert_close(captured, expected)
 
 
-class _M3CompositionGate(nn.Module):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states
-
-
 class _M3CompositionExperts(nn.Module):
     def __init__(self, scheduler_kind: MoESchedulerKind) -> None:
         super().__init__()
@@ -415,25 +412,33 @@ def test_minimax_m3_moe_reduces_only_local_terms(
         "tensorrt_llm._torch.models.modeling_minimaxm3.maybe_execute_in_parallel",
         lambda routed, shared, *_args, **_kwargs: (routed(), shared()),
     )
-    moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
-    nn.Module.__init__(moe)
-    moe.gate = _M3CompositionGate()
-    moe.experts = _M3CompositionExperts(scheduler_kind)
-    moe.shared_experts = _M3CompositionShared()
-    moe.routed_output_is_global = _moe_routed_output_is_global(moe.experts)
-    moe.allreduce = _M3CompositionAllReduce()
-    moe.event_dict = {EventType.Main: None, EventType.MoeShared: None}
-    moe.aux_stream = None
+    allreduce = _M3CompositionAllReduce()
+    monkeypatch.setattr(modeling_minimaxm3, "AllReduce", Mock(return_value=allreduce))
+    monkeypatch.setattr(
+        modeling_minimaxm3, "create_moe", Mock(return_value=_M3CompositionExperts(scheduler_kind))
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_build_swiglu_oai_dense_mlp", Mock(return_value=_M3CompositionShared())
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3.MiniMaxM3Gate, "forward", lambda self, hidden_states: hidden_states
+    )
+    monkeypatch.setattr(torch.cuda, "Event", Mock(return_value=None))
+    moe = MiniMaxM3MoE(
+        model_config=ModelConfig(
+            pretrained_config=_make_text_config(),
+            mapping=Mapping(world_size=2, rank=0, tp_size=2),
+        ),
+        aux_stream_dict={AuxStreamType.MoeShared: None},
+    )
 
     hidden_states = torch.ones((2, 4))
     output = moe(hidden_states, SimpleNamespace(all_rank_num_tokens=None))
 
     torch.testing.assert_close(output, torch.full_like(hidden_states, expected))
-    assert len(moe.allreduce.inputs) == 1
-    torch.testing.assert_close(
-        moe.allreduce.inputs[0], torch.full_like(hidden_states, reduced_input)
-    )
-    assert moe.allreduce.params == [None]
+    assert len(allreduce.inputs) == 1
+    torch.testing.assert_close(allreduce.inputs[0], torch.full_like(hidden_states, reduced_input))
+    assert allreduce.params == [None]
 
 
 @pytest.mark.cpu_only
@@ -534,7 +539,11 @@ def test_validate_sparse_attention_runtime_config_backend_selection(
     if kv_algo is not None:
         model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_algo)
     warning = create_autospec(modeling_minimaxm3.logger.warning_once, spec_set=True)
-    monkeypatch.setattr(modeling_minimaxm3.logger, "warning_once", warning)
+    monkeypatch.setattr(
+        modeling_minimaxm3.logger,
+        "warning_once",
+        (warning),
+    )
 
     if kv_algo == QuantAlgo.NVFP4 and implementation != "msa":
         with pytest.raises(ValueError, match="NVFP4 KV cache requires.*implementation='msa'"):
@@ -680,9 +689,9 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
     residual = torch.tensor([2.0])
 
     output, output_residual = MiniMaxM3DecoderLayer.forward_MoE(
-        layer,
+        (layer),
         hidden_states,
-        SimpleNamespace(),
+        (SimpleNamespace()),
         residual,
         spec_metadata,
     )
@@ -721,7 +730,7 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (metadata, layer),
+        (lambda layer_idx: (metadata, layer)),
     )
     packed = torch.arange(20, dtype=torch.float32).reshape(4, 5)
     position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
@@ -755,7 +764,7 @@ def test_piecewise_projection_fake_preserves_padded_hidden_rows(monkeypatch) -> 
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (metadata, layer),
+        (lambda layer_idx: (metadata, layer)),
     )
     hidden_states = torch.randn(256, 5)
     position_ids = torch.arange(6).reshape(1, 6)
@@ -786,7 +795,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
         qkv_proj=lambda hidden_states: packed,
-        attn=Mock(spec_set=MiniMaxM3SparseRuntimeBackend),  # Non-MSA compatibility path.
+        attn=(Mock(spec_set=MiniMaxM3SparseRuntimeBackend)),  # Non-MSA compatibility path.
         register_to_config=True,
         num_heads=1,
         head_dim=3,
@@ -797,9 +806,13 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (metadata, layer),
+        (lambda layer_idx: (metadata, layer)),
     )
-    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+
+    def _mock_compiling() -> bool:
+        return True
+
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", _mock_compiling)
     monkeypatch.setattr(
         modeling_minimaxm3,
         "maybe_bcg_minimax_m3_attn_custom_op_inplace",
@@ -809,7 +822,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     position_ids = torch.arange(6).reshape(1, 6)
 
     result = MiniMaxM3Attention._sparse_forward(
-        layer,
+        (layer),
         position_ids=position_ids,
         hidden_states=hidden_states,
         attn_metadata=metadata,
@@ -830,7 +843,7 @@ def test_piecewise_captured_producer_preserves_symbolic_shapes(
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (None, layer),
+        (lambda layer_idx: (None, layer)),
     )
     with FakeTensorMode(shape_env=ShapeEnv()) as mode:
         num_tokens = mode.shape_env.create_unbacked_symint()
@@ -884,15 +897,24 @@ def test_piecewise_captures_horizontal_producer_before_attention(
         _forward_attention_core=Mock(return_value=output),
         o_proj=lambda output, all_reduce_params: output,
     )
-    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "is_torch_compiling",
+        (lambda: True),
+    )
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (metadata, layer),
+        (lambda layer_idx: (metadata, layer)),
     )
     hidden = torch.empty((4, 5), dtype=torch.bfloat16)
     positions = torch.arange(4).reshape(1, 4)
-    result = MiniMaxM3Attention._sparse_forward(layer, positions, hidden, metadata)
+    result = MiniMaxM3Attention._sparse_forward(
+        (layer),
+        positions,
+        hidden,
+        (metadata),
+    )
     assert result is output
     layer.qkv_proj.assert_called_once_with(hidden)
     layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
@@ -911,7 +933,9 @@ def test_piecewise_captured_producer_rejects_unavailable_fusion(
         _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=None),
     )
     monkeypatch.setattr(
-        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (None, layer)
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        (lambda _: (None, layer)),
     )
     with pytest.raises(RuntimeError) as exc:
         torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
@@ -962,7 +986,9 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         _fused_fp8_qkv_indexer_norm_rope_kv_insert=producer,
     )
     monkeypatch.setattr(
-        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (None, layer)
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        (lambda _: (None, layer)),
     )
     op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer.default
     assert {
@@ -1085,14 +1111,21 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
     )
-    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "is_torch_compiling",
+        (lambda: True),
+    )
     monkeypatch.setattr(
         modeling_minimaxm3,
         "maybe_execute_in_parallel",
-        lambda first, second, *args, **kwargs: (first(), second()),
+        (lambda first, second, *args, **kwargs: (first(), second())),
     )
     MiniMaxM3Attention._sparse_forward(
-        layer, torch.arange(4).reshape(1, 4), torch.empty((4, 128), dtype=torch.bfloat16), metadata
+        (layer),
+        torch.arange(4).reshape(1, 4),
+        torch.empty((4, 128), dtype=torch.bfloat16),
+        metadata,
     )
     layer._fused_fp8_index_qk_norm_rope.assert_not_called()
     assert layer._fused_qk_norm_rope.call_count == 2
@@ -1174,7 +1207,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (attn_metadata, layer),
+        (lambda layer_idx: (attn_metadata, layer)),
     )
     modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
         q,
@@ -1324,13 +1357,13 @@ def test_attention_dispatch_clips_the_piecewise_token_pad():
     output = torch.full((padded, hidden), float("nan"))
 
     _dispatch_attention_over_live_tokens(
-        attn_layer,
+        (attn_layer),
         q,
         q,
         q,
         None,
         None,
-        SimpleNamespace(num_tokens=live),
+        (SimpleNamespace(num_tokens=live)),
         output,
     )
 
@@ -1350,13 +1383,13 @@ def test_attention_dispatch_leaves_an_unpadded_step_alone():
 
     output = torch.full((5, 8), float("nan"))
     _dispatch_attention_over_live_tokens(
-        SimpleNamespace(_dispatch_attention_backend=capture),
+        (SimpleNamespace(_dispatch_attention_backend=capture)),
         torch.ones((5, 8)),
         None,
         None,
         None,
         None,
-        SimpleNamespace(num_tokens=5),
+        (SimpleNamespace(num_tokens=5)),
         output,
     )
 
@@ -1927,11 +1960,26 @@ def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
         )
         kv_world = min(tp_size, 4)
         kv_rank = tp_rank // max(tp_size // 4, 1)
-        assert shard_geometry(module, "q") == (tp_size, tp_rank)
-        assert shard_geometry(module, "k") == (kv_world, kv_rank)
-        assert shard_geometry(module, "v") == (kv_world, kv_rank)
-        assert shard_geometry(module, "index_q") == (kv_world, kv_rank)
-        assert shard_geometry(module, "index_k") == (1, 0)
+        assert shard_geometry(
+            (module),
+            "q",
+        ) == (tp_size, tp_rank)
+        assert shard_geometry(
+            (module),
+            "k",
+        ) == (kv_world, kv_rank)
+        assert shard_geometry(
+            (module),
+            "v",
+        ) == (kv_world, kv_rank)
+        assert shard_geometry(
+            (module),
+            "index_q",
+        ) == (kv_world, kv_rank)
+        assert shard_geometry(
+            (module),
+            "index_k",
+        ) == (1, 0)
 
 
 @pytest.mark.cpu_only
@@ -2102,7 +2150,11 @@ def test_minimax_m3_unfused_index_projection_tp_construction(
 
     # Simulate each rank on one GPU without creating distributed workspaces.
     # No forward runs here; projection construction and shard sizing stay real.
-    monkeypatch.setattr(distributed, "AllReduce", lambda **_kwargs: nn.Identity())
+    monkeypatch.setattr(
+        distributed,
+        "AllReduce",
+        (lambda **_kwargs: nn.Identity()),
+    )
     for rank in range(tp_size):
         text_cfg, model_cfg = _make_attention_test_config()
         text_cfg.hidden_size = 256
@@ -2375,7 +2427,7 @@ def test_horizontal_producer_explicit_caches_match_manager(
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda _: (metadata, layer),
+        (lambda _: (metadata, layer)),
     )
     op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer
     args = (packed, positions, main, index, explicit_scales, slots, "3")
@@ -2689,7 +2741,7 @@ def test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons() -> None:
         attn._fused_fp8_index_qk_norm_rope(
             torch.empty(1, 640, dtype=torch.bfloat16),
             torch.zeros(1, dtype=torch.int32),
-            SimpleNamespace(),
+            (SimpleNamespace()),
         )
 
 
@@ -2932,7 +2984,11 @@ def test_minimax_m3_fused_routing_matches_reference(
     monkeypatch.setattr(
         MiniMaxM2MoeRoutingMethod,
         "apply",
-        lambda *_args, **_kwargs: pytest.fail("production FP32 routing used the PyTorch fallback"),
+        (
+            lambda *_args, **_kwargs: pytest.fail(
+                "production FP32 routing used the PyTorch fallback"
+            )
+        ),
     )
     fused_idx, fused_weights = fused.apply(logits)
 
@@ -3392,27 +3448,51 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 def test_minimax_m3_dense_backend_library_order(
     monkeypatch, libraries, available, extra_pages_only, use_native
 ):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from tensorrt_llm._torch.models import modeling_minimaxm3 as model_module
+    from tensorrt_llm.bindings import DataType
 
     monkeypatch.setenv("TLLM_FMHA_LIBS", libraries)
     legacy = object()
-    native = SimpleNamespace(support_fused_qkv=lambda: True)
-    construct = Mock(return_value=native)
-    monkeypatch.setattr(model_module, "TrtllmAttention", construct)
+    native = verify_instance(
+        SimpleNamespace(
+            skip_correction_threshold=0.0,
+            support_fused_qkv=TrtllmAttention.support_fused_qkv,
+        ),
+        "tensorrt_llm._torch.attention.backends.trtllm:TrtllmAttention",
+        members=("skip_correction_threshold", "support_fused_qkv"),
+    )
+    construct = create_autospec(TrtllmAttention, return_value=native)
+    monkeypatch.setattr(modeling_minimaxm3, "TrtllmAttention", construct)
+
+    @mock_target(
+        "tensorrt_llm._torch.models.modeling_minimaxm3:FlashInferTrtllmGenFmha.is_environment_available"
+    )
+    @classmethod
+    def is_environment_available(cls) -> bool:
+        return available
+
     monkeypatch.setattr(
-        model_module.FlashInferTrtllmGenFmha,
+        modeling_minimaxm3.FlashInferTrtllmGenFmha,
         "is_environment_available",
-        classmethod(lambda cls: available),
+        is_environment_available,
+    )
+
+    @mock_target(
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen:FlashInferTrtllmGenFmha._is_available"
+    )
+    @classmethod
+    def _is_available(cls, attn: TrtllmAttention) -> bool:
+        return available
+
+    monkeypatch.setattr(
+        modeling_minimaxm3.FlashInferTrtllmGenFmha,
+        "_is_available",
+        _is_available,
     )
     monkeypatch.setattr(
-        model_module.FlashInferTrtllmGenFmha,
-        "is_available",
-        classmethod(lambda cls, attn: available),
+        modeling_minimaxm3,
+        "get_sm_version",
+        (lambda: 107 if extra_pages_only else 100),
     )
-    monkeypatch.setattr(model_module, "get_sm_version", lambda: 107 if extra_pages_only else 100)
     layer = SimpleNamespace(
         attn=legacy,
         layer_idx=0,
@@ -3426,7 +3506,8 @@ def test_minimax_m3_dense_backend_library_order(
         main_kv_is_nvfp4=False,
     )
     MiniMaxM3Attention._init_native_dense_attention(
-        layer, SimpleNamespace(skip_create_weights_in_init=True)
+        (layer),
+        ModelConfig(skip_create_weights_in_init=True, sparse_attention_config=None),
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
@@ -3445,19 +3526,14 @@ def test_minimax_m3_dense_backend_library_order(
         layer.main_kv_is_fp8, layer.main_kv_is_nvfp4 = fp8, nvfp4
         construct.reset_mock()
         MiniMaxM3Attention._init_native_dense_attention(
-            layer, SimpleNamespace(skip_create_weights_in_init=True)
+            (layer),
+            ModelConfig(skip_create_weights_in_init=True, sparse_attention_config=None),
         )
         assert layer.attn is legacy
         construct.assert_not_called()
     layer.main_kv_is_fp8 = layer.main_kv_is_nvfp4 = False
 
-    from tensorrt_llm._torch.attention.backends.trtllm import (
-        TrtllmAttention,
-        TrtllmAttentionMetadata,
-    )
-    from tensorrt_llm.bindings import DataType
-
-    # Exercise the real native forward; only the final FMHA kernel is mocked.
+    # Exercise native forward up to FMHA selection and execution.
     backend = TrtllmAttention.__new__(TrtllmAttention)
     backend.sparse_params = None
     backend.is_mla_enable = False
@@ -3469,62 +3545,158 @@ def test_minimax_m3_dense_backend_library_order(
     backend.kv_scale_orig_quant = None
     backend.kv_scale_quant_orig = None
     backend.print_skip_softmax_stat = False
-    backend._ensure_rope_table_size = lambda *args: None
-    kernel = Mock(supports_workspace_reclamation=True)
-    select = Mock(return_value=kernel)
-    backend._fmha_manager = SimpleNamespace(select=select)
-    layer.attn = backend
-    layer.is_sparse_attention_layer = False
+    backend._ensure_rope_table_size = mock_target(
+        "tensorrt_llm._torch.attention.backends.trtllm:TrtllmAttention._ensure_rope_table_size",
+        bound=True,
+    )(lambda required_max_positions: None)
 
-    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    attn_metadata = object.__new__(TrtllmAttentionMetadata)
     lengths = torch.tensor([2], dtype=torch.int32)
-    metadata._seq_lens = metadata._seq_lens_kv = lengths
-    metadata.kv_lens_runtime = metadata.kv_lens_cuda_runtime = lengths
-    metadata.prompt_lens_cuda_runtime = metadata.prompt_lens_cpu_runtime = lengths
-    metadata.host_request_types_runtime = torch.zeros(1, dtype=torch.int32)
-    metadata.cu_q_seqlens = metadata.cu_kv_seqlens = torch.tensor([0, 2], dtype=torch.int32)
-    metadata.num_contexts = 1
-    metadata.num_generations = 0
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
-    metadata.max_context_q_len_override = None
-    metadata.kv_cache_manager = SimpleNamespace(
+    attn_metadata._seq_lens = attn_metadata._seq_lens_kv = lengths
+    attn_metadata.kv_lens_runtime = attn_metadata.kv_lens_cuda_runtime = lengths
+    attn_metadata.prompt_lens_cuda_runtime = attn_metadata.prompt_lens_cpu_runtime = lengths
+    attn_metadata.host_request_types_runtime = torch.zeros(1, dtype=torch.int32)
+    attn_metadata.cu_q_seqlens = attn_metadata.cu_kv_seqlens = torch.tensor(
+        [0, 2], dtype=torch.int32
+    )
+    attn_metadata.num_contexts = 1
+    attn_metadata.num_generations = 0
+    attn_metadata.enable_flash_mla = False
+    attn_metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    attn_metadata.spec_decoding_bl_tree_mask = None
+    attn_metadata.max_context_q_len_override = None
+    attn_metadata.kv_cache_manager = SimpleNamespace(
         dtype=DataType.BF16, max_attention_window_vec=[128], max_seq_len=128
     )
-    q = torch.randn(2, layer.num_heads * layer.head_dim)
-    k = torch.randn(2, layer.num_key_value_heads * layer.head_dim)
+    verify_instance(
+        attn_metadata,
+        "tensorrt_llm._torch.attention.backends.trtllm:TrtllmAttentionMetadata",
+        members=(
+            "_seq_lens",
+            "_seq_lens_kv",
+            "kv_lens_runtime",
+            "kv_lens_cuda_runtime",
+            "prompt_lens_cuda_runtime",
+            "prompt_lens_cpu_runtime",
+            "host_request_types_runtime",
+            "cu_q_seqlens",
+            "cu_kv_seqlens",
+            "num_contexts",
+            "num_generations",
+            "enable_flash_mla",
+            "spec_bl_tree_first_sparse_mask_offset_kv",
+            "spec_decoding_bl_tree_mask",
+            "max_context_q_len_override",
+            "kv_cache_manager",
+        ),
+    )
+    query = torch.randn(2, layer.num_heads * layer.head_dim, dtype=torch.bfloat16)
+    k = torch.randn(2, layer.num_key_value_heads * layer.head_dim, dtype=query.dtype)
     v = torch.randn_like(k)
-    output = torch.full_like(q, 19)
+    output = torch.full_like(query, 19)
 
-    def check_forward(packed, unused_k, unused_v, meta, args):
-        assert meta is metadata
-        assert unused_k is unused_v is None
-        assert args.is_fused_qkv and args.update_kv_cache
-        assert args.output is output
-        torch.testing.assert_close(packed, torch.cat((q, k, v), dim=-1))
-        args.output.copy_(q)
+    expected_qkv = torch.cat((query, k, v), dim=-1)
 
-    kernel.forward.side_effect = check_forward
+    @mock_target(
+        "tensorrt_llm._torch.attention.backends.fmha.phased:PhasedFmha.forward", bound=True
+    )
+    def check_forward(
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        assert metadata is attn_metadata
+        assert k is v is None
+        assert forward_args.is_fused_qkv and forward_args.update_kv_cache
+        assert forward_args.output is output
+        torch.testing.assert_close(q, expected_qkv)
+        forward_args.output.copy_(query)
+
+    kernel = Mock()
+    kernel.forward = Mock(side_effect=check_forward)
+    kernel.supports_workspace_reclamation = (
+        modeling_minimaxm3.FlashInferTrtllmGenFmha.supports_workspace_reclamation
+    )
+    verify_instance(
+        kernel,
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen:FlashInferTrtllmGenFmha",
+        members=("forward", "supports_workspace_reclamation"),
+    )
+
+    @mock_target(
+        "tensorrt_llm._torch.attention.backends.fmha.manager:FmhaManager.select", bound=True
+    )
+    def select_fmha(
+        attn: TrtllmAttention,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Fmha:
+        return kernel
+
+    select = Mock(side_effect=select_fmha)
+    backend._fmha_manager = verify_instance(
+        SimpleNamespace(select=select),
+        "tensorrt_llm._torch.attention.backends.fmha.manager:FmhaManager",
+        members=("select",),
+    )
+    verify_instance(
+        backend,
+        "tensorrt_llm._torch.attention.backends.trtllm:TrtllmAttention",
+        members=(
+            "sparse_params",
+            "is_mla_enable",
+            "num_heads",
+            "num_kv_heads",
+            "head_dim",
+            "layer_idx",
+            "local_layer_idx",
+            "kv_scale_orig_quant",
+            "kv_scale_quant_orig",
+            "print_skip_softmax_stat",
+            "_ensure_rope_table_size",
+            "_fmha_manager",
+        ),
+    )
+    layer.attn = backend
+    layer.is_sparse_attention_layer = False
     result = MiniMaxM3Attention._dispatch_attention_backend(
-        layer, q, k, v, None, None, metadata, output
+        (layer),
+        query,
+        k,
+        v,
+        None,
+        None,
+        attn_metadata,
+        output,
     )
     assert result is output
-    torch.testing.assert_close(output, q)
+    torch.testing.assert_close(output, query)
     kernel.forward.assert_called_once()
     select.assert_called_once()
 
     # Reject a mismatched manager before invoking native attention or writing output.
     for dtype in (DataType.FP8, DataType.NVFP4):
-        metadata.kv_cache_manager.dtype = dtype
+        attn_metadata.kv_cache_manager.dtype = dtype
         with pytest.raises(
             ValueError, match="model quantization config and KV cache manager disagree"
         ):
             MiniMaxM3Attention._dispatch_attention_backend(
-                layer, q, k, v, None, None, metadata, output
+                (layer),
+                query,
+                k,
+                v,
+                None,
+                None,
+                attn_metadata,
+                output,
             )
     kernel.forward.assert_called_once()
-    torch.testing.assert_close(output, q)
+    torch.testing.assert_close(output, query)
 
 
 # ---------------------------------------------------------------------------
@@ -3568,7 +3740,11 @@ def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
     import tensorrt_llm._torch.distributed as distributed
 
     # Simulate each rank on one GPU; COLUMN projections need no collective.
-    monkeypatch.setattr(distributed, "AllReduce", lambda **_kwargs: nn.Identity())
+    monkeypatch.setattr(
+        distributed,
+        "AllReduce",
+        (lambda **_kwargs: nn.Identity()),
+    )
     torch.manual_seed(0)
     hidden, index_dim, index_heads, tp_size = 256, 32, 4, 4
     head_exponents = torch.tensor([127, 123, 130, 125], dtype=torch.int32)
@@ -3855,11 +4031,15 @@ def _stub_minimax_m3_attention_construction(
         return projection
 
     monkeypatch.setattr(modeling_minimaxm3.Attention, "__init__", initialize_attention)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda: None)
-    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "Stream", (lambda: None))
+    monkeypatch.setattr(torch.cuda, "Event", (lambda: None))
+    monkeypatch.setattr(torch.cuda, "current_device", (lambda: 0))
     projection_factory = Mock(side_effect=make_linear)
-    monkeypatch.setattr(modeling_minimaxm3, "Linear", projection_factory)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "Linear",
+        (projection_factory),
+    )
     return projection_factory
 
 
@@ -3975,7 +4155,14 @@ def test_minimax_m3_sdpa_dense_decode_matches_repeat_interleave_reference(num_kv
     )
     output = torch.empty(batch, num_heads * head_dim, device=device, dtype=dtype)
 
-    MiniMaxM3Attention._sdpa_dense_attention_core(layer, q, k_new, v_new, attn_metadata, output)
+    MiniMaxM3Attention._sdpa_dense_attention_core(
+        (layer),
+        q,
+        k_new,
+        v_new,
+        (attn_metadata),
+        output,
+    )
 
     ref = _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim)
     torch.testing.assert_close(output.float(), ref, atol=2e-2, rtol=2e-2)

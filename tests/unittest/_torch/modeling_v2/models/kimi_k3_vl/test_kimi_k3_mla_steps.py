@@ -61,8 +61,8 @@ def test_breakable_graph_matches_eager(layer):
     """Fresh prefill, chunked prefill over a cached prefix and a mixed step, each captured in a breakable CUDA graph
     and replayed: the output and the cache are the eager step's, bit for bit."""
     lens = [0] * ms.NUM_REQUESTS
-    for make in (ms.fresh_prefill, lambda _: ms.prefix_step(), ms.mixed):
-        s = make(lens) if make is not ms.fresh_prefill else make()
+    for make in (lambda _: ms.fresh_prefill(), lambda _: ms.prefix_step(), ms.mixed):
+        s = make(lens)
         hidden = layer.hidden(s)
         eager, pool_e, graph, pool_g = _both(
             layer, lambda: layer.run(s, hidden), lambda: layer.run_breakable_graph(s, hidden)

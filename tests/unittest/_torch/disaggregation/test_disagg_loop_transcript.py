@@ -22,10 +22,12 @@ belong to executed-batch and lifecycle transcripts, which do not exist yet.
 import inspect
 import queue
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
@@ -40,7 +42,7 @@ from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorRequestRegistry,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ScheduledRequests,
@@ -115,6 +117,13 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
         monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
 
     executor = object.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.dense_dwdp_manager = None
+    verify_instance(
+        executor,
+        "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+        members=("model_engine", "dense_dwdp_manager"),
+    )
     executor._reset_scheduler_failure_state()
     executor._disagg_coordinator = _recording_coordinator(calls)
     executor._flush_pending_transfer_responses = lambda **kwargs: calls.append(
@@ -142,7 +151,6 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.enable_early_first_token_response = False
     executor.drafter = None
     executor.capturable_guided_decoder = None
-    executor.model_engine = None
     executor.previous_batch = None
     executor.active_requests = []
     executor.canceled_req_ids = []
@@ -333,6 +341,13 @@ def test_kv_pool_rebalance_flushes_deferred_closes_before_adjust(defer: bool) ->
     """adjust() moves pages, so a deferred close must not hold any: the rebalance closes them before it suspends
     the active requests and adjusts."""
     executor = object.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.dense_dwdp_manager = None
+    verify_instance(
+        executor,
+        "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+        members=("model_engine", "dense_dwdp_manager"),
+    )
     executor._reset_scheduler_failure_state()
     executor._defer_generation_only_release = defer
     manager = Mock()
@@ -401,7 +416,7 @@ def test_overlap_close_out_stats_wait_for_a_deferred_previous_batch(
     executor._maybe_emit_quiescent_stats = Mock()
     deferred = previous_batch == "deferred"
     if deferred:
-        executor.previous_batch = SimpleNamespace(
+        executor.previous_batch = BatchState(
             scheduled_requests=ScheduledRequests(), sample_state=Mock()
         )
     executor._can_queue.return_value = (False, deferred)
@@ -421,6 +436,24 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
     monkeypatch, states: tuple[str, str]
 ) -> None:
     """Buffered V2 events occupy the same collective slot despite rank-local batch state."""
+
+    def make_previous_batch() -> BatchState:
+        return BatchState(scheduled_requests=ScheduledRequests(), sample_state=Mock())
+
+    def make_cache_manager(rank: int, gather: Callable[[list], list]) -> KVCacheManagerV2:
+        manager = object.__new__(KVCacheManagerV2)
+        manager.is_estimating_kv_cache = False
+        manager.kv_connector_manager = None
+        verify_instance(
+            manager,
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2",
+            members=("is_estimating_kv_cache", "kv_connector_manager"),
+        )
+        manager.event_manager = KVCacheEventManager(
+            max_kv_event_entries=8, attention_dp_rank=rank, attention_dp_gather=gather
+        )
+        return manager
+
     transcripts = []
     for rank, state in enumerate(states):
         calls = []
@@ -431,10 +464,7 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
             gathered_events.append(list(local_events))
             return [local_events, []] if rank == 0 else [[], local_events]
 
-        manager = object.__new__(KVCacheManagerV2)
-        manager.event_manager = KVCacheEventManager(
-            max_kv_event_entries=8, attention_dp_rank=rank, attention_dp_gather=gather
-        )
+        manager = make_cache_manager(rank, gather)
         executor = _idle_executor(monkeypatch, calls)
         executor.enable_attention_dp = True
         executor.enable_kv_cache_events = True
@@ -475,12 +505,7 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
         executor._handle_responses = handle_responses
         executor.resource_manager.update_resources.side_effect = update_resources
         if state != "absent":
-            executor.previous_batch = SimpleNamespace(
-                scheduled_requests=ScheduledRequests(),
-                sample_state=Mock(),
-                guided_batch_id=None,
-                guided_failures=None,
-            )
+            executor.previous_batch = make_previous_batch()
         # A locally ready rank defers its previous batch while a peer cannot queue.
         executor._can_queue.return_value = (False, state == "deferred")
 

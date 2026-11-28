@@ -39,6 +39,7 @@ Dependencies: a TensorRT-LLM build for sm_103. No model files.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import os
 import types
 from pathlib import Path
@@ -50,7 +51,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
 try:
-    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+    builtin_beam = importlib.import_module("tensorrt_llm._torch.models.modeling_beam")
 except ModuleNotFoundError as exc:
     if exc.name != "tensorrt_llm._torch.models.modeling_beam":
         raise

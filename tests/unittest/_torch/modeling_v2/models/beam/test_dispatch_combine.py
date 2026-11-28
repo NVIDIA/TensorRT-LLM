@@ -198,7 +198,8 @@ def test_rejects_provider_outputs_outside_the_contract(
 
 
 def test_wrapper_matches_source_combination(experts: cases.AffineExperts) -> None:
-    out, _, gold = run_checked(*cases.matrix_case(17, 129), experts)
+    x, ids, w = cases.matrix_case(17, 129)
+    out, _, gold = run_checked(x, ids, w, experts)
     assert cases.bitwise_equal(out, gold["output"])
 
 

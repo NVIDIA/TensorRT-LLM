@@ -55,6 +55,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.pyexecutor import _util as util_module
 from tensorrt_llm._torch.pyexecutor import seq_slot_manager as seq_slot_manager_module
@@ -313,6 +314,16 @@ def test_v2_beam_search_keeps_overlap_headroom(max_beam_width: int) -> None:
     assert seats == 2 * max_batch_size
 
 
+def _new_cache_creator() -> KvCacheCreator:
+    creator = object.__new__(KvCacheCreator)
+    creator._cache_transceiver_config = None
+    return verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
+
+
 @pytest.mark.parametrize(
     "max_beam_width,has_kv_connector,enable_sleep",
     [
@@ -346,7 +357,7 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
         pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"], num_hidden_layers=2),
         sparse_attention_config=None,
     )
-    creator = object.__new__(KvCacheCreator)
+    creator = _new_cache_creator()
     creator._max_beam_width = max_beam_width
     creator._kv_connector_manager = object() if has_kv_connector else None
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
@@ -385,12 +396,11 @@ def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
         ),
         sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0),
     )
-    creator = object.__new__(KvCacheCreator)
+    creator = _new_cache_creator()
     creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
     creator._kv_cache_config = kv_cache_config
     creator._max_beam_width = max_beam_width
     creator._is_disagg = False
-    creator._cache_transceiver_config = None
     creator._speculative_config = None
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
 
@@ -410,7 +420,7 @@ def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sl
         pretrained_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
         sparse_attention_config=SimpleNamespace(algorithm="dsa"),
     )
-    creator = object.__new__(KvCacheCreator)
+    creator = _new_cache_creator()
     creator._max_beam_width = max_beam_width
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
 
@@ -436,7 +446,7 @@ def test_v2_fp4_mla_beam_compatibility(max_beam_width: int, mla: bool, fp4_kv_ca
             quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: fp4_kv_cache)
         ),
     )
-    creator = object.__new__(KvCacheCreator)
+    creator = _new_cache_creator()
     creator._max_beam_width = max_beam_width
     creator._llm_args = SimpleNamespace(sleep_config=None)
 
@@ -469,7 +479,7 @@ def test_resolved_v2_respects_an_explicit_v1_request():
     [{"policy": "per_conversation"}, {"swa_endpoint_rewind_tokens": 32}],
 )
 def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
-    creator = object.__new__(KvCacheCreator)
+    creator = _new_cache_creator()
     creator._max_beam_width = 1
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
     model_config = SimpleNamespace(
@@ -843,7 +853,7 @@ def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
 
 def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) -> KvCacheCreator:
     """Minimal creator whose only job is to reach _create_kv_cache_manager."""
-    c = object.__new__(KvCacheCreator)
+    c = _new_cache_creator()
     c._mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
     c._kv_cache_config = Mock()
     c._tokens_per_block = 32
@@ -1092,7 +1102,7 @@ def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_he
     seats = compute_max_num_sequences(
         mapping, max_batch_size, False, enable_overlap_headroom=enable_overlap_headroom
     )
-    creator = KvCacheCreator.__new__(KvCacheCreator)
+    creator = _new_cache_creator()
     creator._mapping = mapping
     creator._max_batch_size = max_batch_size
     creator._llm_args = SimpleNamespace(disable_overlap_scheduler=False)

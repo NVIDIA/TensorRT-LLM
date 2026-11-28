@@ -44,7 +44,7 @@ def _gen(*key: int) -> torch.Generator:
     return torch.Generator(device="cuda").manual_seed(seed % (2**62))
 
 
-def _inputs(rows: int, src: int, salt: int) -> tuple:
+def _inputs(rows: int, src: int, salt: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rank `src`'s rows and routing: bf16 rows, ten distinct experts a row, softmax weights."""
     g = _gen(salt, src)
     x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
@@ -119,7 +119,8 @@ def check_graph() -> None:
         (c for c in _cells() if len(set(c.spec["counts"])) == 1), key=lambda c: c.spec["counts"][0]
     )
     counts = list(cell.spec["counts"])
-    static = [t.clone() for t in _inputs(counts[RANK], RANK, 50)]
+    x, ids, weights = (t.clone() for t in _inputs(counts[RANK], RANK, 50))
+    static = (x, ids, weights)
     _round_trip(*static, counts)  # eager first: the graph replays what the warm call set up
     torch.cuda.synchronize()
     MPI_RANK.barrier()

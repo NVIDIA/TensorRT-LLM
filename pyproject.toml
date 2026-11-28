@@ -937,6 +937,8 @@ ignore-missing-imports = [
 [tool.pyrefly.errors]
 parse-error = "error"
 missing-import = "error"
+missing-module-attribute = "error"
+missing-attribute = "error"
 unknown-name = "error"
 unbound-name = "error"
 bad-argument-count = "error"

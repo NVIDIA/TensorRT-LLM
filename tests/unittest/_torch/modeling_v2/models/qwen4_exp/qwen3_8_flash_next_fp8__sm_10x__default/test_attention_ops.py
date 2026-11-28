@@ -977,7 +977,9 @@ def _check_decode_prologue(cell, monkeypatch) -> None:
     _pro_check(got, want)
 
 
-def _plan_operands(spec, g):
+def _plan_operands(
+    spec, g
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n, p = spec["requests"], spec["rows_per_request"]
     kind = spec["kind"]
     if kind == "equal":
@@ -1004,7 +1006,9 @@ def _check_index_split_plan(cell, monkeypatch) -> None:
     n, p, world, rank = sp["requests"], sp["rows_per_request"], sp["world"], sp["rank"]
     g = torch.Generator().manual_seed(_seed(cell.why))
 
-    def check(got, vectors):
+    def check(
+        got, vectors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         want = index_split_plan.reference(*vectors, n, p, world, rank)
         for a, b in zip(got, want):
             assert a.dtype == b.dtype and torch.equal(a, b)
@@ -1020,7 +1024,8 @@ def _check_index_split_plan(cell, monkeypatch) -> None:
 
     vectors = _plan_operands(sp, g)
     check(index_split_plan(*vectors, n, p, world, rank), vectors)
-    s_vec, fresh = tuple(v.clone() for v in vectors), _plan_operands(sp, g)
+    visible, req_idx, logical, seq_lens, row_starts = (v.clone() for v in vectors)
+    s_vec, fresh = (visible, req_idx, logical, seq_lens, row_starts), _plan_operands(sp, g)
     out = _captured(
         lambda: index_split_plan(*s_vec, n, p, world, rank),
         lambda: [a.copy_(b) for a, b in zip(s_vec, fresh)],
@@ -2008,6 +2013,7 @@ def _prl_site(monkeypatch, built, prologue, site):
     over the built pools, restored after, with the fused prologue on or off."""
     core, L, x, qsa, pools, p = built
     saved = [t.clone() for t in pools]
+    out = scratch = gate = iq = None
     calls, entry = [], M.qwen4_exp_attn_decode_prologue
 
     def counted(*args, **kwargs):
@@ -2327,11 +2333,29 @@ def test_a_magnitude_past_the_e4m3_maximum_is_reported_once(monkeypatch, peak) -
 
 def test_the_probe_runs_only_when_asked_over_an_fp8_pool() -> None:
     core = SimpleNamespace(quant_mode=M.QM_FP8_KV_CACHE, attn_layers=[3, 7, PROBE_LAST])
-    assert M._KvRangeProbe.for_target(core, True)._last == PROBE_LAST
-    assert M._KvRangeProbe.for_target(core, False) is None
+    assert (
+        M._KvRangeProbe.for_target(
+            core,
+            True,
+        )._last
+        == PROBE_LAST
+    )
+    assert (
+        M._KvRangeProbe.for_target(
+            core,
+            False,
+        )
+        is None
+    )
     for quant_mode in (0, M.QM_NVFP4_KV_CACHE):
         other = SimpleNamespace(quant_mode=quant_mode, attn_layers=core.attn_layers)
-        assert M._KvRangeProbe.for_target(other, True) is None
+        assert (
+            M._KvRangeProbe.for_target(
+                other,
+                True,
+            )
+            is None
+        )
 
 
 def test_observing_under_capture_reads_nothing(monkeypatch) -> None:

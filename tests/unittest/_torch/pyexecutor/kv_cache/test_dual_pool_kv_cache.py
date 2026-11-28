@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from test_common.interface_checks import verify_instance
 from transformers import PretrainedConfig, WhisperConfig
 
 import tensorrt_llm
@@ -171,6 +172,11 @@ def _make_creator(
     creator._llm_args = llm_args
     creator._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
     creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._speculative_config = None
     creator._sparse_attention_config = None
     creator._tokens_per_block = 64
@@ -1038,6 +1044,13 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
         mgr.can_share_inflight_prefix = False
         mgr.max_beam_width = 1
+        mgr.is_estimating_kv_cache = False
+        mgr.kv_connector_manager = None
+        verify_instance(
+            mgr,
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2",
+            members=("is_estimating_kv_cache", "kv_connector_manager"),
+        )
         return mgr
 
     def test_default_cross_is_none(self):
@@ -1325,6 +1338,8 @@ class TestCrossCacheV2Lifecycle:
 
         cache.resize.side_effect = resize
         manager = object.__new__(KVCacheManagerV2)
+        manager.kv_connector_manager = None
+        manager.is_estimating_kv_cache = False
         manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
         manager.kv_cache_map = {1: cache}
         manager.enable_block_reuse = False

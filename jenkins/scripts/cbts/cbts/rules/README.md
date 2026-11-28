@@ -554,6 +554,7 @@ including at the repository root or under `scripts/` and `jenkins/`.
 | `scripts/bandit.yaml`, `jenkins/license_cpp.json` | External checks |
 | `legacy-files.txt`, `ruff-legacy.toml`, `ruff-legacy-baseline.json` | Legacy lint configuration |
 | `scripts/templates/precommit-legacy-files.j2`, `scripts/templates/pyproject-format-exclude.j2`, `scripts/templates/ruff-legacy.toml.j2` | Lint configuration templates |
+| `scripts/check_mock_interfaces.py`, `tests/test_common/interface_checks.py`, `tests/test_common/interface_checks.md` | Advisory mock-interface checks and documentation |
 
 `OUT_OF_SCOPE_PREFIXES` covers the complete root directories
 `.github/ISSUE_TEMPLATE/`, `.codex/`, `.claude/`, and `skills/`, including new

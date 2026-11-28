@@ -201,8 +201,16 @@ def lightweight_backbone(monkeypatch: pytest.MonkeyPatch) -> None:
             self.model.norm = nn.LayerNorm(32)
             self.lm_head = nn.Linear(32, 16, bias=False)
 
-    monkeypatch.setattr(dflash, "get_model_architecture", lambda config: (Backbone, None))
-    monkeypatch.setattr(dflash, "get_dflash_flash_attention", lambda: None)
+    monkeypatch.setattr(
+        dflash,
+        "get_model_architecture",
+        (lambda config: (Backbone, None)),
+    )
+    monkeypatch.setattr(
+        dflash,
+        "get_dflash_flash_attention",
+        (lambda: None),
+    )
 
 
 def _draft_config() -> ModelConfig:
@@ -432,7 +440,8 @@ def test_laguna_for_causal_lm_forward() -> None:
         torch.manual_seed(42)
         reference = (
             HFQwen3ForCausalLM(Qwen3Config(**settings))
-            .to(device="cuda", dtype=torch.bfloat16)
+            # Transformers wraps .to with functools.wraps; Pyrefly loses its bound self.
+            .to(device="cuda", dtype=torch.bfloat16)  # pyrefly: ignore [missing-argument]
             .eval()
         )
         model = (

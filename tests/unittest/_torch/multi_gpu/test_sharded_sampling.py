@@ -184,20 +184,25 @@ def _run(tp_size: int) -> bool:
         def accept(model, hidden, draft):
             num_gens = draft.shape[0]
             attn_metadata = types.SimpleNamespace(num_seqs=num_gens, num_contexts=0)
-            spec_metadata = types.SimpleNamespace(
+            spec_metadata = SpecMetadata(
+                max_num_requests=num_gens,
+                max_draft_len=DRAFT_LEN,
+                max_total_draft_tokens=DRAFT_LEN,
                 runtime_draft_len=DRAFT_LEN,
                 draft_tokens=draft.reshape(-1),
                 gather_ids=torch.arange(hidden.shape[0], device="cuda"),
                 is_all_greedy_sample=True,
                 is_all_temperature_only=False,
                 use_rejection_sampling=False,
-                is_ragged_verify=False,
                 enable_penalty=False,
                 is_cuda_graph=False,
                 skip_verify_row_gather=False,
             )
             logits, vocab_sharded = SpecDecOneEngineForCausalLM._verify_logits(
-                model, hidden, attn_metadata, spec_metadata
+                model,
+                hidden,
+                (attn_metadata),
+                spec_metadata,
             )
             assert vocab_sharded == (model is sharded)
             return model.spec_worker._fused_accept(
@@ -283,7 +288,10 @@ def _check_temperature_only(mapping, head, norm, processor, worker):
         spec_metadata.draft_tokens = draft.reshape(-1)
         spec_metadata.gather_ids = torch.arange(hidden.shape[0], device="cuda")
         logits, vocab_sharded = SpecDecOneEngineForCausalLM._verify_logits(
-            model, hidden, attn_metadata, spec_metadata
+            (model),
+            hidden,
+            (attn_metadata),
+            spec_metadata,
         )
         assert vocab_sharded
         return worker._fused_accept(logits, attn_metadata, spec_metadata, vocab_sharded=True)
@@ -302,9 +310,9 @@ def _check_temperature_only(mapping, head, norm, processor, worker):
     seeded = metadata(2, seed=1234)
     seeded.gather_ids = torch.arange(2 * (DRAFT_LEN + 1), device="cuda")
     _, vocab_sharded = SpecDecOneEngineForCausalLM._verify_logits(
-        model,
+        (model),
         _hidden(2 * (DRAFT_LEN + 1), 4000),
-        types.SimpleNamespace(num_seqs=2, num_contexts=0),
+        (types.SimpleNamespace(num_seqs=2, num_contexts=0)),
         seeded,
     )
     assert not vocab_sharded
@@ -377,6 +385,7 @@ def _check_temperature_distribution(mapping):
     columns = slice(mapping.tp_rank * local, (mapping.tp_rank + 1) * local)
     logits = base[columns].cuda().expand(rows, local).contiguous()
     seeds = torch.full((rows,), 77, dtype=torch.int64, device="cuda")
+    offsets = torch.arange(rows, dtype=torch.int64, device="cuda")
     for temperature in (0.5, 1.0, 2.0):
         probs = torch.softmax(base.double() / temperature, dim=0).numpy()
         temperatures = torch.full((rows,), temperature, device="cuda")

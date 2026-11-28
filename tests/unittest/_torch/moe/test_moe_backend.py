@@ -941,7 +941,11 @@ def test_fp4_block_scale_decode_tactic_key_matches_tuning(
             raise _OpLookedUp
 
     tuner = _Tuner()
-    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        (classmethod(lambda cls: tuner)),
+    )
     num_slots, top_k, num_local, inter, hidden, m = 512, 10, 64, 512, 4096, 14
 
     def meta(*shape):
@@ -967,7 +971,14 @@ def test_fp4_block_scale_decode_tactic_key_matches_tuning(
         w2_weight_scale=meta(num_local, hidden, inter // 16),
     )
     # Not tuned yet.
-    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, do_finalize) is None
+    assert (
+        TRTLLMGenFp4BlockScaleBase.decode_tactic(
+            (backend),
+            m,
+            do_finalize,
+        )
+        is None
+    )
     # The op call TRTLLMGenFp4BlockScaleBase.run_moe makes for m router-logit rows.
     with pytest.raises(_OpLookedUp):
         _run_fp4_block_scale_moe(
@@ -1002,9 +1013,23 @@ def test_fp4_block_scale_decode_tactic_key_matches_tuning(
             use_dp=backend.use_dp,
             decode_tuning=backend.decode_tuning,
         )
-    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, do_finalize) == tuned_tactic
+    assert (
+        TRTLLMGenFp4BlockScaleBase.decode_tactic(
+            (backend),
+            m,
+            do_finalize,
+        )
+        == tuned_tactic
+    )
     # The other do_finalize runs other kernels and is tuned apart.
-    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, not do_finalize) is None
+    assert (
+        TRTLLMGenFp4BlockScaleBase.decode_tactic(
+            (backend),
+            m,
+            not do_finalize,
+        )
+        is None
+    )
 
 
 @pytest.mark.cpu_only
@@ -1022,9 +1047,24 @@ def test_decode_front_tactics_per_do_finalize() -> None:
 
     backend = SimpleNamespace(decode_tactic=decode_tactic)
     front = df.DecodeFront(frozenset())
-    assert front._moe_tactic(backend, 14, True) is None
-    assert front._moe_tactic(backend, 14, False) == [8, 0]
-    assert front._moe_tactic(backend, 14, False) == [8, 0]  # cached
+    assert (
+        front._moe_tactic(
+            (backend),
+            14,
+            True,
+        )
+        is None
+    )
+    assert front._moe_tactic(
+        (backend),
+        14,
+        False,
+    ) == [8, 0]
+    assert front._moe_tactic(
+        (backend),
+        14,
+        False,
+    ) == [8, 0]  # cached
     assert asked == [(14, True), (14, False)]
 
     moe = SimpleNamespace(
@@ -1034,8 +1074,16 @@ def test_decode_front_tactics_per_do_finalize() -> None:
         routing_method=SimpleNamespace(experts_per_token=top_k),
     )
     gate = SimpleNamespace(weight=torch.empty(num_experts, 16))
-    unfinalized = front._front_runner(gate, moe, False)
-    finalized = front._front_runner(gate, moe, True)
+    unfinalized = front._front_runner(
+        gate,
+        (moe),
+        False,
+    )
+    finalized = front._front_runner(
+        gate,
+        (moe),
+        True,
+    )
     assert unfinalized.tile_of(7) == 8 and finalized.tile_of(7) is None
     assert unfinalized.unique_id() != finalized.unique_id()
 
@@ -1081,8 +1129,8 @@ def test_cutedsl_deep_ep_direct_metadata_disable_env(
     else:
         monkeypatch.setenv(env_name, disable_value)
 
-    monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
-    monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
+    monkeypatch.setattr(torch.cuda, "Stream", (MagicMock(return_value=object())))
+    monkeypatch.setattr(torch.cuda, "Event", (MagicMock(return_value=object())))
 
     constructor_kwargs = {
         "routing_method": MagicMock(),
@@ -1174,7 +1222,11 @@ def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(
 def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", MagicMock(return_value=True))
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        (MagicMock(return_value=True)),
+    )
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
     comm._adapter_free_placeholder_cache = {}
     hidden_states = MagicMock(
@@ -1245,7 +1297,7 @@ def test_cutedsl_direct_metadata_request_fails_without_fused_finalize() -> None:
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             moe_output=torch.empty((2, 4), dtype=torch.bfloat16),
-            weight_view=MagicMock(),
+            weight_view=(MagicMock()),
             recv_expert_count=torch.tensor([2], dtype=torch.int32),
             deep_ep_expert_capacity=2,
             use_deep_ep_direct_metadata=True,
@@ -1320,8 +1372,15 @@ def test_scheduler_quantizes_input_async_only_under_multi_stream(
 ) -> None:
     from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 
-    monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: multi_stream)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    def _mock_multi_stream() -> bool:
+        return multi_stream
+
+    monkeypatch.setattr(moe_scheduler, "do_multi_stream", _mock_multi_stream)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        (lambda: capturing),
+    )
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
         backend=TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl),
@@ -1335,7 +1394,11 @@ def test_scheduler_quantizes_input_async_only_under_multi_stream(
 def test_scheduler_skips_async_quantization_without_backend_support(monkeypatch) -> None:
     from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 
-    monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: True)
+    monkeypatch.setattr(
+        moe_scheduler,
+        "do_multi_stream",
+        (lambda: True),
+    )
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
         backend=TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl),
@@ -2262,7 +2325,7 @@ def test_cutedsl_dense_gemm_returns_an_empty_output_for_an_empty_micro_batch():
     hidden_size, num_experts = 32, 4
     backend = SimpleNamespace(has_nvfp4=True, hidden_size=hidden_size)
     output = TrtllmCutedslDenseGemmNvfp4Impl.run_moe_nvfp4(
-        backend,
+        (backend),
         x=torch.empty(0, hidden_size // 2, dtype=torch.uint8),
         token_selected_experts=torch.empty(0, num_experts, dtype=torch.int32),
         token_final_scales=torch.empty(0, num_experts, dtype=torch.float32),
@@ -2758,7 +2821,7 @@ def test_megamoe_quant_method_allocates_and_binds_the_arena_through_the_layer_ha
     monkeypatch.setattr(
         NVFP4MegaMoECuteDslMethod,
         "_bind_live_weight_planes",
-        lambda self, module, bound: events.append(("bind", bound)),
+        (lambda self, module, bound: events.append(("bind", bound))),
     )
     module = torch.nn.Module()
     module.hidden_size = 160
@@ -2812,7 +2875,7 @@ def test_megamoe_quant_method_builds_the_producer_after_checking_the_planes(monk
     monkeypatch.setattr(
         NVFP4MegaMoECuteDslMethod,
         "assert_live_weight_aliases",
-        lambda self, module, arena: events.append(("aliases", arena)),
+        (lambda self, module, arena: events.append(("aliases", arena))),
     )
     arena = SimpleNamespace(assert_identity=lambda: events.append("identity"))
     handle = SimpleNamespace(
@@ -3106,17 +3169,17 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     set_device = MagicMock()
     tcp_store = MagicMock()
 
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "is_available", (lambda: True))
+    monkeypatch.setattr(dist, "is_initialized", (lambda: False))
     monkeypatch.setattr(dist, "init_process_group", init_process_group)
     monkeypatch.setattr(dist, "TCPStore", tcp_store)
-    monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
-    monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
-    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
-    monkeypatch.setattr(utils, "local_mpi_comm", local_mpi_comm)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(utils, "mpi_world_size", (lambda: 8))
+    monkeypatch.setattr(utils, "mpi_rank", (lambda: 3))
+    monkeypatch.setattr(utils, "mpi_comm", (lambda: mpi_comm))
+    monkeypatch.setattr(utils, "local_mpi_comm", (local_mpi_comm))
+    monkeypatch.setattr(torch.cuda, "is_available", (lambda: True))
+    monkeypatch.setattr(torch.cuda, "device_count", (lambda: 4))
+    monkeypatch.setattr(torch.cuda, "current_device", (lambda: 2))
     monkeypatch.setattr(torch.cuda, "set_device", set_device)
 
     moe._maybe_init_torch_dist_under_mpi()
@@ -3146,13 +3209,13 @@ def _patch_megamoe_cutedsl_bootstrap(monkeypatch, *, rank, world, bcast, allgath
     if allgather is not None:
         mpi_comm.allgather.side_effect = allgather
     init_process_group = MagicMock()
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "is_available", (lambda: True))
+    monkeypatch.setattr(dist, "is_initialized", (lambda: False))
     monkeypatch.setattr(dist, "init_process_group", init_process_group)
-    monkeypatch.setattr(utils, "mpi_world_size", lambda: world)
-    monkeypatch.setattr(utils, "mpi_rank", lambda: rank)
-    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(utils, "mpi_world_size", (lambda: world))
+    monkeypatch.setattr(utils, "mpi_rank", (lambda: rank))
+    monkeypatch.setattr(utils, "mpi_comm", (lambda: mpi_comm))
+    monkeypatch.setattr(torch.cuda, "is_available", (lambda: False))
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     moe.ep_size = world
     return moe, mpi_comm, init_process_group
@@ -3172,8 +3235,8 @@ def test_megamoe_cutedsl_mpi_bootstrap_rank0_hosts_store_on_bound_port(monkeypat
     store = MagicMock(port=41234)
     tcp_store = MagicMock(return_value=store)
     monkeypatch.setattr(dist, "TCPStore", tcp_store)
-    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
-    monkeypatch.setattr(socket, "gethostbyname", lambda name: "192.168.0.10")
+    monkeypatch.setattr(socket, "gethostname", (lambda: "node0"))
+    monkeypatch.setattr(socket, "gethostbyname", (lambda name: "192.168.0.10"))
     moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
         monkeypatch, rank=0, world=4, bcast=lambda obj, root: obj
     )
@@ -3196,7 +3259,7 @@ def test_megamoe_cutedsl_mpi_bootstrap_rank0_hosts_store_on_bound_port(monkeypat
 def test_megamoe_cutedsl_mpi_bootstrap_store_failure_raises_on_every_rank(monkeypatch):
     """Rank 0's store failure goes out in the bcast so no rank waits for it."""
     error = dist.DistNetworkError("address already in use")
-    monkeypatch.setattr(dist, "TCPStore", MagicMock(side_effect=error))
+    monkeypatch.setattr(dist, "TCPStore", (MagicMock(side_effect=error)))
     sent = []
 
     def bcast(obj, root):
@@ -3232,7 +3295,7 @@ def test_megamoe_cutedsl_mpi_bootstrap_loopback_on_single_host(monkeypatch):
     store = MagicMock(port=41234)
     tcp_store = MagicMock(return_value=store)
     monkeypatch.setattr(dist, "TCPStore", tcp_store)
-    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(socket, "gethostname", (lambda: "node0"))
     monkeypatch.setattr(socket, "gethostbyname", _unresolvable_hostname)
     moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
         monkeypatch,
@@ -3263,8 +3326,12 @@ def test_megamoe_cutedsl_mpi_bootstrap_loopback_across_hosts_raises_on_every_ran
     """
     hostnames = ["node0", "node0", "node1", "node1"]
     monkeypatch.setattr(socket, "gethostbyname", _unresolvable_hostname)
-    monkeypatch.setattr(dist, "TCPStore", MagicMock(return_value=MagicMock(port=41234)))
-    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(
+        dist,
+        "TCPStore",
+        (MagicMock(return_value=MagicMock(port=41234))),
+    )
+    monkeypatch.setattr(socket, "gethostname", (lambda: "node0"))
     sent = []
 
     def bcast(obj, root):
@@ -3282,7 +3349,7 @@ def test_megamoe_cutedsl_mpi_bootstrap_loopback_across_hosts_raises_on_every_ran
     # allgather, and raises before dialing the loopback store.
     peer_store = MagicMock()
     monkeypatch.setattr(dist, "TCPStore", peer_store)
-    monkeypatch.setattr(socket, "gethostname", lambda: "node1")
+    monkeypatch.setattr(socket, "gethostname", (lambda: "node1"))
     peer, peer_comm, peer_init = _patch_megamoe_cutedsl_bootstrap(
         monkeypatch,
         rank=2,
@@ -3305,9 +3372,13 @@ def test_megamoe_cutedsl_mpi_bootstrap_resolved_loopback_across_hosts_raises(mon
     resolution succeeds, but a rank on another host still cannot reach it.
     """
     hostnames = ["node0", "node0", "node1", "node1"]
-    monkeypatch.setattr(socket, "gethostbyname", lambda name: "127.0.1.1")
-    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
-    monkeypatch.setattr(dist, "TCPStore", MagicMock(return_value=MagicMock(port=41234)))
+    monkeypatch.setattr(socket, "gethostbyname", (lambda name: "127.0.1.1"))
+    monkeypatch.setattr(socket, "gethostname", (lambda: "node0"))
+    monkeypatch.setattr(
+        dist,
+        "TCPStore",
+        (MagicMock(return_value=MagicMock(port=41234))),
+    )
     moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
         monkeypatch,
         rank=0,
@@ -3332,7 +3403,11 @@ def test_megamoe_cutedsl_init_raises_bootstrap_failure(monkeypatch):
     address exchange until the process-group timeout.
     """
     bootstrap = MagicMock(side_effect=dist.DistNetworkError("address already in use"))
-    monkeypatch.setattr(MegaMoECuteDsl, "_maybe_init_torch_dist_under_mpi", bootstrap)
+    monkeypatch.setattr(
+        MegaMoECuteDsl,
+        "_maybe_init_torch_dist_under_mpi",
+        (bootstrap),
+    )
     with pytest.raises(dist.DistNetworkError, match="address already in use"):
         _make_megamoe_cutedsl_for_ctor_test()
     bootstrap.assert_called_once()
@@ -3367,9 +3442,21 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     arena = MagicMock(home_experts=4, helper_slots=2, bundle=bundle)
     arena.assert_identity = MagicMock()
     allocate = MagicMock(return_value=arena)
-    monkeypatch.setattr(arena_module, "allocate_rebalance_arena", allocate)
-    monkeypatch.setattr(manager, "get_ep_comm", lambda process_group: "ep_comm")
-    monkeypatch.setattr(manager, "create_arena_provider", lambda: "provider")
+    monkeypatch.setattr(
+        arena_module,
+        "allocate_rebalance_arena",
+        (allocate),
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_ep_comm",
+        (lambda process_group: "ep_comm"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "create_arena_provider",
+        (lambda: "provider"),
+    )
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe._ep_pg = object()
@@ -3395,12 +3482,16 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     moe.quant_method = NVFP4MegaMoECuteDslMethod()
     monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "setup_quant_scales", lambda self, module: None)
     assert_aliases = MagicMock()
-    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "assert_live_weight_aliases", assert_aliases)
+    monkeypatch.setattr(
+        NVFP4MegaMoECuteDslMethod,
+        "assert_live_weight_aliases",
+        (assert_aliases),
+    )
     builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
     monkeypatch.setattr(
         planner,
         "build_rebalance_slot_scheduler_group",
-        builder,
+        (builder),
     )
 
     moe.cache_derived_state()
@@ -3653,8 +3744,16 @@ def test_megamoe_deepgemm_primes_reachable_tiles_before_staging(
         get_block_m_for_mega_moe=MagicMock(side_effect=lambda *args: tiles[args[3]]),
         fp8_fp4_mega_moe=launch,
     )
-    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=tuning_mode))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        (lambda: SimpleNamespace(is_tuning_mode=tuning_mode)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        (lambda: capturing),
+    )
     ctx = SimpleNamespace(
         x=torch.full((2, 4), 3.0),
         x_sf=torch.full((2, 1), 4.0),
@@ -3690,8 +3789,16 @@ def test_megamoe_deepgemm_primes_reachable_tiles_before_staging(
 def test_megamoe_deepgemm_primes_each_geometry_once_per_process(monkeypatch):
     """Layers that share a geometry reuse the tiles the first of them compiled."""
     monkeypatch.setattr(mega_moe_deepgemm_module, "_MEGA_MOE_PRIMED_TILES", set())
-    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=True))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        (lambda: SimpleNamespace(is_tuning_mode=True)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        (lambda: False),
+    )
 
     def make_layer(hidden_size):
         moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
@@ -3754,7 +3861,7 @@ def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatc
 
     monkeypatch.setitem(sys.modules, "mpi4py", SimpleNamespace(MPI=mpi))
     monkeypatch.setattr(dist, "init_process_group", init_process_group)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", (lambda: False))
     monkeypatch.setenv("MASTER_ADDR", "outer-host")
     monkeypatch.setenv("MASTER_PORT", "29400")
     monkeypatch.setenv("RANK", "1")
@@ -3925,16 +4032,20 @@ def test_fused_moe_appends_post_silu_mode_to_positional_schema():
 def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):
     create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
     configurable_moe = MagicMock(return_value=object())
-    monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
+    monkeypatch.setattr(
+        create_moe_module,
+        "ConfigurableMoE",
+        (configurable_moe),
+    )
     monkeypatch.setattr(
         create_moe_module,
         "resolve_moe_cls",
-        MagicMock(return_value=MegaMoEDeepGemm),
+        (MagicMock(return_value=MegaMoEDeepGemm)),
     )
     activation = SiTuActivation(gate_softcap=4.0, linear_softcap=25.0)
 
     result = create_moe_module.create_moe(
-        routing_method=MagicMock(),
+        routing_method=(MagicMock()),
         num_experts=8,
         hidden_size=512,
         intermediate_size=512,
@@ -3959,7 +4070,7 @@ def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration(
     with pytest.raises(ValueError, match="apply_router_weight_on_input"):
         create_moe_backend(
             moe_cls=_Undeclared,
-            routing_method=MagicMock(),
+            routing_method=(MagicMock()),
             num_experts=8,
             hidden_size=512,
             intermediate_size=512,
@@ -4019,7 +4130,11 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         num_slots = 10
         ep_size = 4
 
-    monkeypatch.setattr(quantization_module, "_import_deep_gemm", lambda: object())
+    monkeypatch.setattr(
+        quantization_module,
+        "_import_deep_gemm",
+        (lambda: object()),
+    )
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
 
     with pytest.raises(
@@ -4730,7 +4845,10 @@ def test_nvfp4_streaming_stages_pre_quant_scales_for_finalization() -> None:
 
     # The base implementation, not MegaMoE's override: that one additionally
     # rematerializes the raw source parameters, which needs real weights.
-    NVFP4FusedMoEMethod.prepare_streaming_expert_load(method, module)
+    NVFP4FusedMoEMethod.prepare_streaming_expert_load(
+        (method),
+        module,
+    )
     assert module.tmp_pre_quant_scales == {}, "staging must predate the loader threads"
 
     w1 = torch.linspace(0.5, 2.0, hidden_size)
@@ -4773,7 +4891,10 @@ def test_nvfp4_streaming_plain_checkpoint_leaves_act_scale_unset() -> None:
     module = _streaming_module_for_pre_quant_scale_test(8)
 
     # Base implementation, for the reason given in the test above.
-    NVFP4FusedMoEMethod.prepare_streaming_expert_load(method, module)
+    NVFP4FusedMoEMethod.prepare_streaming_expert_load(
+        (method),
+        module,
+    )
     method._finalize_pre_quant_scales(module)
 
     assert module.fc31_act_scale is None
@@ -4995,9 +5116,17 @@ def test_megamoe_genphase_rejects_compact_rows_it_cannot_address(
 
     if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
         pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
-    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(
+        megamoe_op,
+        "get_sm_version",
+        (lambda: 107),
+    )
     # Construction only; the occupancy query would need a CUDA context.
-    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
+    monkeypatch.setattr(
+        megamoe_op,
+        "_max_active_clusters",
+        (lambda size, *args: 184 // size),
+    )
     # hidden 2880 stages 180-byte SF rows; the gen kernel addresses 192-byte ones, so the
     # query must fall back to the generic kernel instead of trapping at launch.
     _, is_genphase = megamoe_op.query_megamoe_kernel_properties(
@@ -5021,7 +5150,11 @@ def test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants(
 
     if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
         pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
-    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(
+        megamoe_op,
+        "get_sm_version",
+        (lambda: 100),
+    )
     runner_kwargs = {
         "world_size": 1,
         "local_rank": 0,
@@ -7324,7 +7457,11 @@ def test_cutedsl_fc12_run_moe_sort_tables(
         return runners[0], 128
 
     tuner = SimpleNamespace(choose_one=Mock(side_effect=choose_one))
-    monkeypatch.setattr(AutoTuner, "get", staticmethod(lambda: tuner))
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        (staticmethod(lambda: tuner)),
+    )
     output = torch.empty((num_tokens, backend.hidden_size), dtype=torch.bfloat16)
     for _ in range(2):
         calls.clear()
@@ -7983,7 +8120,7 @@ def test_sm90_triton_fp8_act_leaf_prewarms_once_per_layer_shape(monkeypatch):
     monkeypatch.setattr(
         fp8_block_scales_hopper_triton,
         "prewarm_triton_fp8_block_scale_moe_fp8_act",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
+        (lambda *args, **kwargs: calls.append((args, kwargs))),
     )
     monkeypatch.setattr(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, "_prewarmed", set())
     monkeypatch.setattr(

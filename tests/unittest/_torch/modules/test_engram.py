@@ -41,6 +41,8 @@ from tensorrt_llm._torch.modules.linear import (
     flashinfer_mxfp8_autotune,
     flashinfer_mxfp8_decode_graph_capture,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.bindings import SamplingConfig
 
 
 def _reference_v41_engram_gate(
@@ -105,7 +107,11 @@ def test_v41_engram_gate_parity(monkeypatch: pytest.MonkeyPatch, add_residual: b
         layer_multipliers={1: torch.tensor([17, 31, 47])},
         vocab_size_across_layers={1: [buckets[:2], buckets[2:]]},
     )
-    monkeypatch.setattr(engram_module, "NgramHashMapping", lambda **kwargs: mapping)
+    monkeypatch.setattr(
+        engram_module,
+        "NgramHashMapping",
+        (lambda **kwargs: mapping),
+    )
     aggregate, generation = EngramHashProvider(config), EngramHashProvider(config)
     with torch.device("cuda"):
         module = v41.DeepseekV41Engram(1, config, vocab_sizes_flat=buckets)
@@ -284,8 +290,19 @@ def test_v41_engram_gate_parity(monkeypatch: pytest.MonkeyPatch, add_residual: b
         return prompt[start:end]
 
     model = SimpleNamespace(model=SimpleNamespace(use_engram=True, engram_hash_provider=generation))
-    request = SimpleNamespace(py_request_id=41, prompt_len=3, get_tokens_range=get_tokens_range)
-    v41.DeepseekV41ForCausalLM.prepare_disagg_generation_request(model, request)
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=3,
+        input_tokens=prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=None,
+    )
+    monkeypatch.setattr(request, "get_tokens_range", get_tokens_range)
+    v41.DeepseekV41ForCausalLM.prepare_disagg_generation_request(
+        (model),
+        request,
+    )
     assert reads == [(0, 1, 3)]
     assert 41 in generation._pending_history_seeds
     previous_hashes = None
@@ -346,6 +363,7 @@ def _sharded_lookup_reference(
     """Dequantize owned rows on the host; row shards return zero for unowned rows."""
     heads = slice(table.head_start, table.head_start + table.num_local_heads)
     index = indices[:, heads].cpu() + table.offsets.cpu()
+    owned = None
     if not table.shard_heads:
         owned = (index >= table.vocab_start_idx) & (index < table.vocab_end_idx)
         index = torch.where(owned, index - table.vocab_start_idx, 0)
@@ -427,10 +445,16 @@ def test_sharded_fp8_lookup_after_host_numa_oom(
     # A free eviction lock and an eviction that reports success without running its child: each table
     # retries once, then falls back.
     monkeypatch.setattr(
-        host_memory, "_eviction_lock", lambda mode: contextlib.nullcontext((-1, False))
+        host_memory,
+        "_eviction_lock",
+        (lambda mode: contextlib.nullcontext((-1, False))),
     )
     evict = Mock(return_value=True)
-    monkeypatch.setattr(host_memory, "evict_numa_node_page_cache", evict)
+    monkeypatch.setattr(
+        host_memory,
+        "evict_numa_node_page_cache",
+        (evict),
+    )
     torch.manual_seed(11)
     buckets = [16411 + 6 * head for head in range(num_heads)]
     table = _host_table(buckets, tp_size=2, tp_rank=1, check_numa=False)
@@ -464,7 +488,11 @@ def test_engram_hashes_retain_only_captured_and_latest_shapes(
             for layer in layers
         },
     )
-    monkeypatch.setattr(engram_module, "NgramHashMapping", lambda **kwargs: mapping)
+    monkeypatch.setattr(
+        engram_module,
+        "NgramHashMapping",
+        (lambda **kwargs: mapping),
+    )
     config = EngramConfig(layer_ids=list(layers), max_ngram_size=ngram, n_head_per_ngram=heads)
     provider, reference = EngramHashProvider(config), EngramHashProvider(config)
     monkeypatch.setattr(reference, "_compute_decode_hashes", lambda *args: None)

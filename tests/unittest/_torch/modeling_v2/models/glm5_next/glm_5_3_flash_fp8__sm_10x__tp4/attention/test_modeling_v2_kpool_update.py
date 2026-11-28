@@ -123,7 +123,9 @@ def test_kpool_update_matches_reference(cell, certifying):  # noqa: F811
         assert torch.equal(s[:, 1, :, 3 * HD :], before[:, 1, :, 3 * HD :])
     keys = (s[:, 1, :, 2 * HD : 3 * HD] for s in (storage, ref_storage, before))
     got, want, old = keys
-    slot, row, scale = _key_scale(before[:, 1, :, : 3 * HD], *args[1:3], kwargs["request_ids"])
+    slot, row, scale = _key_scale(
+        before[:, 1, :, : 3 * HD], args[1], args[2], kwargs["request_ids"]
+    )
     dest = slot * TPB + row
     written = torch.zeros(got.shape[0] * TPB, dtype=torch.bool, device=DEVICE)
     written[dest] = True

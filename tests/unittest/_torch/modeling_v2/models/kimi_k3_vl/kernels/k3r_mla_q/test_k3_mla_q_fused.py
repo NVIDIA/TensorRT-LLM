@@ -207,7 +207,6 @@ def _fp4_case(n, kv, seed):
         _paged_kv_indptr=indptr,
         paged_kv_indptr_decode=indptr.clone(),
         num_sequences=n,
-        num_blocks=None,
         num_context_blocks=n * stride,
         num_generation_blocks=0,
     )

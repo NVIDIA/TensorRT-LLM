@@ -261,6 +261,8 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    fake_v2.kv_connector_manager = None
+    fake_v2.is_estimating_kv_cache = False
     fake_v2.enable_block_reuse = enable_block_reuse
     fake_v2.is_draft = is_draft
     fake_v2.kv_compression_manages_history = False

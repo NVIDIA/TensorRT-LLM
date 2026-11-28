@@ -84,8 +84,12 @@ def _chain(case, caches, producer, eps=EPS):
     packed = gemv.m3_mx_gemv(xq, xsf, wq, wsf, True, CFG, True, None)
     assert packed is not None, "the in-model sparse QKV GEMV must serve <= 8 tokens"
     if producer == "target":
+        kv_data, kv_scale, index_k = caches
+        q_weight, k_weight, index_q_weight, index_k_weight = norms
         q, iq = m3_producer(
-            packed, *caches, slots, quant, eps, *norms, rotary, positions, HEADS_Q, True, True, True
+            packed, kv_data, kv_scale, index_k, slots, quant, eps,
+            q_weight, k_weight, index_q_weight, index_k_weight, rotary, positions,
+            HEADS_Q, pdl=True, early=True, prewait_step_inputs=True,
         )  # fmt: skip
     else:
         q, iq = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
@@ -100,8 +104,12 @@ def _fused(case, caches, eps=EPS, cfg=CFG):
     tokens = xq.shape[0]
     q = torch.zeros(tokens, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
     iq = torch.zeros(tokens, HEADS_INDEX, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    kv_data, kv_scale, index_k = caches
+    q_weight, k_weight, index_q_weight, index_k_weight = norms
     ok = gemv.m3_mx_gemv_producer(
-        xq, xsf, wq, wsf, q, iq, *caches, slots, quant, eps, *norms, rotary, positions, cfg=cfg, use_pdl=True
+        xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, eps,
+        q_weight, k_weight, index_q_weight, index_k_weight, rotary, positions,
+        cfg=cfg, use_pdl=True,
     )  # fmt: skip
     torch.cuda.synchronize()
     return ok, q, iq
@@ -246,11 +254,15 @@ def test_fold_is_deterministic_and_graph_replays() -> None:
     q = torch.zeros(4, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
     iq = torch.zeros(4, HEADS_INDEX, 128, dtype=torch.float8_e4m3fn, device="cuda")
     caches = _caches()
+    kv_data, kv_scale, index_k = caches
+    q_weight, k_weight, index_q_weight, index_k_weight = norms
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         captured = gemv.m3_mx_gemv_producer(
-            xq, xsf, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions, cfg=CFG, use_pdl=True
+            xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, EPS,
+            q_weight, k_weight, index_q_weight, index_k_weight, rotary, positions,
+            cfg=CFG, use_pdl=True,
         )  # fmt: skip
     assert captured, "the captured producer GEMV must serve 4 tokens on the split-8 config"
     graph.replay()

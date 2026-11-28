@@ -343,7 +343,15 @@ def test_context_timeout_skew_retains_claims_until_tp_retirement(
     """One expired rank cannot leave the collective loop before its peer retires."""
     now = {"value": 100.0}
     monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now["value"])
-    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+
+    def _mock_is_disagg_inflight_cancel_enabled() -> bool:
+        return False
+
+    monkeypatch.setattr(
+        coordinator_mod,
+        "is_disagg_inflight_cancel_enabled",
+        _mock_is_disagg_inflight_cancel_enabled,
+    )
     group = FakeDistGroup(world_size=2, tp_size=2)
     ranks = []
     requests = []
@@ -389,6 +397,7 @@ def test_context_timeout_skew_retains_claims_until_tp_retirement(
         assert not harness.coordinator._context_cancellation_drains
         executors.append(_assert_transfer_only_progress(harness, group.rank(rank), monkeypatch))
 
+    rx = operation = None
     now["value"] = 104.0
     group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
     group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())

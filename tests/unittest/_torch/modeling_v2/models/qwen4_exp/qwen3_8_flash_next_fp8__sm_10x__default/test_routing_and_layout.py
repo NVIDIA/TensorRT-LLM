@@ -624,7 +624,11 @@ def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch
 
     monkeypatch.setattr(M.MNNVLAllReduce, "is_mnnvl", staticmethod(is_mnnvl))
     monkeypatch.setattr(dist_ops, "get_allreduce_workspace", lambda mapping: "ipc workspace")
-    monkeypatch.setattr(utils, "mpi_disabled", lambda: False)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(utils, "mpi_disabled", _mock_mpi_disabled)
     monkeypatch.setattr(M, "mnnvl_workspace_args", lambda *args: dict(buffers="mnnvl workspace"))
     monkeypatch.setattr(M, "mnnvl_tp_sum", lambda x, buffers: ("mnnvl", buffers))
     monkeypatch.setattr(
@@ -662,9 +666,21 @@ def test_the_target_opens_its_own_ipc_buffers_at_auto_or_mnnvl_only(
     )
 
     built = []
-    monkeypatch.setattr(M, "can_access_peer", lambda mapping: True)
-    monkeypatch.setattr(M, "get_env_enable_pdl", lambda: True)
-    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+
+    def _mock_can_access_peer(mapping: Mapping) -> bool:
+        return True
+
+    monkeypatch.setattr(M, "can_access_peer", _mock_can_access_peer)
+
+    def _mock_get_env_enable_pdl() -> bool:
+        return True
+
+    monkeypatch.setattr(M, "get_env_enable_pdl", _mock_get_env_enable_pdl)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(M, "mpi_disabled", _mock_mpi_disabled)
     monkeypatch.setattr(
         M, "_selection_lamport_build", lambda mapping, size: built.append("lamport") or "lamport"
     )
@@ -716,7 +732,11 @@ def test_the_fused_decode_sum_runs_at_auto_with_fp32_accumulation(
     """`hc_allreduce_inject_norm` sums in fp32 only: under the stock all-reduce's opt-out
     (`AR_FP32_ACC_ENV=0`) and at a strategy other than AUTO the decode sites sum through
     `tp_sum`."""
-    monkeypatch.setattr(M, "can_access_peer", lambda mapping: True)
+
+    def _mock_can_access_peer(mapping: Mapping) -> bool:
+        return True
+
+    monkeypatch.setattr(M, "can_access_peer", _mock_can_access_peer)
     monkeypatch.setattr(M, "allreduce_group_args", lambda mapping, s: dict(workspace="ipc"))
     if fp32_acc is None:
         monkeypatch.delenv(M.AR_FP32_ACC_ENV, raising=False)
@@ -848,7 +868,11 @@ def test_a_moe_layer_enters_the_fp8_runner_over_its_window(
     monkeypatch.setattr(M, "fp8_quantize_1x128", quantize)
     monkeypatch.setattr(M, "fp8_block_scale_moe_runner", runner)
     monkeypatch.setattr(M, "moe_prefill_grouped", grouped)
-    monkeypatch.setattr(M, "prefill_grouped_ready", lambda local: local == 128)
+
+    def _mock_prefill_grouped_ready(local: int) -> bool:
+        return local == 128
+
+    monkeypatch.setattr(M, "prefill_grouped_ready", _mock_prefill_grouped_ready)
     monkeypatch.setattr(M, "_MOE_PREFILL_GROUPED_MIN_ROWS", grouped_min)
     out = M._routed_experts(core, x, "router", experts)
     assert [(kind, xq.shape[0]) for kind, xq, *_ in seen] == calls
@@ -953,7 +977,7 @@ class _HostMoe:
         monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: _HOST_STREAM)
         monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
 
-    def route(self, x):
+    def route(self, x) -> tuple[torch.Tensor, torch.Tensor]:
         top_logits, top_ids = torch.topk(x @ self.router, TOPK, dim=-1)
         return top_ids, torch.softmax(top_logits, dim=-1)
 
@@ -1044,7 +1068,11 @@ def test_the_attention_dp_round_trip_returns_each_ranks_rows(counts, draft, monk
 
     monkeypatch.setattr(M, "allgather", fake_allgather)
     monkeypatch.setattr(M, "reducescatter", fake_reducescatter)
-    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(M, "mpi_disabled", _mock_mpi_disabled)
     per_rank = []
     for rank in range(world):
         core = _core(f"dep{world}", rank, _mtp() if draft else None)
@@ -1110,7 +1138,8 @@ class _HostA2a:
         rows, ids, w, lo, count = self.got
         torch.testing.assert_close(partials, _expert_out(rows, ids, w, lo, count))
         own = self.xs[self.rank]
-        return _expert_out(own, *self.routes[self.rank], 0, NUM_EXPERTS)
+        own_ids, own_weights = self.routes[self.rank]
+        return _expert_out(own, own_ids, own_weights, 0, NUM_EXPERTS)
 
 
 @pytest.mark.cpu_only
@@ -1132,7 +1161,11 @@ def test_the_attention_dp_alltoall_round_trip(counts, draft, monkeypatch) -> Non
         raise AssertionError("the all-to-all round trip took the default collectives")
 
     monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "NVLINK_ONE_SIDED")
-    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(M, "mpi_disabled", _mock_mpi_disabled)
     for name in ("allgather", "reducescatter"):
         monkeypatch.setattr(M, name, forbidden)
     for rank in range(world):
@@ -1288,8 +1321,20 @@ def _sp_ce_scatter(monkeypatch, rank):
     assert torch.equal(got, partial[1][lo:hi] + partial[0][lo:hi])
     four = SimpleNamespace(tp_size=4, gpus_per_node=4, tp_rank=0)
     across = SimpleNamespace(tp_size=2, gpus_per_node=1, tp_rank=0)
-    assert CopyEngineExchange.create(four, 1 << 20) is None
-    assert CopyEngineExchange.create(across, 1 << 20) is None
+    assert (
+        CopyEngineExchange.create(
+            four,
+            1 << 20,
+        )
+        is None
+    )
+    assert (
+        CopyEngineExchange.create(
+            across,
+            1 << 20,
+        )
+        is None
+    )
 
 
 def _sp_project(monkeypatch, rank, overlap):

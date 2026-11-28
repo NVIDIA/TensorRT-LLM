@@ -513,7 +513,9 @@ def _rope_gather(tp):
     scale = torch.tensor([0.05], device="cuda")
     inv_scale = 1.0 / scale
 
-    def call_inputs(q_len, b, seed):
+    def call_inputs(
+        q_len, b, seed
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         g = torch.Generator(device="cuda").manual_seed(seed)
         seq = torch.randint(q_len, page * max_pages, (b,), generator=g, device="cuda").to(
             torch.int32
@@ -924,7 +926,11 @@ def test_group_exchange_is_cached_per_gather_head_dim(monkeypatch):
             transport="ipc", gather_head_dim=gather_head_dim, num_channels=num_channels
         )
 
-    monkeypatch.setattr(ll_exchange.TPGroupExchange, "create", classmethod(create))
+    monkeypatch.setattr(
+        ll_exchange.TPGroupExchange,
+        "create",
+        (classmethod(create)),
+    )
     monkeypatch.setattr(ll_exchange, "_GROUP_EXCHANGES", {})
     mapping = SimpleNamespace(tp_group=[0, 1], tp_rank=0, tp_size=2)
     a = ll_exchange.get_tp_group_exchange(mapping, 2, 1 << 20, 64, 3, gather_head_dim=256)

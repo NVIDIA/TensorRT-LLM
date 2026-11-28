@@ -19,13 +19,16 @@ import sys
 import time
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
 import numpy as np
 import pytest
 import torch
+from test_common.host_cache_manager import make_host_cache_manager
+from test_common.interface_checks import mock_target
+from test_common.llm_request_stubs import make_llm_request_stub
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor._util import _get_num_storage_pool_groups
@@ -97,6 +100,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferId,
     CacheLevel,
     CacheTier,
+    CacheTierConfig,
     CudaStream,
     DataRole,
     DiskCacheTierConfig,
@@ -169,7 +173,7 @@ def test_swa_endpoint_priority(
 def test_create_kv_cache_swa_endpoint_priority(
     rewind: int, is_dummy: bool, is_draft: bool, prompt: int | None, enabled: bool
 ) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager._swa_endpoint_rewind = rewind
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.enable_block_reuse = True
@@ -200,7 +204,7 @@ def test_create_kv_cache_forwards_custom_priority_callback(rewind: int) -> None:
     With SWA endpoint priorities on, attention pages keep them and every other
     page takes the caller's priority.
     """
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager._swa_endpoint_rewind = rewind
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.enable_block_reuse = True
@@ -238,8 +242,15 @@ def test_create_kv_cache_forwards_custom_priority_callback(rewind: int) -> None:
 
 def test_context_priority_callback_defaults_to_none() -> None:
     """The base manager keeps the backend's default page priorities."""
-    manager = object.__new__(KVCacheManagerV2)
-    assert manager._context_priority_callback(Mock()) is None
+    manager = make_host_cache_manager()
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[0],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    assert manager._context_priority_callback(request) is None
 
 
 def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
@@ -353,19 +364,6 @@ class _CacheTierInitError(Exception):
     pass
 
 
-@dataclass
-class _FakeManagerConfig:
-    cache_tiers: list[object]
-    layers: list[object] = field(
-        default_factory=lambda: [
-            AttentionLayerConfig(
-                layer_id=LayerId(0),
-                buffers=[BufferConfig(role=Role.KEY, size=128)],
-            )
-        ]
-    )
-
-
 class _FakeKVCache:
     def __init__(self, num_committed_tokens: int) -> None:
         self.num_committed_tokens = num_committed_tokens
@@ -416,7 +414,7 @@ def _make_cache_config_for_test(
         pp_layers = list(range(len(max_attention_window_vec)))
     assert len(max_attention_window_vec) == len(pp_layers)
 
-    cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager = make_host_cache_manager()
     cache_manager.layer_specs = None
     cache_manager._sparse_kv_offload = sparse_kv_offload
     cache_manager.max_beam_width = 1
@@ -477,28 +475,43 @@ def _make_manager_for_cache_tier_test(
     if mapping is None:
         mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
 
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_base_config"
+    )
     def build_base_config(
         self: KVCacheManagerV2,
-        config: KvCacheConfig,
+        kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        cache_tiers: list[object],
-    ) -> _FakeManagerConfig:
-        del self, config, tokens_per_block
-        return _FakeManagerConfig(cache_tiers=cache_tiers)
+        cache_tiers: list[CacheTierConfig],
+    ) -> KVCacheManagerConfig:
+        del self, kv_cache_config
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=cache_tiers,
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=128)],
+                )
+            ],
+        )
 
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_cache_config"
+    )
     def build_cache_config(
-        self: KVCacheManagerV2, config: _FakeManagerConfig
-    ) -> _FakeManagerConfig:
+        self: KVCacheManagerV2, config: KVCacheManagerConfig
+    ) -> KVCacheManagerConfig:
         del self
         if add_secondary_gpu_tier:
-            return _FakeManagerConfig(
+            return replace(
+                config,
                 cache_tiers=[
                     config.cache_tiers[0],
                     GpuCacheTierConfig(quota=1 << 20),
                     *config.cache_tiers[1:],
                 ],
-                layers=config.layers,
             )
         return config
 
@@ -517,9 +530,33 @@ def _make_manager_for_cache_tier_test(
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
-        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
-        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
-        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+        patch.object(
+            KVCacheManagerV2,
+            "get_num_available_tokens",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_num_available_tokens"
+            )(
+                lambda self,
+                *,
+                token_num_upper_bound,
+                batch_size=1,
+                max_num_draft_tokens=0: MAX_SEQ_LEN
+            ),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_prepare_page_table_tensor",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_page_table_tensor"
+            )(lambda self, index_mapper_capacity: None),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_log_kv_cache_pool_lifecycle_mapping",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_kv_cache_pool_lifecycle_mapping"
+            )(lambda self: None),
+        ),
         patch(f"{module}.get_pp_layers", return_value=([0], 1)),
     ):
         manager = manager_cls(
@@ -570,7 +607,13 @@ def test_buffered_events_receive_vocab_size(
     # Exercise the real resource-manager constructor and selected event backend.
     with (
         patch.object(kv_cache_v2_module, "mpi_rank", return_value=rank),
-        patch.object(Distributed, "get", return_value=distributed),
+        patch.object(
+            Distributed,
+            "get",
+            mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+                staticmethod(lambda mapping: distributed)
+            ),
+        ),
         patch.object(
             kv_cache_v2_module,
             "KVCacheEventManager",
@@ -833,8 +876,20 @@ def test_manager_without_regions_builds_as_before(monkeypatch, enable_block_reus
     finally:
         manager.shutdown()
     with monkeypatch.context() as patch:
-        patch.setattr(KVCacheManagerV2, "_declare_regions", lambda self: None)
-        patch.setattr(KVCacheManagerV2, "_lay_out_regions", lambda self, config: config)
+        patch.setattr(
+            KVCacheManagerV2,
+            "_declare_regions",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._declare_regions"
+            )(lambda self: None),
+        )
+        patch.setattr(
+            KVCacheManagerV2,
+            "_lay_out_regions",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._lay_out_regions"
+            )(lambda self, config: config),
+        )
         manager = build()
         try:
             without_hooks = _layer_api_snapshot(manager)
@@ -1148,7 +1203,7 @@ def test_mixed_nvfp4_bf16_pool_pointer_views() -> None:
 
 
 def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.pp_layers = [3, 4, 5]
     manager.num_layers = 6
     manager.num_local_layers = 3
@@ -1213,7 +1268,7 @@ def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
 
 
 def test_zero_size_filter_keeps_a_sparse_fetch_path() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.pp_layers = [0, 1]
     manager.num_layers = 2
     manager.num_local_layers = 2
@@ -1257,7 +1312,7 @@ def test_zero_size_filter_keeps_a_sparse_fetch_path() -> None:
 
 
 def test_zero_size_filter_rejects_empty_local_cache() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     config = KVCacheManagerConfig(
         tokens_per_block=TOKENS_PER_BLOCK,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
@@ -1274,7 +1329,7 @@ def test_zero_size_filter_rejects_empty_local_cache() -> None:
 
 
 def test_zero_size_filter_preserves_layer_and_buffer_reuse_policies() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.pp_layers = [0, 1, 2, 3]
     manager.num_layers = 4
     manager.num_local_layers = 4
@@ -1358,11 +1413,12 @@ def test_layer_group_helpers_describe_split_ssm_layers() -> None:
     )
     impl = KVCacheManager(config)
     try:
-        manager = object.__new__(KVCacheManagerV2)
+        manager = make_host_cache_manager()
         manager.max_seq_len = MAX_SEQ_LEN
         manager.tokens_per_block = TOKENS_PER_BLOCK
         manager.kv_cache_manager_py_config = config
         manager.impl = impl
+        manager.__dict__.pop("_layer_ids_by_group", None)
         manager._layer_group_life_cycles = None
 
         attention = impl.get_layer_group_id(LayerId(0))
@@ -1395,7 +1451,7 @@ def test_layer_group_helpers_describe_split_ssm_layers() -> None:
 def test_event_window_sizes_filter_attention_without_backend_internals(
     sliding_window_size: int | None, attention_first: bool
 ) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.max_seq_len = MAX_SEQ_LEN
     manager.kv_cache_manager_py_config = SimpleNamespace(
         layers=[
@@ -1417,6 +1473,7 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
             [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
         ]
     )
+    manager.__dict__.pop("_layer_ids_by_group", None)
 
     attention_group_id = 0 if attention_first else 1
     window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
@@ -1498,7 +1555,7 @@ def test_draft_token_relocation_uses_local_cache_layout(
     _update_kv_cache_draft_token_location(
         cache_manager,
         batch,
-        attention_metadata,
+        (attention_metadata),
         kv_cache_dtype_byte_size=2,
         include_finished_requests=include_finished,
     )
@@ -1668,25 +1725,21 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     fresh_cache: bool, expected_lookup_tokens: int | None
 ) -> None:
     """Snapshot metadata survives the cursor-free cache preparation split."""
-    request = SimpleNamespace(
-        py_request_id=7,
+    request = LlmRequest(
+        request_id=7,
+        max_new_tokens=1,
+        input_tokens=list(range(8)),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
         lora_task_id=3,
         cache_salt="11",
-        kv_cache_retention_config=None,
-        is_dummy=False,
-        return_perf_metrics=False,
-        prompt_len=8,
-        context_current_position=6,
-        is_first_context_chunk=True,
-        is_disagg_generation_init_state=False,
-        is_context_only_request=False,
     )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.set_prepopulated_prompt_len(6, TOKENS_PER_BLOCK)
     kv_cache = Mock(num_committed_tokens=2)
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.conversation_manager = None
-    manager.kv_connector_manager = None
     manager.enable_block_reuse = True
-    manager.is_estimating_kv_cache = False
     manager._has_cp_helix = False
     manager.kv_cache_map = {} if fresh_cache else {request.py_request_id: kv_cache}
     manager._on_allocation_stream = set()
@@ -1900,8 +1953,14 @@ def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
     dist = Mock()
     dist.allreduce.return_value = int(_KVCacheManagerInitStatus.ABORT)
 
-    with patch.object(Distributed, "get", return_value=dist):
-        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.OK, mapping)
+    with patch.object(
+        Distributed,
+        "get",
+        mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+            staticmethod(lambda mapping: dist)
+        ),
+    ):
+        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.OK, (mapping))
 
     assert status == _KVCacheManagerInitStatus.ABORT
     dist.allreduce.assert_called_once_with(int(_KVCacheManagerInitStatus.OK), op=ReduceOp.MAX)
@@ -1967,7 +2026,12 @@ class TestRemoteTierInitStatus:
         """An _add_remote_level that starts a donor, then raises `error` if given."""
         donor = Mock()
 
-        def add_remote_level(self, remote_config, cache_tiers):
+        @mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._add_remote_level"
+        )
+        def add_remote_level(
+            self: KVCacheManagerV2, remote_config: object, cache_tiers: list[CacheTierConfig]
+        ) -> None:
             self._remote_donor = donor
             if error is not None:
                 raise error
@@ -1979,7 +2043,11 @@ class TestRemoteTierInitStatus:
         """Without the estimation the target starts the donation itself: it is placed before warmup and capture."""
         donor, add_remote_level = self._starting_donor()
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -1996,7 +2064,11 @@ class TestRemoteTierInitStatus:
     def test_local_failure_aborts_every_rank_and_closes_the_donor(self, tmp_path) -> None:
         donor, add_remote_level = self._starting_donor(RuntimeError("capacity check failed"))
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2015,7 +2087,11 @@ class TestRemoteTierInitStatus:
         donor, add_remote_level = self._starting_donor()
         local_impl = Mock()
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 return_value=_KVCacheManagerInitStatus.ABORT,
@@ -2036,9 +2112,12 @@ class TestRemoteTierInitStatus:
             max_gpu_total_bytes=16 << 20,
             remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
         )
-        add_remote_level = Mock()
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._add_remote_level"
+            )(
+                patch.object(KVCacheManagerV2, "_add_remote_level", autospec=True)
+            ) as add_remote_level,
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2066,7 +2145,9 @@ class TestRemoteTierInitStatus:
             return status
 
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", Mock()),
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._add_remote_level"
+            )(patch.object(KVCacheManagerV2, "_add_remote_level", autospec=True)),
             patch(f"{self.module}._sync_kv_cache_manager_init_status", side_effect=sync),
             pytest.raises(ValueError, match="host_cache_size"),
         ):
@@ -2086,10 +2167,15 @@ class TestRemoteTierInitStatus:
             return status
 
         with (
-            patch.object(
-                KVCacheManagerV2,
-                "_add_remote_level",
-                Mock(side_effect=ValueError("UCX devices: unknown token")),
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._add_remote_level"
+            )(
+                patch.object(
+                    KVCacheManagerV2,
+                    "_add_remote_level",
+                    autospec=True,
+                    side_effect=ValueError("UCX devices: unknown token"),
+                )
             ),
             patch(f"{self.module}._sync_kv_cache_manager_init_status", side_effect=sync),
             pytest.raises(ValueError, match="unknown token"),
@@ -2104,7 +2190,11 @@ class TestRemoteTierInitStatus:
     def test_failure_after_the_sync_withdraws_the_donation(self, tmp_path) -> None:
         donor, add_remote_level = self._starting_donor()
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2136,7 +2226,11 @@ class TestRemoteTierInitStatus:
                 raise ValueError("state pool too small")
 
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2164,7 +2258,11 @@ class TestRemoteTierInitStatus:
                 raise ValueError("indexer cache too small")
 
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2197,7 +2295,11 @@ class TestRemoteTierInitStatus:
                 raise ValueError("late failure")
 
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2224,7 +2326,11 @@ class TestRemoteTierInitStatus:
     def test_shutdown_withdraws_the_donation_when_a_deferred_close_raises(self, tmp_path) -> None:
         donor, add_remote_level = self._starting_donor()
         with (
-            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                add_remote_level,
+            ),
             patch(
                 f"{self.module}._sync_kv_cache_manager_init_status",
                 side_effect=lambda status, mapping: status,
@@ -2286,7 +2392,13 @@ def test_agg_helix_gpu_only_init_syncs_status_across_ranks(peer_failed: bool) ->
     dist.allreduce.side_effect = lambda value, op: value
 
     with (
-        patch.object(Distributed, "get", return_value=dist),
+        patch.object(
+            Distributed,
+            "get",
+            mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+                staticmethod(lambda mapping: dist)
+            ),
+        ),
         patch(f"{module}._sync_kv_cache_manager_init_status", return_value=status) as sync,
     ):
         config = KvCacheConfig(
@@ -2512,32 +2624,41 @@ def test_record_branch_snapshot_point(
     points: list[int],
     expected: list[int],
 ) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager._record_branch_snapshots = record
     manager.tokens_per_block = 64
-    request = SimpleNamespace(
-        py_request_id=1,
-        is_dummy_request=is_dummy_request,
-        prompt_len=1000,
-        expect_snapshot_points=points,
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[0] * 1000,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
     )
+    request.is_dummy_request = is_dummy_request
+    request.expect_snapshot_points = points
     kv_cache = Mock(num_committed_tokens=0)
     kv_cache._get_num_reusable_tokens_before_pruning.return_value = 512
 
-    manager._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens)
+    manager._record_branch_snapshot_point(
+        request,
+        kv_cache,
+        num_lookup_tokens,
+    )
 
     assert request.expect_snapshot_points == expected
 
 
 def test_generation_allocation_reserves_dynamic_width() -> None:
-    request = SimpleNamespace(
-        py_request_id=80,
-        py_beam_width=1,
-        py_num_accepted_draft_tokens=2,
-        py_rewind_len=2,
-        state=LlmRequestState.GENERATION_IN_PROGRESS,
-        max_beam_num_tokens=103,
+    request = LlmRequest(
+        request_id=80,
+        max_new_tokens=8,
+        input_tokens=[0] * 103,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
     )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.py_num_accepted_draft_tokens = 2
+    request.py_rewind_len = 2
     kv_cache = Mock(is_active=True, capacity=100, beam_width=1)
 
     def resize(capacity, history_length=None):
@@ -2546,7 +2667,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
         return True
 
     kv_cache.resize.side_effect = resize
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.kv_cache_type = CacheType.SELFKONLY
     manager.max_beam_width = 1
     manager.is_draft = True
@@ -2582,7 +2703,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
 
 def _revert_context_request(request_id: int) -> SimpleNamespace:
-    return SimpleNamespace(
+    return make_llm_request_stub(
         py_request_id=request_id,
         py_ctx_pre_resize_cap=64,
         prompt_len=512,
@@ -2598,8 +2719,7 @@ def test_context_revert_drops_unshrinkable_cache_and_rewinds_progress() -> None:
     # history (256) past pre_cap (64) is the steady state for a sliding-window
     # request part-way through its prompt, so the cache cannot be shrunk back.
     kv_cache = Mock(is_active=True, capacity=128, history_length=256)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.kv_connector_manager = None
+    manager = make_host_cache_manager()
     manager.tokens_per_block = 64
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager.free_resources = Mock()
@@ -2620,8 +2740,7 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     request = _revert_context_request(92)
     kv_cache = Mock(is_active=True, capacity=128, history_length=32)
     kv_cache.resize.return_value = True
-    manager = object.__new__(KVCacheManagerV2)
-    manager.kv_connector_manager = None
+    manager = make_host_cache_manager()
     manager.tokens_per_block = 64
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager.free_resources = Mock()
@@ -2652,8 +2771,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     request.move_to_next_context_chunk()
 
     kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192, beam_width=1)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.kv_connector_manager = None
+    manager = make_host_cache_manager()
     manager.kv_cache_type = CacheType.SELFKONLY
     manager.max_beam_width = 1
     manager.is_draft = True
@@ -2753,7 +2871,7 @@ def test_unpaired_draft_mirror_context_resize(
     kv_cache = Mock(is_active=True, capacity=mirror_capacity, history_length=mirror_history)
     views = []
     kv_cache.resize.side_effect = lambda *args: views.append(request.use_draft_model) or True
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager._mirror_uses_draft_view = uses_draft_view
@@ -2802,7 +2920,7 @@ def test_unpaired_draft_mirror_that_cannot_grow_raises_with_the_pool_diagnostic(
     }
     caches[51].resize.return_value = True
     caches[52].resize.return_value = False
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager._mirror_uses_draft_view = False
@@ -2858,7 +2976,7 @@ def test_exhausted_pool_fails_explicitly_on_an_empty_fresh_mirror() -> None:
     small = Mock(is_active=True, capacity=64, history_length=0, num_blocks=2)
     fresh = Mock(is_active=True, capacity=0, history_length=0, num_blocks=0)
     fresh.resize.return_value = False
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager._mirror_uses_draft_view = False
@@ -3402,8 +3520,8 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
             hidden_states=torch.zeros(tokens_per_req, hidden, device="cuda"),
             accepted_tokens=torch.ones((1, tokens_per_req), dtype=torch.long, device="cuda"),
             num_accepted_tokens=torch.tensor([tokens_per_req], dtype=torch.int32, device="cuda"),
-            attn_metadata=attn_metadata,
-            spec_metadata=step_metadata,
+            attn_metadata=(attn_metadata),
+            spec_metadata=(step_metadata),
             draft_model=draft_model,
             total_target_tokens=tokens_per_req,
         )
@@ -3592,7 +3710,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     """A manager wired just far enough to run the publish/history bookkeeping."""
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.kv_cache_type = CacheType.SELFKONLY
     manager.enable_block_reuse = True
     manager.is_draft = False
@@ -3601,7 +3719,6 @@ def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     manager.block_reuse_policy = policy
     manager.kv_compression_manages_history = False
     manager.conversation_manager = None
-    manager.kv_connector_manager = None
     manager.kv_cache_map = {}
     return manager
 
@@ -3669,25 +3786,22 @@ def test_context_publishes_the_whole_prompt_at_history_length() -> None:
 
 def test_draft_pool_commits_every_chunk_it_computes() -> None:
     prompt = list(range(12))
-    request = SimpleNamespace(
-        py_request_id=41,
-        is_dummy_request=False,
-        prompt_len=len(prompt),
-        is_context_only_request=False,
-        context_current_position=4,
-        context_remaining_length=8,
-        multimodal_hashes=None,
-        multimodal_positions=None,
-        multimodal_lengths=None,
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=1,
+        input_tokens=prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
     )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 4
     kv_cache = _FakeKVCache(num_committed_tokens=0)
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.enable_block_reuse = True
     manager.is_draft = True
     manager._can_publish_block_reuse = True
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
     manager._reuse_token_source = Mock(return_value=prompt)
     manager.kv_cache_map = {request.py_request_id: kv_cache}
 
@@ -3695,77 +3809,38 @@ def test_draft_pool_commits_every_chunk_it_computes() -> None:
     assert kv_cache.num_committed_tokens == 4
 
     request.context_current_position = len(prompt)
-    request.context_remaining_length = 0
     manager.try_commit_blocks(request)
     assert kv_cache.num_committed_tokens == len(prompt)
     assert kv_cache.stopped_committing
 
 
-@dataclass
-class _ContextRequest:
-    request_id: int
-    tokens: list[int]
-    context_remaining_length: int
-    conversation_id: str
-    py_request_id: int = field(init=False)
-    py_conversation_params: ConversationParams | None = field(init=False)
-    use_conversation_params: bool = True
-    lora_task_id: int | None = None
-    cache_salt: str | None = None
-    kv_cache_retention_config: KvCacheRetentionConfig | None = None
-    is_first_context_chunk: bool = True
-    is_last_context_chunk: bool = True
-    is_disagg_generation_init_state: bool = False
-    is_generation_only_request: bool = False
-    is_dummy_request: bool = False
-    is_context_only_request: bool = False
-    return_perf_metrics: bool = False
-    context_current_position: int = 0
-    py_served_prefix_end: int = 0
-    py_num_connector_matched_tokens: int = 0
-    py_connector_allocation_reported: bool = False
-    prepopulated_prompt: tuple[int, int] | None = None
-    multimodal_hashes: None = None
-    multimodal_positions: None = None
-    multimodal_lengths: None = None
-
-    def __post_init__(self) -> None:
-        self.py_request_id = self.request_id
-        if not self.use_conversation_params:
-            self.py_conversation_params = None
-            return
-        self.py_conversation_params = ConversationParams(conversation_id=self.conversation_id)
-
-    @property
-    def prompt_len(self) -> int:
-        return len(self.tokens)
-
-    @property
-    def is_dummy(self) -> bool:
-        return self.is_dummy_request
-
-    @property
-    def prepopulated_prompt_len(self) -> int:
-        if self.prepopulated_prompt is None:
-            return 0
-        return self.prepopulated_prompt[0]
-
-    def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
-        assert beam_id == DEFAULT_BEAM_INDEX
-        return self.tokens
-
-    def get_tokens_view(self, beam_id: int = DEFAULT_BEAM_INDEX) -> np.ndarray:
-        """Mirror LlmRequest.get_tokens_view, which the C++ backend takes on the reuse path.
-
-        The real binding returns a zero-copy contiguous 1-D int32 view of the token buffer;
-        the dtype matters because it selects the C++ int32 ingest fast path.
-        """
-        assert beam_id == DEFAULT_BEAM_INDEX
-        return np.asarray(self.tokens, dtype=np.int32)
-
-    def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
-        self.prepopulated_prompt = (length, tokens_per_block)
-        self.context_current_position = length
+def _make_context_request(
+    request_id: int,
+    tokens: list[int],
+    conversation_id: str,
+    *,
+    use_conversation_params: bool = True,
+    is_disagg_generation_init_state: bool = False,
+    kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+    cache_salt: str | None = None,
+) -> LlmRequest:
+    request = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        kv_cache_retention_config=kv_cache_retention_config,
+        cache_salt=cache_salt,
+    )
+    request.state = (
+        LlmRequestState.DISAGG_GENERATION_INIT
+        if is_disagg_generation_init_state
+        else LlmRequestState.CONTEXT_INIT
+    )
+    if use_conversation_params:
+        request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+    return request
 
 
 @pytest.mark.parametrize("config_cls", [DFlashDecodingConfig, PARDDecodingConfig])
@@ -3789,7 +3864,7 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
     batch_size, context_tokens, window = 64, 512, 504
     config = KvCacheConfig(enable_block_reuse=False, max_attention_window=[window])
     slope, fixed = KVCacheManagerV2.get_cache_size_per_token(
-        model_config,
+        (model_config),
         Mapping(),
         tokens_per_block=32,
         max_seq_len=4096,
@@ -3860,17 +3935,15 @@ def test_retired_long_cache_returns_its_pages_and_clears_its_page_table() -> Non
         dtype=DataType.HALF,
     )
 
-    def gen_init(request_id: int) -> _ContextRequest:
-        request = _ContextRequest(
+    def gen_init(request_id: int) -> LlmRequest:
+        request = _make_context_request(
             request_id,
             list(range(prompt_len)),
-            prompt_len,
             f"conv-{request_id}",
             use_conversation_params=False,
             is_disagg_generation_init_state=True,
         )
         request.py_draft_tokens = []
-        request.is_first_context_chunk = True
         assert manager.prepare_disagg_gen_init(request)
         return request
 
@@ -4204,7 +4277,7 @@ def test_draft_mirror_preserves_preallocated_dummy_capacity(
     # Dummies have only one 32-token page available. Real requests are a
     # control: unlike fixed-shape dummies they still need per-step growth.
     cache.resize.side_effect = lambda capacity: capacity <= (32 if is_dummy else 64)
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = joint_reuse
     manager._mirror_uses_draft_view = False
@@ -4280,7 +4353,13 @@ def test_helix_retention_uses_rank_local_ranges(
 ) -> None:
     # Only cross-process coordination is replaced; allocation and policy run in native V2 on GPU.
     dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
-    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    monkeypatch.setattr(
+        Distributed,
+        "get",
+        mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+            staticmethod(lambda mapping: dist)
+        ),
+    )
     manager = KVCacheManagerV2(
         KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
         CacheType.SELF,
@@ -4297,14 +4376,18 @@ def test_helix_retention_uses_rank_local_ranges(
         dtype=DataType.HALF,
         is_disagg=True,
     )
-    request = _ContextRequest(
-        1, list(range(local_prompt)), local_prompt, "retention", use_conversation_params=False
-    )
-    request.total_input_len_cp = global_prompt
-    request.kv_cache_retention_config = KvCacheRetentionConfig(
+    retention_config = KvCacheRetentionConfig(
         [KvCacheRetentionConfig.TokenRangeRetentionConfig(64, range_end, 80)],
         decode_retention_priority=10,
     )
+    request = _make_context_request(
+        1,
+        list(range(local_prompt)),
+        "retention",
+        use_conversation_params=False,
+        kv_cache_retention_config=retention_config,
+    )
+    request.total_input_len_cp = global_prompt
     try:
         assert isinstance(manager.impl, KVCacheManager)
         assert manager.impl.init_config.tokens_per_block == 128
@@ -4334,7 +4417,13 @@ def test_agg_helix_retention_uses_global_ranges(
     # Aggregated helix holds the full prompt on every rank, so a range in prompt
     # tokens marks exactly the ledger blocks (two 64-token pages each) it covers.
     dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
-    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    monkeypatch.setattr(
+        Distributed,
+        "get",
+        mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+            staticmethod(lambda mapping: dist)
+        ),
+    )
     manager = KVCacheManagerV2(
         KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
         CacheType.SELF,
@@ -4352,14 +4441,18 @@ def test_agg_helix_retention_uses_global_ranges(
         is_disagg=False,
     )
     prompt_len = 256
-    request = _ContextRequest(
-        1, list(range(prompt_len)), prompt_len, "retention", use_conversation_params=False
-    )
-    request.total_input_len_cp = prompt_len
-    request.kv_cache_retention_config = KvCacheRetentionConfig(
+    retention_config = KvCacheRetentionConfig(
         [KvCacheRetentionConfig.TokenRangeRetentionConfig(range_start, range_end, 80)],
         decode_retention_priority=10,
     )
+    request = _make_context_request(
+        1,
+        list(range(prompt_len)),
+        "retention",
+        use_conversation_params=False,
+        kv_cache_retention_config=retention_config,
+    )
+    request.total_input_len_cp = prompt_len
     try:
         assert manager.prepare_context_cache(request) is not None
         cache = manager.kv_cache_map[request.py_request_id]
@@ -4420,7 +4513,7 @@ def manager(max_num_turns: int, drop_extended_turns: bool) -> KVCacheManagerV2:
         manager.shutdown()
 
 
-def _context_batch(*requests: _ContextRequest) -> ScheduledRequests:
+def _context_batch(*requests: LlmRequest) -> ScheduledRequests:
     batch = ScheduledRequests()
     for request in requests:
         batch.append_context_request(request)
@@ -4429,7 +4522,7 @@ def _context_batch(*requests: _ContextRequest) -> ScheduledRequests:
 
 def _prepare_context_resources(
     manager: KVCacheManagerV2,
-    *requests: _ContextRequest,
+    *requests: LlmRequest,
 ) -> ScheduledRequests:
     batch = _context_batch(*requests)
     manager.prepare_resources(batch)
@@ -4445,34 +4538,30 @@ def _update_context_resources(
 
 def _free_if_active(
     manager: KVCacheManagerV2,
-    request: _ContextRequest,
+    request: LlmRequest,
 ) -> None:
     manager.free_resources(request)
 
 
 def _run_context(
     manager: KVCacheManagerV2,
-    request: _ContextRequest,
+    request: LlmRequest,
 ) -> None:
     batch = _prepare_context_resources(manager, request)
     assert manager.prepare_context(request)
-    request.context_remaining_length = request.prompt_len - request.context_current_position
     assert manager.resize_context(request, num_tokens=request.context_remaining_length)
     request.context_current_position = request.prompt_len
-    request.context_remaining_length = 0
     _update_context_resources(manager, batch)
 
 
-def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> bool:
+def _try_run_context(manager: KVCacheManagerV2, request: LlmRequest) -> bool:
     """Run a context request all the way through, reporting whether it fit."""
     batch = _prepare_context_resources(manager, request)
     if not manager.prepare_context(request):
         return False
-    request.context_remaining_length = request.prompt_len - request.context_current_position
     if not manager.resize_context(request, num_tokens=request.context_remaining_length):
         return False
     request.context_current_position = request.prompt_len
-    request.context_remaining_length = 0
     _update_context_resources(manager, batch)
     return True
 
@@ -4487,9 +4576,9 @@ def test_preempt_request_gives_a_full_pool_back_its_pages(
     covers the release itself: the pages returning, and the connector's
     matched-token count dropping.
     """
-    victim = _ContextRequest(1, list(range(MAX_SEQ_LEN)), MAX_SEQ_LEN, "conv-1")
+    victim = _make_context_request(1, list(range(MAX_SEQ_LEN)), "conv-1")
     victim.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
-    started: list[_ContextRequest] = [victim]
+    started: list[LlmRequest] = [victim]
 
     try:
         assert _try_run_context(manager, victim)
@@ -4500,10 +4589,9 @@ def test_preempt_request_gives_a_full_pool_back_its_pages(
         # request keep block reuse from hiding the pressure.
         blocked = None
         for request_id in range(2, 12):
-            candidate = _ContextRequest(
+            candidate = _make_context_request(
                 request_id,
                 [request_id * 1000 + i for i in range(MAX_SEQ_LEN)],
-                MAX_SEQ_LEN,
                 f"conv-{request_id}",
             )
             started.append(candidate)
@@ -4539,7 +4627,7 @@ def test_preemption_waits_for_a_connector_still_reading_the_victims_pages(
     now would let it overwrite the bytes mid-transfer and publish them under a
     hash that says they are the victim's prefix.
     """
-    victim = _ContextRequest(1, list(range(MAX_SEQ_LEN)), MAX_SEQ_LEN, "conv-1")
+    victim = _make_context_request(1, list(range(MAX_SEQ_LEN)), "conv-1")
     victim.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
 
     # Reports a save in flight for every request, which is the only answer the
@@ -4585,26 +4673,23 @@ def test_preemption_waits_for_a_connector_still_reading_the_victims_pages(
 def test_per_conversation_policy_delays_commit_until_last_context_chunk(
     manager: KVCacheManagerV2,
 ) -> None:
-    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request = _make_context_request(1, list(range(8)), "conv-1")
 
     try:
         batch = _prepare_context_resources(manager, request)
         assert manager.prepare_context(request)
         assert manager.resize_context(request, num_tokens=4)
         request.context_current_position = 4
-        request.context_remaining_length = 4
         _update_context_resources(manager, batch)
 
         kv_cache = manager.kv_cache_map[request.py_request_id]
         assert kv_cache.num_committed_tokens == 0
         assert kv_cache.history_length == 4
 
-        request.is_first_context_chunk = False
         batch = _prepare_context_resources(manager, request)
         assert manager.prepare_context(request)
         assert manager.resize_context(request, num_tokens=4)
         request.context_current_position = 8
-        request.context_remaining_length = 0
         _update_context_resources(manager, batch)
 
         assert kv_cache.num_committed_tokens == 8
@@ -4616,20 +4701,13 @@ def test_per_conversation_policy_delays_commit_until_last_context_chunk(
 def test_per_conversation_policy_without_params_uses_per_request_commit(
     manager: KVCacheManagerV2,
 ) -> None:
-    request = _ContextRequest(
-        1,
-        list(range(8)),
-        8,
-        "conv-1",
-        use_conversation_params=False,
-    )
+    request = _make_context_request(1, list(range(8)), "conv-1", use_conversation_params=False)
     batch = _context_batch(request)
 
     try:
         assert manager.prepare_context(request)
         assert manager.resize_context(request, num_tokens=4)
         request.context_current_position = 4
-        request.context_remaining_length = 4
         _update_context_resources(manager, batch)
 
         kv_cache = manager.kv_cache_map[request.py_request_id]
@@ -4643,15 +4721,14 @@ def test_per_conversation_policy_without_params_uses_per_request_commit(
 def test_per_conversation_policy_releases_cancelled_request(
     manager: KVCacheManagerV2,
 ) -> None:
-    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    request_b = _ContextRequest(2, list(range(8)), 8, "conv-1")
+    request_a = _make_context_request(1, list(range(8)), "conv-1")
+    request_b = _make_context_request(2, list(range(8)), "conv-1")
 
     try:
         batch_a = _prepare_context_resources(manager, request_a)
         assert manager.prepare_context(request_a)
         assert manager.resize_context(request_a, num_tokens=4)
         request_a.context_current_position = 4
-        request_a.context_remaining_length = 4
         _update_context_resources(manager, batch_a)
         _free_if_active(manager, request_a)
 
@@ -4663,7 +4740,6 @@ def test_per_conversation_policy_releases_cancelled_request(
             mock_warning.assert_not_called()
         assert manager.resize_context(request_b, num_tokens=request_b.prompt_len)
         request_b.context_current_position = request_b.prompt_len
-        request_b.context_remaining_length = 0
         _update_context_resources(manager, batch_b)
     finally:
         _free_if_active(manager, request_b)
@@ -4673,14 +4749,9 @@ def test_per_conversation_policy_releases_cancelled_request(
 def test_per_conversation_policy_drops_previous_divergent_blocks(
     manager: KVCacheManagerV2,
 ) -> None:
-    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    request_b = _ContextRequest(
-        2,
-        [*range(8), 100, 101, 102, 103],
-        12,
-        "conv-1",
-    )
-    request_old_prompt = _ContextRequest(3, list(range(8)), 8, "conv-2")
+    request_a = _make_context_request(1, list(range(8)), "conv-1")
+    request_b = _make_context_request(2, [*range(8), 100, 101, 102, 103], "conv-1")
+    request_old_prompt = _make_context_request(3, list(range(8)), "conv-2")
     try:
         _run_context(manager, request_a)
         _free_if_active(manager, request_a)
@@ -4701,11 +4772,11 @@ def test_per_conversation_policy_drops_previous_divergent_blocks(
 def test_per_conversation_policy_retains_configured_number_of_turns(
     manager: KVCacheManagerV2,
 ) -> None:
-    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    request_b = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
-    request_a_probe = _ContextRequest(3, list(range(8)), 8, "conv-2")
-    request_c = _ContextRequest(4, list(range(200, 208)), 8, "conv-1")
-    request_a_after_eviction = _ContextRequest(5, list(range(8)), 8, "conv-3")
+    request_a = _make_context_request(1, list(range(8)), "conv-1")
+    request_b = _make_context_request(2, list(range(100, 108)), "conv-1")
+    request_a_probe = _make_context_request(3, list(range(8)), "conv-2")
+    request_c = _make_context_request(4, list(range(200, 208)), "conv-1")
+    request_a_after_eviction = _make_context_request(5, list(range(8)), "conv-3")
 
     try:
         _run_context(manager, request_a)
@@ -4750,11 +4821,11 @@ def test_per_conversation_policy_drop_extended_turns_keeps_unextended_branch(
     subagent_reuse: int,
 ) -> None:
     """A subagent that shares its parent's conversation id must not evict the parent."""
-    main = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    subagent_turn_1 = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
-    subagent_turn_2 = _ContextRequest(3, list(range(100, 112)), 12, "conv-1")
-    main_probe = _ContextRequest(4, list(range(8)), 8, "conv-2")
-    subagent_probe = _ContextRequest(5, list(range(100, 108)), 8, "conv-3")
+    main = _make_context_request(1, list(range(8)), "conv-1")
+    subagent_turn_1 = _make_context_request(2, list(range(100, 108)), "conv-1")
+    subagent_turn_2 = _make_context_request(3, list(range(100, 112)), "conv-1")
+    main_probe = _make_context_request(4, list(range(8)), "conv-2")
+    subagent_probe = _make_context_request(5, list(range(100, 108)), "conv-3")
 
     try:
         for request in (main, subagent_turn_1, subagent_turn_2):
@@ -4792,9 +4863,9 @@ def test_per_conversation_policy_drop_extended_turns_respects_reuse_scope(
     first_reuse: int,
 ) -> None:
     """Only a later turn in the same reuse scope can drop an earlier turn."""
-    first = _ContextRequest(1, list(range(8)), 8, "conv-1", cache_salt="a")
-    second = _ContextRequest(2, list(range(12)), 12, "conv-1", cache_salt=second_salt)
-    first_probe = _ContextRequest(3, list(range(8)), 8, "conv-2", cache_salt="a")
+    first = _make_context_request(1, list(range(8)), "conv-1", cache_salt="a")
+    second = _make_context_request(2, list(range(12)), "conv-1", cache_salt=second_salt)
+    first_probe = _make_context_request(3, list(range(8)), "conv-2", cache_salt="a")
 
     try:
         for request in (first, second):
@@ -4815,12 +4886,12 @@ def test_per_conversation_policy_drop_extended_turns_drops_every_extended_turn(
     manager: KVCacheManagerV2,
 ) -> None:
     """A turn that extends several retained turns drops all of them at once."""
-    main = _ContextRequest(1, list(range(500, 508)), 8, "conv-1")
-    longer = _ContextRequest(2, list(range(12)), 12, "conv-1")
-    shorter = _ContextRequest(3, list(range(8)), 8, "conv-1")
-    extending = _ContextRequest(4, list(range(16)), 16, "conv-1")
-    main_probe = _ContextRequest(5, list(range(500, 508)), 8, "conv-2")
-    shorter_probe = _ContextRequest(6, list(range(8)), 8, "conv-3")
+    main = _make_context_request(1, list(range(500, 508)), "conv-1")
+    longer = _make_context_request(2, list(range(12)), "conv-1")
+    shorter = _make_context_request(3, list(range(8)), "conv-1")
+    extending = _make_context_request(4, list(range(16)), "conv-1")
+    main_probe = _make_context_request(5, list(range(500, 508)), "conv-2")
+    shorter_probe = _make_context_request(6, list(range(8)), "conv-3")
 
     try:
         for request in (main, longer, shorter, extending):
@@ -4856,9 +4927,9 @@ def test_per_conversation_policy_extension_keeps_shared_window_page(
     turn ended in. The new turn is planned before the old one is dropped, so
     that page stays reusable at the new endpoint.
     """
-    turn = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    extension = _ContextRequest(2, list(range(9)), 9, "conv-1")
-    extension_probe = _ContextRequest(3, list(range(9)), 9, "conv-2")
+    turn = _make_context_request(1, list(range(8)), "conv-1")
+    extension = _make_context_request(2, list(range(9)), "conv-1")
+    extension_probe = _make_context_request(3, list(range(9)), "conv-2")
 
     try:
         for request in (turn, extension):
@@ -4891,9 +4962,9 @@ def test_prefix_digests_match_across_token_types() -> None:
 def test_per_conversation_policy_ignores_overlapping_request(
     manager: KVCacheManagerV2,
 ) -> None:
-    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    request_b = _ContextRequest(2, [0, 1, 2, 3, 100, 101, 102, 103], 8, "conv-1")
-    request_old_prompt = _ContextRequest(3, list(range(8)), 8, "conv-2")
+    request_a = _make_context_request(1, list(range(8)), "conv-1")
+    request_b = _make_context_request(2, [0, 1, 2, 3, 100, 101, 102, 103], "conv-1")
+    request_old_prompt = _make_context_request(3, list(range(8)), "conv-2")
     conversation_params = request_b.py_conversation_params
 
     try:
@@ -4901,7 +4972,6 @@ def test_per_conversation_policy_ignores_overlapping_request(
         assert manager.prepare_context(request_a)
         assert manager.resize_context(request_a, num_tokens=4)
         request_a.context_current_position = 4
-        request_a.context_remaining_length = 4
         _update_context_resources(manager, batch_a)
 
         batch_b = _prepare_context_resources(manager, request_b)
@@ -4916,16 +4986,13 @@ def test_per_conversation_policy_ignores_overlapping_request(
         assert request_b.py_conversation_params is conversation_params
         assert manager.resize_context(request_b, num_tokens=request_b.prompt_len)
         request_b.context_current_position = request_b.prompt_len
-        request_b.context_remaining_length = 0
         _update_context_resources(manager, batch_b)
         _free_if_active(manager, request_b)
 
-        request_a.is_first_context_chunk = False
         batch_a = _prepare_context_resources(manager, request_a)
         assert manager.prepare_context(request_a)
         assert manager.resize_context(request_a, num_tokens=4)
         request_a.context_current_position = 8
-        request_a.context_remaining_length = 0
         _update_context_resources(manager, batch_a)
         _free_if_active(manager, request_a)
 
@@ -4976,7 +5043,7 @@ def _make_spec_recompute_manager(
 def _drive_context_chunks(
     manager: KVCacheManagerV2,
     batch: ScheduledRequests,
-    request: _ContextRequest,
+    request: LlmRequest,
 ) -> None:
     """Finish *request* in single-block chunks, updating resources per chunk."""
     position = request.context_current_position
@@ -4985,9 +5052,7 @@ def _drive_context_chunks(
         assert manager.resize_context(request, num_tokens=chunk)
         position += chunk
         request.context_current_position = position
-        request.context_remaining_length = request.prompt_len - position
         _update_context_resources(manager, batch)
-        request.is_first_context_chunk = False
 
 
 @pytest.mark.parametrize("policy", ["per_request", "per_conversation"])
@@ -5004,8 +5069,8 @@ def test_deferred_commit_policies_disable_the_spec_recompute_tail(policy: str) -
     torch.cuda.init()
     manager = _make_spec_recompute_manager(policy, context_recompute_tail=-1)
     prompt = list(range(MAX_SEQ_LEN))
-    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
-    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    request_a = _make_context_request(1, prompt, "conv-1", use_conversation_params=False)
+    request_b = _make_context_request(2, prompt, "conv-2", use_conversation_params=False)
     try:
         assert manager._spec_recompute_tail == 0
 
@@ -5039,8 +5104,8 @@ def test_all_reusable_policy_recomputes_the_tail_across_chunks() -> None:
     torch.cuda.init()
     manager = _make_spec_recompute_manager("all_reusable", context_recompute_tail=-1)
     prompt = list(range(MAX_SEQ_LEN))
-    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
-    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    request_a = _make_context_request(1, prompt, "conv-1", use_conversation_params=False)
+    request_b = _make_context_request(2, prompt, "conv-2", use_conversation_params=False)
     try:
         assert manager._spec_recompute_tail == -1
 
@@ -5079,8 +5144,8 @@ def test_windowed_layers_keep_the_recompute_tail_claim_capped() -> None:
         max_attention_window=[window],
     )
     prompt = list(range(MAX_SEQ_LEN))
-    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
-    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    request_a = _make_context_request(1, prompt, "conv-1", use_conversation_params=False)
+    request_b = _make_context_request(2, prompt, "conv-2", use_conversation_params=False)
     try:
         assert manager._spec_recompute_tail == 6
 
@@ -5117,17 +5182,12 @@ def test_recurrent_state_managers_allow_only_a_full_reprefill_tail(
         pytest.skip("requires CUDA")
     torch.cuda.init()
 
-    class _RecurrentManager(KVCacheManagerV2):
-        _has_recurrent_state = True
-
-    manager_cls = _RecurrentManager if has_recurrent_state else KVCacheManagerV2
-    manager = _make_spec_recompute_manager(
-        "all_reusable", context_recompute_tail=6, manager_cls=manager_cls
-    )
-    try:
-        assert manager._spec_recompute_tail == expected_tail
-    finally:
-        manager.shutdown()
+    with patch.object(KVCacheManagerV2, "_has_recurrent_state", has_recurrent_state):
+        manager = _make_spec_recompute_manager("all_reusable", context_recompute_tail=6)
+        try:
+            assert manager._spec_recompute_tail == expected_tail
+        finally:
+            manager.shutdown()
 
 
 def test_live_storage_stats_use_the_manager_api() -> None:
@@ -5143,7 +5203,7 @@ def test_live_storage_stats_use_the_manager_api() -> None:
             ],
         )
     )
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.impl = Mock(wraps=core, cache_tier_list=core.cache_tier_list)
     manager.tokens_per_block = TOKENS_PER_BLOCK
     manager._storage_pool_groups_by_window = lambda: {}
@@ -5177,7 +5237,7 @@ def test_live_storage_stats_use_the_manager_api() -> None:
 def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
     kv_connector_manager, expected_connector_cached_tokens
 ) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.enable_stats = True
     manager.is_draft = False
     manager.kv_connector_manager = kv_connector_manager
@@ -5232,9 +5292,8 @@ def _make_admission_manager(
     Exercises the cached-token attribution branch of prepare_context_cache without a GPU. The
     attribution itself is staged inside the core; the manager only decides when to drop it.
     """
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.conversation_manager = None
-    manager.kv_connector_manager = None
     manager.enable_block_reuse = True
     manager.tokens_per_block = TOKENS_PER_BLOCK
     manager.is_draft = False
@@ -5259,7 +5318,7 @@ def _make_admission_manager(
 
 def test_prepare_context_keeps_cached_token_attribution_staged_by_the_core() -> None:
     manager, kv_cache = _make_admission_manager()
-    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request = _make_context_request(1, list(range(8)), "conv-1")
 
     assert manager.prepare_context(request)
 
@@ -5270,7 +5329,7 @@ def test_prepare_context_keeps_cached_token_attribution_staged_by_the_core() -> 
 
 def test_prepare_context_drops_cached_token_attribution_while_estimating() -> None:
     manager, kv_cache = _make_admission_manager(is_estimating_kv_cache=True)
-    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request = _make_context_request(1, list(range(8)), "conv-1")
 
     assert manager.prepare_context(request)
 
@@ -5280,7 +5339,9 @@ def test_prepare_context_drops_cached_token_attribution_while_estimating() -> No
 
 def test_disagg_gen_init_drops_only_the_partial_block() -> None:
     manager, kv_cache = _make_admission_manager()
-    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+    request = _make_context_request(
+        1, list(range(8)), "conv-1", is_disagg_generation_init_state=True
+    )
 
     assert manager.prepare_context_cache(request) == kv_cache.num_committed_tokens
 
@@ -5328,9 +5389,7 @@ def test_disagg_partial_attribution_survives_admission_retry(enable_stats: bool)
         # Use the real resume/utilization check. Output-index restoration is unrelated to admission.
         del manager._resume_and_restore
         manager._restore_page_index_bufs = Mock()
-        request = _ContextRequest(
-            1, tokens, len(tokens), "conv-1", is_disagg_generation_init_state=True
-        )
+        request = _make_context_request(1, tokens, "conv-1", is_disagg_generation_init_state=True)
 
         assert blocker.resume(CudaStream(stream.cuda_stream))
         total_slots = core.get_storage_statistics()[0].total
@@ -5362,7 +5421,9 @@ def test_disagg_partial_attribution_survives_admission_retry(enable_stats: bool)
 
 def test_disagg_gen_init_drops_everything_when_the_transfer_overwrites_the_prefix() -> None:
     manager, kv_cache = _make_admission_manager(overwrites_whole_cached_prefix=True)
-    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+    request = _make_context_request(
+        1, list(range(8)), "conv-1", is_disagg_generation_init_state=True
+    )
 
     assert manager.prepare_context_cache(request) == kv_cache.num_committed_tokens
 
@@ -5375,7 +5436,9 @@ def test_disagg_gen_init_drops_everything_in_gen_only_benchmark_mode(
 ) -> None:
     monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
     manager, kv_cache = _make_admission_manager()
-    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+    request = _make_context_request(
+        1, list(range(8)), "conv-1", is_disagg_generation_init_state=True
+    )
 
     assert manager.prepare_context_cache(request) == kv_cache.num_committed_tokens
 
@@ -5384,7 +5447,7 @@ def test_disagg_gen_init_drops_everything_in_gen_only_benchmark_mode(
 
 
 def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager._cold_pool_group_membership = lambda: ((0, frozenset({0, 1})),)
     life_cycle_metadata = {
         0: (0, 32, "attention"),
@@ -5428,7 +5491,7 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
 
     # K/V default to the TRTLLM head-major layout; the index-key side cache
     # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
@@ -5466,14 +5529,17 @@ def _index_mapper_capacity_for(
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_base_config"
+    )
     def build_base_config(
         self: KVCacheManagerV2,
-        config: KvCacheConfig,
+        kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        cache_tiers: list[object],
+        cache_tiers: list[CacheTierConfig],
     ) -> KVCacheManagerConfig:
-        del self, config
+        del self, kv_cache_config
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
@@ -5501,11 +5567,45 @@ def _index_mapper_capacity_for(
         patch(f"{module}.IndexMapper") as index_mapper_cls,
         patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
-        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
-        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
-        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
-        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
-        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
+        patch.object(
+            KVCacheManagerV2,
+            "_build_cache_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_cache_config"
+            )(lambda self, config: config),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "get_num_available_tokens",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_num_available_tokens"
+            )(
+                lambda self,
+                *,
+                token_num_upper_bound,
+                batch_size=1,
+                max_num_draft_tokens=0: MAX_SEQ_LEN
+            ),
+        ),
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_page_table_tensor"
+        )(
+            patch.object(KVCacheManagerV2, "_prepare_page_table_tensor", autospec=True)
+        ) as page_table,
+        patch.object(
+            KVCacheManagerV2,
+            "_log_kv_cache_pool_lifecycle_mapping",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_kv_cache_pool_lifecycle_mapping"
+            )(lambda self: None),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_reserve_guard_page",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._reserve_guard_page"
+            )(lambda self: None),
+        ),
     ):
         manager = KVCacheManagerV2(
             # A quota must be set or __init__ asserts; the value is irrelevant here.
@@ -5539,7 +5639,7 @@ def _index_mapper_capacity_for(
     assert not config.constraints
     return (
         index_mapper_cls.call_args.args[0],
-        page_table.call_args.args[0],
+        page_table.call_args.args[1],
         manager.max_admissible_sequences,
     )
 
@@ -5869,20 +5969,26 @@ def _native_config_with_sparse_arena(
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_base_config"
+    )
     def build_base_config(
         self: KVCacheManagerV2,
-        config: KvCacheConfig,
+        kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        cache_tiers: list[object],
+        cache_tiers: list[CacheTierConfig],
     ) -> KVCacheManagerConfig:
-        del self, config
+        del self, kv_cache_config
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block, cache_tiers=cache_tiers, layers=layers
         )
 
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._plan_host_history_budget"
+    )
     def plan_host_history_budget(
-        self: KVCacheManagerV2, kv_cache_config: KvCacheConfig, **kwargs: object
+        self: KVCacheManagerV2, kv_cache_config: KvCacheConfig, *, tokens_per_block: int
     ) -> None:
         # Settles the budget only; the manager divides the device quota against it.
         self._host_history_budget = host_history_budget
@@ -5893,18 +5999,63 @@ def _native_config_with_sparse_arena(
         patch(f"{module}.IndexMapper"),
         patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
-        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
-        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
-        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
-        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
-        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
-        patch.object(
-            KVCacheManagerV2, "_get_sparse_arena_bytes", return_value=arena_bytes
-        ) as get_arena_bytes,
         patch.object(
             KVCacheManagerV2,
-            "_get_sparse_batch_buffer_bytes",
-            return_value=(batch_buffer_bytes, 4096 if batch_buffer_bytes else 0),
+            "_build_cache_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_cache_config"
+            )(lambda self, config: config),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "get_num_available_tokens",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_num_available_tokens"
+            )(
+                lambda self,
+                *,
+                token_num_upper_bound,
+                batch_size=1,
+                max_num_draft_tokens=0: MAX_SEQ_LEN
+            ),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_prepare_page_table_tensor",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_page_table_tensor"
+            )(lambda self, index_mapper_capacity: None),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_log_kv_cache_pool_lifecycle_mapping",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_kv_cache_pool_lifecycle_mapping"
+            )(lambda self: None),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_reserve_guard_page",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._reserve_guard_page"
+            )(lambda self: None),
+        ),
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._get_sparse_arena_bytes"
+        )(
+            patch.object(
+                KVCacheManagerV2, "_get_sparse_arena_bytes", return_value=arena_bytes, autospec=True
+            )
+        ) as get_arena_bytes,
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._get_sparse_batch_buffer_bytes"
+        )(
+            patch.object(
+                KVCacheManagerV2,
+                "_get_sparse_batch_buffer_bytes",
+                return_value=(batch_buffer_bytes, 4096 if batch_buffer_bytes else 0),
+                autospec=True,
+            )
         ) as get_batch_buffer_bytes,
         patch.object(KVCacheManagerV2, "_plan_host_history_budget", plan_host_history_budget),
     ):
@@ -5926,8 +6077,10 @@ def _native_config_with_sparse_arena(
         )
     # A lease follows Batch membership, so the arena is sized by the rows rather than by
     # the 5 indices the mapper can hand out -- disagg doubling and padding included.
-    get_arena_bytes.assert_called_once_with(ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=2)
-    get_batch_buffer_bytes.assert_called_once_with(ANY, tokens_per_block=TOKENS_PER_BLOCK)
+    get_arena_bytes.assert_called_once_with(
+        ANY, ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=2
+    )
+    get_batch_buffer_bytes.assert_called_once_with(ANY, ANY, tokens_per_block=TOKENS_PER_BLOCK)
     return create_impl.call_args.args[0]
 
 
@@ -6001,7 +6154,13 @@ def test_offload_sizing_fails_on_every_rank_before_the_token_sync(
     dist.allreduce.side_effect = [ok, abort]
 
     with (
-        patch.object(Distributed, "get", return_value=dist),
+        patch.object(
+            Distributed,
+            "get",
+            mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+                staticmethod(lambda mapping: dist)
+            ),
+        ),
         pytest.raises(error, match=match),
     ):
         _device_quota_with_sparse_arena(
@@ -6032,7 +6191,13 @@ def test_host_history_budget_is_the_smallest_ranks() -> None:
         return value
 
     dist.allreduce.side_effect = allreduce
-    with patch.object(Distributed, "get", return_value=dist):
+    with patch.object(
+        Distributed,
+        "get",
+        mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+            staticmethod(lambda mapping: dist)
+        ),
+    ):
         config = _native_config_with_sparse_arena(
             arena_bytes=0,
             budget=16 << 20,
@@ -6051,10 +6216,13 @@ def test_host_history_budget_is_the_smallest_ranks() -> None:
 @pytest.mark.cpu_only
 def test_automatic_host_tier_gets_what_offload_leaves(monkeypatch) -> None:
     # The 8 GiB of history and 4 KiB of staging leave 10 MiB of the memlock limit.
+    def _mock_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
+        return HostMemoryLimits(1, float(400 << 30), float((8 << 30) + 4096 + (10 << 20)))
+
     monkeypatch.setattr(
         kv_cache_v2_module,
         "get_host_memory_limits",
-        lambda mapping: HostMemoryLimits(1, float(400 << 30), float((8 << 30) + 4096 + (10 << 20))),
+        _mock_host_memory_limits,
     )
 
     with patch.object(kv_cache_v2_module.logger, "warning") as warning:
@@ -6080,7 +6248,7 @@ def test_automatic_host_tier_takes_what_the_history_pools_leave(
     monkeypatch.setattr(
         kv_cache_v2_module,
         "get_host_memory_limits",
-        lambda mapping: HostMemoryLimits(1, float(400 << 30), float("inf")),
+        (lambda mapping: HostMemoryLimits(1, float(400 << 30), float("inf"))),
     )
 
     config = _native_config_with_sparse_arena(
@@ -6135,7 +6303,13 @@ def _host_tier_growth_manager(pinned: int, *, world_size: int = 1) -> KVCacheMan
 def test_automatic_host_tier_grows_into_unpinned_history(pinned: int, grown_to: int | None) -> None:
     manager = _host_tier_growth_manager(pinned)
 
-    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+    with patch.object(
+        KVCacheManagerV2,
+        "_log_sparse_kv_offload_capacity",
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+        )(lambda self, kv_cache_config: None),
+    ):
         manager._setup_sparse_kv_offload(
             KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
         )
@@ -6154,8 +6328,20 @@ def test_host_tier_keeps_its_size_when_a_rank_cannot_grow_it() -> None:
     dist.allreduce.side_effect = [64, 6 << 30, 0]
 
     with (
-        patch.object(kv_cache_v2_module.Distributed, "get", return_value=dist),
-        patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"),
+        patch.object(
+            kv_cache_v2_module.Distributed,
+            "get",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:Distributed.get"
+            )(staticmethod(lambda mapping: dist)),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_log_sparse_kv_offload_capacity",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+            )(lambda self, kv_cache_config: None),
+        ),
         patch.object(kv_cache_v2_module.logger, "warning") as warning,
     ):
         manager._setup_sparse_kv_offload(
@@ -6185,7 +6371,7 @@ def test_host_tier_keeps_its_size_when_a_rank_cannot_grow_it() -> None:
 def test_host_tier_reserve_holds_one_max_seq_len_request(
     tmp_path, tiers: str, reserve: int
 ) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.max_seq_len = 1000
     manager.num_extra_kv_tokens = 0
     manager._generation_kv_capacity_headroom = 1
@@ -6200,7 +6386,13 @@ def test_host_tier_reserve_holds_one_max_seq_len_request(
         "disk": KvCacheConfig(disk_cache_size=1 << 20, disk_cache_path=str(tmp_path)),
     }[tiers]
 
-    assert manager._get_host_tier_reserve_bytes(kv_cache_config, config) == reserve
+    assert (
+        manager._get_host_tier_reserve_bytes(
+            kv_cache_config,
+            (config),
+        )
+        == reserve
+    )
 
 
 @pytest.mark.cpu_only
@@ -6212,7 +6404,7 @@ def test_host_tier_reserve_holds_only_the_pages_a_window_keeps(
     # life cycle holding its buffers' bytes: the compressed history, which a request keeps
     # whole, its ratio-4 rows offloaded and its indexer keys and ratio-128 rows on the GPU;
     # the 128-token sliding window; and the 8-token compressor state.
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.max_seq_len = max_seq_len
     manager.num_extra_kv_tokens = 0
     manager._generation_kv_capacity_headroom = 1
@@ -6237,7 +6429,10 @@ def test_host_tier_reserve_holds_only_the_pages_a_window_keeps(
         tokens_per_block=128, layers=[history, sliding_window, compressor_state]
     )
 
-    reserve = manager._get_host_tier_reserve_bytes(KvCacheConfig(), config)
+    reserve = manager._get_host_tier_reserve_bytes(
+        KvCacheConfig(),
+        (config),
+    )
 
     # Each window keeps the two pages its live tokens can straddle, so one request holds
     # 0.46 GiB at 128K tokens and 3.13 GiB at 1M, not the 39.3 GiB and 314.6 GiB that
@@ -6254,7 +6449,7 @@ def test_offload_refuses_to_leave_no_room_for_the_automatic_host_tier(
     monkeypatch.setattr(
         kv_cache_v2_module,
         "get_host_memory_limits",
-        lambda mapping: HostMemoryLimits(1, float(400 << 30), float(8 << 30)),
+        (lambda mapping: HostMemoryLimits(1, float(400 << 30), float(8 << 30))),
     )
     kwargs = dict(
         arena_bytes=0,
@@ -6321,12 +6516,18 @@ def test_raise_on_every_rank_agrees_across_ranks(
     dist = Mock()
     dist.allreduce.return_value = int(agreed_status)
 
-    with patch.object(Distributed, "get", return_value=dist):
+    with patch.object(
+        Distributed,
+        "get",
+        mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+            staticmethod(lambda mapping: dist)
+        ),
+    ):
         if raised is None:
-            _raise_on_every_rank(error, mapping, "Checking")
+            _raise_on_every_rank(error, (mapping), "Checking")
         else:
             with pytest.raises(raised, match=match):
-                _raise_on_every_rank(error, mapping, "Checking")
+                _raise_on_every_rank(error, (mapping), "Checking")
 
     # Every rank offers its own outcome through the init-status sync, and the most
     # severe one is every rank's.
@@ -6338,10 +6539,16 @@ def test_raise_on_every_rank_agrees_across_ranks(
 def test_raise_on_every_rank_needs_no_collective_on_one_rank() -> None:
     mapping = SimpleNamespace(world_size=1, rank=0)
 
-    with patch.object(Distributed, "get") as get:
-        _raise_on_every_rank(None, mapping, "Checking")
+    with mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+        patch.object(Distributed, "get", autospec=True)
+    ) as get:
+        _raise_on_every_rank(None, (mapping), "Checking")
         with pytest.raises(ValueError, match="no room"):
-            _raise_on_every_rank(ValueError("no room"), mapping, "Checking")
+            _raise_on_every_rank(
+                ValueError("no room"),
+                (mapping),
+                "Checking",
+            )
 
     get.assert_not_called()
 
@@ -6357,14 +6564,18 @@ def test_sparse_arena_without_a_reservation_is_rejected() -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("offload", [False, True])
 def test_sparse_arena_bytes_come_from_a_provisional_config(offload: bool) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.max_seq_len = MAX_SEQ_LEN
     manager.mapping = Mapping()
     if offload:
         manager._sparse_kv_offload = SparseKvCacheOffloadConfig()
     config = _sparse_arena_config(2, False)
 
-    with patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config) as build:
+    with mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_manager_config"
+    )(
+        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config, autospec=True)
+    ) as build:
         arena_bytes = manager._get_sparse_arena_bytes(
             KvCacheConfig(), tokens_per_block=16, max_leases=5
         )
@@ -6382,7 +6593,7 @@ def test_sparse_arena_bytes_come_from_a_provisional_config(offload: bool) -> Non
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("offload", [False, True])
 def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.mapping = Mapping()
     manager.max_seq_len = MAX_SEQ_LEN
     manager.max_batch_size = 2
@@ -6397,9 +6608,22 @@ def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> N
     )
 
     with (
-        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config) as build,
-        patch.object(
-            KVCacheManagerV2, "get_sparse_offload_scratch_bytes", return_value=1000
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_manager_config"
+        )(
+            patch.object(
+                KVCacheManagerV2, "_build_manager_config", return_value=config, autospec=True
+            )
+        ) as build,
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_sparse_offload_scratch_bytes"
+        )(
+            patch.object(
+                KVCacheManagerV2,
+                "get_sparse_offload_scratch_bytes",
+                return_value=1000,
+                autospec=True,
+            )
         ) as get_scratch_bytes,
     ):
         device_bytes, staging_bytes = manager._get_sparse_batch_buffer_bytes(
@@ -6426,7 +6650,7 @@ def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> N
         + 1000
     )
     assert staging_bytes == batch.staging_bytes == 4096
-    get_scratch_bytes.assert_called_once_with(config)
+    get_scratch_bytes.assert_called_once_with(manager, config)
     (gpu_tier,) = build.call_args.kwargs["cache_tiers"]
     assert gpu_tier.quota == sys.maxsize
 
@@ -6437,7 +6661,13 @@ def test_sparse_startup_rejects_ordinal_overflow_before_sizing() -> None:
     manager.max_seq_len = 262_143 * 4
     config = _sparse_arena_config(2, False)
     with (
-        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config),
+        patch.object(
+            KVCacheManagerV2,
+            "_build_manager_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_manager_config"
+            )(lambda self, kv_cache_config, *, tokens_per_block, cache_tiers: config),
+        ),
         patch.object(kv_cache_v2_module, "sparse_arena_bytes") as size_arena,
         pytest.raises(ValueError, match="max_seq_len=1048572"),
     ):
@@ -6465,8 +6695,20 @@ def test_sparse_ordinal_overflow_fails_startup_on_every_rank(local_overflow: boo
     error_type = ValueError if local_overflow else RuntimeError
     message = "unit_tokens=1" if local_overflow else "sequence-length check failed on another rank"
     with (
-        patch.object(Distributed, "get", return_value=dist),
-        patch.object(KVCacheManagerV2, "_build_manager_config", return_value=config),
+        patch.object(
+            Distributed,
+            "get",
+            mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+                staticmethod(lambda mapping: dist)
+            ),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_build_manager_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_manager_config"
+            )(lambda self, kv_cache_config, *, tokens_per_block, cache_tiers: config),
+        ),
         patch.object(kv_cache_v2_module, "sparse_arena_bytes") as size_arena,
         pytest.raises(error_type, match=message),
     ):
@@ -6485,7 +6727,7 @@ def test_sparse_ordinal_overflow_fails_startup_on_every_rank(local_overflow: boo
 def test_page_table_holds_the_decode_step_and_pads_to_four_pages(
     max_seq_len: int, headroom: int, max_blocks_per_seq: int
 ) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager._generation_kv_capacity_headroom = headroom
     manager._ledger_tokens_per_block = TOKENS_PER_BLOCK
 
@@ -6493,7 +6735,7 @@ def test_page_table_holds_the_decode_step_and_pads_to_four_pages(
 
 
 def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     if host_capacity_blocks is not None:
         manager._host_history_reservations = HostHistoryReservations(host_capacity_blocks)
     manager.num_extra_kv_tokens = 0
@@ -6504,7 +6746,7 @@ def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
 
 
 def _gen_init_request(request_id: int, prompt_len: int, max_new_tokens: int):
-    return SimpleNamespace(
+    return make_llm_request_stub(
         py_request_id=request_id,
         prompt_len=prompt_len,
         orig_prompt_len=prompt_len,
@@ -6519,8 +6761,12 @@ def test_gen_init_reserves_host_history_to_completion() -> None:
     manager = _gen_init_manager(host_capacity_blocks=10)
     reservations = manager._host_history_reservations
 
-    with patch.object(
-        KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True
+    with mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_disagg_gen_init_cache"
+    )(
+        patch.object(
+            KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True, autospec=True
+        )
     ) as prepare:
         # 641 tokens through the last output token span six blocks.
         assert manager.prepare_disagg_gen_init(_gen_init_request(1, 512, 129))
@@ -6534,7 +6780,13 @@ def test_gen_init_reserves_host_history_to_completion() -> None:
         assert reservations.reserved_blocks == 7
         # A request larger than the whole pool is never admitted.
         assert not manager.prepare_disagg_gen_init(_gen_init_request(3, 128 * 11, 0))
-    with patch.object(KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=False):
+    with patch.object(
+        KVCacheManagerV2,
+        "_prepare_disagg_gen_init_cache",
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_disagg_gen_init_cache"
+        )(lambda self, req: False),
+    ):
         # A request whose cache could not be prepared reserves nothing.
         assert not manager.prepare_disagg_gen_init(_gen_init_request(4, 128, 0))
     assert reservations.reserved_blocks == 7
@@ -6544,8 +6796,12 @@ def test_gen_init_reserves_host_history_to_completion() -> None:
 def test_gen_init_without_sparse_offload_reserves_nothing() -> None:
     manager = _gen_init_manager(host_capacity_blocks=None)
 
-    with patch.object(
-        KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True
+    with mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_disagg_gen_init_cache"
+    )(
+        patch.object(
+            KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True, autospec=True
+        )
     ) as prepare:
         assert manager.prepare_disagg_gen_init(_gen_init_request(1, 1 << 20, 0))
 
@@ -6569,7 +6825,13 @@ def test_request_larger_than_host_history_is_rejected_on_arrival() -> None:
     # Ten blocks fit, and admission reserves exactly what the check counted.
     request = _gen_init_request(2, 1024, 256)
     executor._validate_request_budget(request)
-    with patch.object(KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True):
+    with patch.object(
+        KVCacheManagerV2,
+        "_prepare_disagg_gen_init_cache",
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_disagg_gen_init_cache"
+        )(lambda self, req: True),
+    ):
         assert manager.prepare_disagg_gen_init(request)
     assert manager._host_history_reservations.reserved_blocks == 10
 
@@ -6588,13 +6850,12 @@ def _offload_setup_manager(
     Without ``cold_tier`` it has no cache tier below the GPU, so admission reserves
     history.
     """
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     tiers = [CacheTier.GPU_MEM, CacheTier.HOST_MEM] if cold_tier else [CacheTier.GPU_MEM]
     manager.impl = SimpleNamespace(cache_tier_list=tiers)
     manager.mapping = SimpleNamespace(
         world_size=world_size, rank=0, enable_attention_dp=attention_dp
     )
-    manager.is_estimating_kv_cache = False
     manager.num_extra_kv_tokens = 0
     manager.max_total_draft_tokens = max_total_draft_tokens
     manager.tokens_per_block = 128
@@ -6625,8 +6886,20 @@ def test_sparse_offload_setup_judges_requests_by_the_smallest_host_pool(
     dist.allreduce.side_effect = lambda value, op: min(value, peer_slots)
 
     with (
-        patch.object(kv_cache_v2_module.Distributed, "get", return_value=dist),
-        patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"),
+        patch.object(
+            kv_cache_v2_module.Distributed,
+            "get",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:Distributed.get"
+            )(staticmethod(lambda mapping: dist)),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_log_sparse_kv_offload_capacity",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+            )(lambda self, kv_cache_config: None),
+        ),
         patch.object(kv_cache_v2_module.logger, "warning") as warning,
     ):
         manager._setup_sparse_kv_offload(
@@ -6658,7 +6931,13 @@ def test_sparse_offload_admits_by_current_need_with_a_cold_tier() -> None:
     # could never fit alone is still rejected on arrival.
     manager = _offload_setup_manager([12, 10], cold_tier=True)
 
-    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+    with patch.object(
+        KVCacheManagerV2,
+        "_log_sparse_kv_offload_capacity",
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+        )(lambda self, kv_cache_config: None),
+    ):
         manager._setup_sparse_kv_offload(
             KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
         )
@@ -6668,8 +6947,12 @@ def test_sparse_offload_admits_by_current_need_with_a_cold_tier() -> None:
     assert manager.get_request_kv_block_budget(_gen_init_request(1, 128 * 11, 0)) == (11, 10)
     manager._on_allocation_stream = set()
     manager._allocation_ready = {}
-    with patch.object(
-        KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True
+    with mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_disagg_gen_init_cache"
+    )(
+        patch.object(
+            KVCacheManagerV2, "_prepare_disagg_gen_init_cache", return_value=True, autospec=True
+        )
     ) as prepare:
         # Two requests of ten blocks each are admitted beside each other.
         assert manager.prepare_disagg_gen_init(_gen_init_request(1, 1024, 256))
@@ -6689,7 +6972,13 @@ def test_a_remote_level_alone_below_the_gpu_reserves_history_and_stops_counting_
     )
     manager._can_evict = manager._only_remote_below_gpu = True
 
-    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+    with patch.object(
+        KVCacheManagerV2,
+        "_log_sparse_kv_offload_capacity",
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+        )(lambda self, kv_cache_config: None),
+    ):
         manager._setup_sparse_kv_offload(
             KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
         )
@@ -6709,7 +6998,13 @@ def test_sparse_offload_setup_warns_when_max_seq_len_outgrows_host_history() -> 
     manager = _offload_setup_manager([8])
 
     with (
-        patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"),
+        patch.object(
+            KVCacheManagerV2,
+            "_log_sparse_kv_offload_capacity",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+            )(lambda self, kv_cache_config: None),
+        ),
         patch.object(kv_cache_v2_module.logger, "warning") as warning,
     ):
         manager._setup_sparse_kv_offload(
@@ -6749,7 +7044,13 @@ def test_sparse_offload_setup_sets_dummy_history_aside(
         max_total_draft_tokens=draft_tokens,
     )
 
-    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+    with patch.object(
+        KVCacheManagerV2,
+        "_log_sparse_kv_offload_capacity",
+        mock_target(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_sparse_kv_offload_capacity"
+        )(lambda self, kv_cache_config: None),
+    ):
         manager._setup_sparse_kv_offload(
             KvCacheConfig(), max_seq_len=128, num_reserved_index_slots=num_reserved_index_slots
         )
@@ -6795,7 +7096,9 @@ def test_host_memory_limits_cap_automatic_pinning() -> None:
 def test_sparse_kv_offload_config_is_checked_against_this_rank(monkeypatch) -> None:
     limits = {"value": HostMemoryLimits(4, float(400 << 30), float("inf"))}
     monkeypatch.setattr(
-        kv_cache_v2_module, "get_host_memory_limits", lambda mapping: limits["value"]
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        (lambda mapping: limits["value"]),
     )
 
     def check(offload_config, kv_cache_config, mapping):
@@ -6881,13 +7184,19 @@ def test_sparse_kv_offload_config_check_fails_on_every_rank(monkeypatch) -> None
     monkeypatch.setattr(
         kv_cache_v2_module,
         "get_host_memory_limits",
-        lambda mapping: HostMemoryLimits(4, float(400 << 30), float("inf")),
+        (lambda mapping: HostMemoryLimits(4, float(400 << 30), float("inf"))),
     )
     dist = Mock()
     dist.allreduce.return_value = int(_KVCacheManagerInitStatus.ABORT)
 
     with (
-        patch.object(Distributed, "get", return_value=dist),
+        patch.object(
+            Distributed,
+            "get",
+            mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
+                staticmethod(lambda mapping: dist)
+            ),
+        ),
         pytest.raises(RuntimeError, match="config check failed on another rank"),
     ):
         KVCacheManagerV2._check_sparse_kv_offload_config(
@@ -6922,7 +7231,7 @@ def _offload_layers() -> list[AttentionLayerConfig]:
 
 
 def _offload_manager(host_history_size: int | None = None) -> KVCacheManagerV2:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager._sparse_kv_offload = SparseKvCacheOffloadConfig(host_history_size=host_history_size)
     manager.max_seq_len = MAX_SEQ_LEN
     manager.max_batch_size = 2
@@ -6939,8 +7248,20 @@ def _base_config(layers: list, initial_pool_ratio: list[float] | None = None):
         initial_pool_ratio=initial_pool_ratio,
     )
     return (
-        patch.object(KVCacheManagerV2, "_build_base_config", return_value=config),
-        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
+        patch.object(
+            KVCacheManagerV2,
+            "_build_base_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_base_config"
+            )(lambda self, kv_cache_config, *, tokens_per_block, cache_tiers: config),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_build_cache_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_cache_config"
+            )(lambda self, config: config),
+        ),
     )
 
 
@@ -6964,7 +7285,7 @@ def test_offload_leaves_the_pool_ratio_to_the_manager_unless_pinned(pinned: bool
 
 @pytest.mark.cpu_only
 def test_host_backed_pools_come_from_the_native_pool_descriptions() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
 
     def group(*media: CacheTier) -> SimpleNamespace:
         return SimpleNamespace(
@@ -7010,14 +7331,17 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_base_config"
+    )
     def build_base_config(
         self: KVCacheManagerV2,
-        config: KvCacheConfig,
+        kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        cache_tiers: list[object],
+        cache_tiers: list[CacheTierConfig],
     ) -> KVCacheManagerConfig:
-        del self, config
+        del self, kv_cache_config
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
@@ -7028,7 +7352,7 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
     monkeypatch.setattr(
         kv_cache_v2_module,
         "get_host_memory_limits",
-        lambda mapping: HostMemoryLimits(1, float(250 << 20), float("inf")),
+        (lambda mapping: HostMemoryLimits(1, float(250 << 20), float("inf"))),
     )
     with (
         patch.dict(os.environ, {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""}),
@@ -7036,11 +7360,47 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
         patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
         patch(f"{module}.is_device_integrated", return_value=False),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
-        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
-        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
-        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
-        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
-        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
+        patch.object(
+            KVCacheManagerV2,
+            "_build_cache_config",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_cache_config"
+            )(lambda self, config: config),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "get_num_available_tokens",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_num_available_tokens"
+            )(
+                lambda self,
+                *,
+                token_num_upper_bound,
+                batch_size=1,
+                max_num_draft_tokens=0: MAX_SEQ_LEN
+            ),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_prepare_page_table_tensor",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._prepare_page_table_tensor"
+            )(lambda self, index_mapper_capacity: None),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_log_kv_cache_pool_lifecycle_mapping",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._log_kv_cache_pool_lifecycle_mapping"
+            )(lambda self: None),
+        ),
+        patch.object(
+            KVCacheManagerV2,
+            "_reserve_guard_page",
+            mock_target(
+                "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._reserve_guard_page"
+            )(lambda self: None),
+        ),
     ):
         KVCacheManagerV2(
             KvCacheConfig(max_gpu_total_bytes=64 << 20, enable_block_reuse=False),
@@ -7140,18 +7500,20 @@ def test_fill_kv_pages_skips_dtype_without_index_fill():
 
 def test_guard_page_accessors_report_no_guard_by_default():
     """With the guard page off, backends see ``None`` and keep page 0."""
-    manager = SimpleNamespace(_guard_page_by_layer={})
-    assert KVCacheManagerV2.guard_page_index(manager, 0) is None
-    assert KVCacheManagerV2.guard_page_indices(manager) == frozenset()
+    manager = make_host_cache_manager()
+    assert manager.guard_page_index(0) is None
+    assert manager.guard_page_indices() == frozenset()
 
 
 def test_guard_page_accessors_report_reserved_pages():
     # Layers in one pool can carry different page-index scales, so one
     # reservation can surface as more than one index.
-    manager = SimpleNamespace(_guard_page_by_layer={0: 7, 1: 14, 2: 7})
-    assert KVCacheManagerV2.guard_page_index(manager, 1) == 14
-    assert KVCacheManagerV2.guard_page_index(manager, 9) is None
-    assert KVCacheManagerV2.guard_page_indices(manager) == frozenset({7, 14})
+    manager = make_host_cache_manager()
+    manager._guard_page_by_layer = {0: 7, 1: 14, 2: 7}
+
+    assert manager.guard_page_index(1) == 14
+    assert manager.guard_page_index(9) is None
+    assert manager.guard_page_indices() == frozenset({7, 14})
 
 
 class _FreshFillKVCache:
@@ -7182,10 +7544,16 @@ def _make_fresh_fill_manager(
 ) -> KVCacheManagerV2:
     # These tests use CPU tensors and an explicit stream double; a device-wide wait is forbidden.
     monkeypatch.setattr(
-        torch.cuda, "synchronize", Mock(side_effect=AssertionError("device-wide fill sync"))
+        torch.cuda,
+        "synchronize",
+        (Mock(side_effect=AssertionError("device-wide fill sync"))),
     )
-    monkeypatch.setattr(torch.cuda, "current_stream", Mock(return_value=Mock()))
-    manager = object.__new__(KVCacheManagerV2)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        (Mock(return_value=Mock())),
+    )
+    manager = make_host_cache_manager()
     manager._stream = SimpleNamespace(device=torch.device("cuda:0"))
     manager._fresh_page_fill = fill_value
     manager.layer_specs = None
@@ -7216,7 +7584,11 @@ def test_fresh_fill_covers_pages_on_allocation(monkeypatch: pytest.MonkeyPatch) 
     order = Mock()
     order.attach_mock(torch.cuda.current_stream.return_value, "stream")
     fill = Mock(wraps=kv_cache_v2_module._fill_kv_pages)
-    monkeypatch.setattr(kv_cache_v2_module, "_fill_kv_pages", fill)
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "_fill_kv_pages",
+        (fill),
+    )
     order.attach_mock(fill, "fill")
 
     manager._fill_fresh_kv_pages(1)
@@ -7397,8 +7769,8 @@ def _make_guard_manager(
     buffer: torch.Tensor | None,
     page: int,
 ) -> KVCacheManagerV2:
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    manager = object.__new__(KVCacheManagerV2)
+    monkeypatch.setattr(torch.cuda, "synchronize", (lambda: None))
+    manager = make_host_cache_manager()
     manager._guard_page_fill = "nan"
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
@@ -7501,13 +7873,13 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
     """``check_invalid_values_in_kv_cache(fill_with_zero=True)`` runs during
     warmup and scrubs the cache; it must leave the guard-page sentinel intact,
     otherwise the startup warning claims a guard that no longer exists."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(torch.cuda, "synchronize", (lambda: None))
+    monkeypatch.setattr(torch.cuda, "current_device", (lambda: "cpu"))
     guard_page = 3
     buffer = torch.ones(6, 2)
     buffer[guard_page] = float("nan")  # the guard sentinel
 
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.layer_offsets = {0: 0}
     manager.layer_specs = None
     manager.layer_to_pool_mapping_dict = {0: 0}
@@ -7525,7 +7897,7 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("offload", [False, True])
 def test_warmup_scan_leaves_host_backed_history_alone(offload: bool) -> None:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.layer_offsets = {0: 0, 1: 1}
     manager.layer_to_pool_mapping_dict = {0: 0, 1: 1}
     manager.layer_specs = None
@@ -7579,7 +7951,7 @@ class _FakeWindowedKVCache:
 
 
 def _make_window_crossing_manager() -> KVCacheManagerV2:
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.max_seq_len = 4096
     manager.tokens_per_block = 64
     # Group 0 is windowed at 2048; group 1 spans the whole sequence, so it is
@@ -7589,10 +7961,10 @@ def _make_window_crossing_manager() -> KVCacheManagerV2:
 
 
 def test_window_crossing_logs_once_with_capacity_and_blocks(monkeypatch) -> None:
-    fake_logger = _FakeLogger()
-    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
-
     manager = _make_window_crossing_manager()
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
+
     kv_cache = _FakeWindowedKVCache({0: [7, 8, 9]})
     request = SimpleNamespace(py_request_id=42)
 
@@ -7625,10 +7997,10 @@ def test_window_crossing_logs_once_with_capacity_and_blocks(monkeypatch) -> None
 def test_window_crossing_is_silent_without_a_crossing(
     monkeypatch, pre_capacity: int, new_capacity: int
 ) -> None:
-    fake_logger = _FakeLogger()
-    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
-
     manager = _make_window_crossing_manager()
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
+
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1),
         _FakeWindowedKVCache({0: [1]}),
@@ -7658,6 +8030,7 @@ def test_window_crossing_does_not_query_the_logger_without_a_crossing(
     stack, so consulting it before the integer crossing test puts that cost
     on every request of every iteration.
     """
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger()
     calls: list[None] = []
 
@@ -7666,9 +8039,8 @@ def test_window_crossing_does_not_query_the_logger_without_a_crossing(
         return True
 
     fake_logger.is_debug_enabled = counting_is_debug_enabled
-    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
-    manager = _make_window_crossing_manager()
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1),
         _FakeWindowedKVCache({0: [1]}),
@@ -7692,10 +8064,10 @@ def test_window_crossing_follows_the_logger_severity_order(monkeypatch, level, e
     guard that compares the level to the literal ``"debug"`` suppresses the
     line for users who did enable it.
     """
-    fake_logger = _FakeLogger(level=level)
-    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
-
     manager = _make_window_crossing_manager()
+    fake_logger = _FakeLogger(level=level)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
+
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 2047, 2049, "context"
     )
@@ -7727,7 +8099,11 @@ def test_window_crossing_honours_per_module_log_levels(
     recorded: list[str] = []
     monkeypatch.setattr(real_logger, "_min_severity", global_level)
     monkeypatch.setattr(real_logger, "_module_levels", {"_torch": module_level})
-    monkeypatch.setattr(real_logger, "debug", lambda *msg: recorded.append(" ".join(map(str, msg))))
+    monkeypatch.setattr(
+        real_logger,
+        "debug",
+        (lambda *msg: recorded.append(" ".join(map(str, msg)))),
+    )
 
     manager = _make_window_crossing_manager()
     manager._log_window_crossing(
@@ -7739,14 +8115,14 @@ def test_window_crossing_honours_per_module_log_levels(
 
 def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
     """Diagnostics must never turn a working run into a failing one."""
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger()
-    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
     class _BrokenKVCache:
         def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
             raise KeyError("no base buffer")
 
-    manager = _make_window_crossing_manager()
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1), _BrokenKVCache(), 2047, 2049, "context"
     )
@@ -7877,10 +8253,9 @@ def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(
         vocab_size=4096,
         enable_stats=False,
     )
-    request = _ContextRequest(
+    request = _make_context_request(
         1,
         list(range(prompt_len)),
-        prompt_len,
         "conversation",
         use_conversation_params=False,
         is_disagg_generation_init_state=disagg,
@@ -7890,22 +8265,19 @@ def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(
         assert manager._generation_kv_capacity_headroom == max_draft_len + 1 + block_width
         if disagg:
             request.py_draft_tokens = []
-            request.is_disagg_generation_transmission_complete = False
-            request.context_phase_params = None
             assert manager.prepare_disagg_gen_init(request)
-            request.is_disagg_generation_init_state = False
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
         else:
             _run_context(manager, request)
-        generation = SimpleNamespace(
-            py_request_id=request.py_request_id,
-            py_beam_width=1,
-            py_draft_tokens=[0] * max_draft_len,
-            state=LlmRequestState.GENERATION_IN_PROGRESS,
-            is_dummy_request=False,
-            is_disagg_generation_transmission_complete=False,
-            context_phase_params=None,
-            max_beam_num_tokens=prompt_len + 1,
+        generation = LlmRequest(
+            request_id=request.py_request_id,
+            max_new_tokens=max_draft_len + 1,
+            input_tokens=list(range(prompt_len + 1)),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
         )
+        generation.state = LlmRequestState.GENERATION_IN_PROGRESS
+        generation.py_draft_tokens = [0] * max_draft_len
         assert manager.try_allocate_generation(generation)
 
         furthest_write_end = prompt_len + max_draft_len + 1 + block_width
@@ -7945,13 +8317,16 @@ def test_cost_headroom_counts_the_drafter_block_only_for_shared_layers() -> None
 
 def test_generation_token_slice_shares_token_view() -> None:
     token_view = np.arange(10, dtype=np.int32)
-    request = SimpleNamespace(
-        get_tokens_view=Mock(return_value=token_view),
-        multimodal_hashes=None,
-        multimodal_positions=None,
-        multimodal_lengths=None,
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=10,
+        input_tokens=[0],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
     )
-    manager = object.__new__(KVCacheManagerV2)
+    get_tokens_view = Mock(return_value=token_view)
+    request.get_tokens_view = get_tokens_view
+    manager = make_host_cache_manager()
 
     source = manager._reuse_token_source(request)
     result = manager._augment_tokens_for_block_reuse(source, request, start=7, end=10)
@@ -7959,7 +8334,7 @@ def test_generation_token_slice_shares_token_view() -> None:
     assert source is token_view
     np.testing.assert_array_equal(result, [7, 8, 9])
     assert np.shares_memory(result, token_view)
-    request.get_tokens_view.assert_called_once_with(DEFAULT_BEAM_INDEX)
+    get_tokens_view.assert_called_once_with(DEFAULT_BEAM_INDEX)
 
 
 # Only a range that still overlaps the prompt can hold multimodal items to augment.
@@ -8056,7 +8431,10 @@ def test_try_commit_generation_blocks_honors_guards(
 def test_default_attention_rejects_split_coupled_buffers(monkeypatch, role):
     original = KVCacheManagerV2._build_cache_config
 
-    def build_config(self, config):
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._build_cache_config"
+    )
+    def build_config(self: KVCacheManagerV2, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
         config = original(self, config)
         layers = list(config.layers)
         layer = layers[0]
@@ -8256,15 +8634,15 @@ def test_disk_tier_from_config_keeps_evicted_prefixes(tmp_path) -> None:
             GpuCacheTierConfig,
             DiskCacheTierConfig,
         ]
-        first = _ContextRequest(1, list(range(512)), 512, "conv-1")
+        first = _make_context_request(1, list(range(512)), "conv-1")
         _run_context(manager, first)
         manager.free_resources(first)
         # Fill the GPU pool with other prompts so the first prompt's blocks go to disk.
         disk = manager.impl.get_storage_statistics(CacheLevel(1))
         request_id = 2
         while all(stats.free == stats.total for stats in disk):
-            other = _ContextRequest(
-                request_id, [request_id * 1000 + i for i in range(512)], 512, f"conv-{request_id}"
+            other = _make_context_request(
+                request_id, [request_id * 1000 + i for i in range(512)], f"conv-{request_id}"
             )
             _run_context(manager, other)
             manager.free_resources(other)
@@ -8444,17 +8822,19 @@ class TestVetoedContextChunk:
         """Another attention-DP rank had nothing to run, so this batch is skipped."""
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-        executor = SimpleNamespace(
-            _is_kv_manager_v2=True,
-            kv_cache_manager=manager,
-            enable_joint_kv_cache_reuse=False,
-            _num_skipped_forward_ctx_chunks=0,
-            _num_reverted_ctx_tokens=0,
-        )
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = True
+        executor.kv_cache_manager = manager
+        executor.enable_joint_kv_cache_reuse = False
+        executor._num_skipped_forward_ctx_chunks = 0
+        executor._num_reverted_ctx_tokens = 0
         batch = ScheduledRequests()
         for request in output.context_requests:
             batch.append_context_request(request)
-        PyExecutor._revert_unexecuted_alloc(executor, batch)
+        PyExecutor._revert_unexecuted_alloc(
+            executor,
+            batch,
+        )
 
     def test_chunk_dropped_after_scheduling_is_given_back(self, manager) -> None:
         """A chunk the scheduler grew but _schedule drops (here the KV-length cap) gives the growth
