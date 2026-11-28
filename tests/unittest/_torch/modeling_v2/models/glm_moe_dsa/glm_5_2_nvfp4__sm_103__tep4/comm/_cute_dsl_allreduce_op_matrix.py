@@ -31,7 +31,6 @@ module scope: `_rank_job` executes it to read `DEADLINE_S`.
 
 import os
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -1049,15 +1048,22 @@ def _spawn_ranks() -> None:
     assert world_size == WORLD_SIZE, (
         f"CUDA_VISIBLE_DEVICES names {world_size} device(s); these entries need {WORLD_SIZE}"
     )
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    store = dist.TCPStore(
+        "127.0.0.1",
+        0,
+        is_master=True,
+        wait_for_workers=False,
+        use_libuv=os.environ.get("USE_LIBUV", "1") == "1",
+    )
+    port = store.port
     env = dict(
         os.environ,
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
         WORLD_SIZE=str(world_size),
         TLLM_DISABLE_MPI="1",
+        TORCHELASTIC_USE_AGENT_STORE="True",
     )
     # Drop a launching srun step's PMIx/PMI/OMPI namespace from the children:
     # inherited, it registers them as participants of that step, and the first
@@ -1065,43 +1071,50 @@ def _spawn_ranks() -> None:
     # anything is reported. These ranks rendezvous through torch.distributed.
     env = {k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))}
     print(f"[launcher] spawning {world_size} ranks, rendezvous on :{port}", flush=True)
-    children = [
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
-            env=dict(env, RANK=str(r)),
-            start_new_session=True,
-        )
-        for r in range(world_size)
-    ]
+    children = []
+    succeeded = False
+    try:
+        for rank in range(world_size):
+            children.append(
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
+                    env=dict(env, RANK=str(rank)),
+                    start_new_session=True,
+                )
+            )
 
-    def _kill_all() -> None:
-        for p in children:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        for p in children:
-            p.wait()
-
-    deadline = time.monotonic() + DEADLINE_S
-    live = set(range(world_size))
-    failure = None
-    while live and failure is None:
-        if time.monotonic() > deadline:
-            failure = f"did not finish in {DEADLINE_S}s (wedged)"
-            break
-        for r in sorted(live):
-            code = children[r].poll()
-            if code is None:
-                continue
-            live.discard(r)
-            if code != 0:
-                failure = f"rank {r} exited {code}"
+        deadline = time.monotonic() + DEADLINE_S
+        live = set(range(world_size))
+        failure = None
+        while live and failure is None:
+            if time.monotonic() > deadline:
+                failure = f"did not finish in {DEADLINE_S}s (wedged)"
                 break
-        time.sleep(0.5)
-    if failure is not None:
-        _kill_all()
-        raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+            for rank in sorted(live):
+                status = os.waitid(
+                    os.P_PID, children[rank].pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+                )
+                if status is None:
+                    continue
+                live.discard(rank)
+                code = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+                if code != 0:
+                    failure = f"rank {rank} exited {code}"
+                    break
+            time.sleep(0.5)
+        if failure is not None:
+            raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+        succeeded = True
+    finally:
+        if not succeeded:
+            for child in children:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        for child in children:
+            child.wait()
+        del store
 
 
 if __name__ == "__main__":

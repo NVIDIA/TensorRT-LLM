@@ -14,6 +14,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4/comm/test_modeling_v2_cute_dsl_allreduce_op_matrix.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_reporting.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_prefill_fullgraph.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
