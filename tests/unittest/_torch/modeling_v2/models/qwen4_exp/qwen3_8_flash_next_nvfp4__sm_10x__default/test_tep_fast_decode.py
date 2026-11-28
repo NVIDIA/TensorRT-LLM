@@ -10,7 +10,8 @@
   three-launch site; without it every site keeps the three launches.
 * **Sparse GQA at the tep4 shard** (GPU): `qsa_sparse_gqa_splitk_cute` over 6 q heads on one
   e4m3 KV head, gated by the trunk's projection row, within the band every sparse GQA entry
-  holds against its fp32 reference, eagerly and replayed from a CUDA graph.
+  holds against its fp32 reference, eagerly and replayed from a CUDA graph. The shard's first
+  call, which names the target's reach (`max_rows`), compiles every plan up to 16 rows.
 
 The route front at tep4 is covered by `test_route_front.py` and the op's tep4 cells.
 """
@@ -20,6 +21,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
+    qsa_sparse_gqa_splitk_cute__decode as splitk_mod,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     modeling as M,
 )
@@ -205,6 +209,53 @@ def test_splitk_serves_the_tep4_shard(rows):
     torch.cuda.synchronize()
     assert torch.equal(captured, op(**args))
     assert_within_ulp(captured, op.reference(**args), element_ulp=4.0, rms_ulp=2.0)
+
+
+def _splitk_compiled():
+    """The split-K op's compiled `(splits, tiles per split)` split passes and merge widths."""
+    keys = splitk_mod._COMPILED
+    splits = {k[-3:-1] for k in keys if k[0] != "merge"}
+    merges = {k[2] for k in keys if k[0] == "merge"}
+    return splits, merges
+
+
+@_GPU
+def test_splitk_first_call_compiles_every_plan_up_to_the_callers_reach(monkeypatch):
+    """The tep4 shard is not in the op's `MAX_ROWS`: a first call of 4 rows compiles the 4-row
+    plans only, unless the caller names its reach (`max_rows`, the target's 16). With it, that
+    call compiles the split pass and merge of every plan 1..16 rows reach, and no later call of
+    up to 16 rows, gated or not, compiles another."""
+    device = torch.device("cuda")
+    op = M.qsa_sparse_gqa_splitk_cute
+    reach = M._TEP_SPLITK_MAX_ROWS[(_HQ, _HKV, torch.float8_e4m3fn)]
+    args = _tep4_call(reach, 5000, device)
+    assert (_HQ, _HKV, torch.float8_e4m3fn) not in splitk_mod.MAX_ROWS
+    elem = 1  # e4m3
+    sliced = ("q", "selected_tokens", "request_indices", "output_gate")
+
+    def call(rows, gated=True, **kwargs):
+        a = {n: (v[:rows] if n in sliced else v) for n, v in args.items()}
+        if not gated:
+            del a["output_gate"]
+        return op(**a, **kwargs)
+
+    def plans(rows):
+        return set(splitk_mod.reachable_plans(rows, _HKV, _WIDTH, elem))
+
+    assert plans(4) < plans(reach), "the reach adds plans past the first call's rows"
+    for named in (None, reach):
+        monkeypatch.setattr(splitk_mod, "_COMPILED", {})
+        monkeypatch.setattr(splitk_mod, "_PLANNED", set())
+        call(4, max_rows=named)
+        want = plans(4 if named is None else reach)
+        splits, merges = _splitk_compiled()
+        assert splits == want, (named, sorted(splits), sorted(want))
+        assert merges == {n for n, _ in want if n > 1}, (named, sorted(merges))
+    compiled = set(splitk_mod._COMPILED)
+    for rows in range(1, reach + 1):
+        for gated in (True, False):
+            call(rows, gated)
+            assert set(splitk_mod._COMPILED) == compiled, f"{rows} rows, gated={gated} compiled"
 
 
 @_GPU
