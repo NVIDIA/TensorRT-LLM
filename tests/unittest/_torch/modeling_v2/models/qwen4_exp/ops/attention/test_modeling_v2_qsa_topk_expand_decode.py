@@ -15,6 +15,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
+    qsa_topk_expand_decode as _module,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (  # noqa: E501
     qsa_canonical_selection,
 )
@@ -23,6 +26,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_b
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
     qsa_topk_expand_decode as op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
+    takes_context,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_select import (  # noqa: E501
     qsa_topk_select,
@@ -92,15 +98,18 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     want_topk, want_sel = op.reference(*args)
     margin = cell.spec.get("out_margin")
+    context = cell.spec.get("context", False)
+    if context:
+        assert takes_context(args[0], K), "the cell does not reach the context launch"
     if margin is None:
-        sel = op(*args)
+        sel = op(*args, context=context)
     else:
         # Rows [margin, margin + rows) of a step-sized selection; the rows around stay put.
         rows = args[0].shape[0]
         whole = torch.full(
             (rows + 2 * margin, TOKEN_TOPK + CR - 1), -9, dtype=torch.int32, device=DEV
         )
-        sel = op(*args, out=whole[margin : margin + rows])
+        sel = op(*args, out=whole[margin : margin + rows], context=context)
         assert sel.data_ptr() == whole[margin].data_ptr()
         assert (whole[:margin] == -9).all() and (whole[margin + rows :] == -9).all(), (
             "rows outside out"
@@ -166,6 +175,92 @@ def test_wide_rows_past_one_wave_in_row_order(rows: int, distribution: str) -> N
     for topk, sel in outs:
         assert torch.equal(topk, want_topk), "block list vs reference"
         assert torch.equal(sel, want_sel.to(torch.int32)), "token selection vs reference"
+
+
+_CONTEXT_FILLS = ("relu_sum", "relu_sparse", "equal", "lognormal", "narrow")
+#: The wide kernel's configuration (`_wide_config`, the last item of the compile key) of a
+#: context launch: `CONTEXT_THREADS`-thread CTAs, `CONTEXT_CTAS` an SM, the prefilter, no row
+#: order, the bound from all lanes.
+_CONTEXT_CONFIG = (_module.CONTEXT_THREADS, _module.CONTEXT_CTAS, True, False, True)
+
+
+class _CompiledKeys:
+    """Stands in for the entry's compiled-kernel cache and records the key of every launch
+    (`launch` looks its kernel up by it), so a test sees which configuration ran."""
+
+    def __init__(self, inner):
+        self.inner, self.keys = inner, []
+
+    def get(self, key, default=None):
+        self.keys.append(key)
+        return self.inner.get(key, default)
+
+    def __setitem__(self, key, value):
+        self.inner[key] = value
+
+
+@pytest.fixture
+def compiled_keys(monkeypatch):
+    keys = _CompiledKeys(_module._COMPILED)
+    monkeypatch.setattr(_module, "_COMPILED", keys)
+    return keys.keys
+
+
+@pytest.mark.parametrize("width", [65536, 65568])
+@pytest.mark.parametrize("fill", _CONTEXT_FILLS)
+@pytest.mark.parametrize(
+    "requests",
+    [
+        ((90000, 1024),),  # one request deep in its history
+        ((0, 512), (4000, 1024), (200000, 512)),  # a cold one, a short one and a deep one
+        ((262143 - 299, 300),),  # the end of the table, just past `CONTEXT_MIN_ROWS`
+    ],
+    ids=["deep", "mixed", "table end"],
+)
+def test_context_launch_is_the_decode_launch(
+    width: int, fill: str, requests, compiled_keys
+) -> None:
+    """A context chunk on the context launch (smaller CTAs, no window cache, the bound from all
+    lanes) selects exactly what the decode launch selects: block lists and token selections,
+    over ties, flat and clustered rows, relu-sparse rows with negative zeros, windows of fewer
+    than k blocks and of the whole table."""
+    rows = sum(c for _, c in requests)
+    spec = dict(rows=rows, requests=requests, width=width, **{fill: True})
+    seed = zlib.crc32(f"{width}{fill}{requests}".encode()) % 2**31
+    ctx_args = _build(spec, seed=seed)
+    assert takes_context(ctx_args[0], K)
+    ctx = op(*ctx_args, context=True)
+    dec_args = _build(spec, seed=seed)
+    dec = op(*dec_args)
+    # The context call ran the context configuration, the decode call the decode one.
+    assert [key[-1] for key in compiled_keys] == [
+        _CONTEXT_CONFIG,
+        _module._wide_config(rows, ctx.device),
+    ]
+    assert compiled_keys[1][-1][0] == _module._WIDE_THREADS and not compiled_keys[1][-1][-1]
+    assert torch.equal(ctx_args[4], dec_args[4]), "block list"
+    assert torch.equal(ctx, dec), "token selection"
+    want_topk, want_sel = op.reference(*_build(spec, seed=seed))
+    assert torch.equal(ctx_args[4], want_topk) and torch.equal(ctx, want_sel.to(torch.int32))
+
+
+@pytest.mark.parametrize("rows", [1, 256])
+def test_small_context_calls_keep_the_decode_launch(rows: int, compiled_keys) -> None:
+    """At or below `CONTEXT_MIN_ROWS` rows, or over a table the narrow kernel serves, a
+    `context=True` call is the decode launch."""
+    spec = dict(rows=rows, requests=((70000, rows),), width=65568, relu_sum=True)
+    assert not takes_context(_build(spec, seed=rows)[0], K)
+    narrow = dict(rows=300, requests=((3000, 300),), width=2560, relu_sum=True)
+    assert not takes_context(_build(narrow, seed=3)[0], K)
+    for s in (spec, narrow):
+        args = _build(s, seed=11)
+        sel = op(*args, context=True)
+        want_topk, want_sel = op.reference(*_build(s, seed=11))
+        assert torch.equal(args[4], want_topk) and torch.equal(sel, want_sel.to(torch.int32))
+    # The wide table's call took the decode configuration, the narrow table the narrow kernel.
+    wide, narrow_key = compiled_keys
+    assert wide[-1] == _module._wide_config(rows, DEV) and wide[-1] != _CONTEXT_CONFIG
+    assert narrow_key[-1] is None
 
 
 # The decode-path shapes, captured in the decode CUDA graph: tp1's one row at 2560 columns,

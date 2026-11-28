@@ -5211,6 +5211,9 @@ def _create_kv_cache_manager(
                 mamba_manager_extra_kwargs["inforward_snapshot_min_main"] = int(
                     getattr(model_engine.model, "inforward_snapshot_min_main",
                             0) or 0)
+                mamba_manager_extra_kwargs["inforward_snapshot_max_tail"] = int(
+                    getattr(model_engine.model, "inforward_snapshot_max_tail",
+                            0) or 0)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
