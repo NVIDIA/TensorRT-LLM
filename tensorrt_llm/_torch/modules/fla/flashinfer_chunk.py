@@ -31,8 +31,9 @@ Differences vs the Triton path are absorbed inside this wrapper:
     ``[N, H, V, K]`` logical layout, so the adapter gathers/scatters without
     transposing the last two dims. The SM100/SM103 kernel carries the recurrent
     state in fp32 in TMEM regardless of the initial/output-state I/O dtype, so
-    the round-trip stays in the native pool dtype (bf16/fp16) there with no
-    precision change; only SM90/SM120 need an fp32 up-cast/down-cast.
+    the ordinary round-trip stays in the native pool dtype (bf16/fp16) there
+    with no precision change. FP32 checkpoint buffers use FP32 state I/O when
+    the plain kernel may run; SM90/SM120 use an fp32 up-cast/down-cast.
 
 This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
@@ -40,7 +41,7 @@ at process start; do not import it lazily inside hot paths.
 
 import functools
 import os
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -206,6 +207,10 @@ def chunk_gated_delta_rule(
     cu_seqlens_cpu: Optional[torch.Tensor] = None,
     use_cp: Union[Literal["auto"], bool] = "auto",
     g_is_linear: bool = False,
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts_cpu: Optional[Sequence[int]] = None,
+    checkpoint_every_n_tokens: int = 0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's chunk_gated_delta_rule.
 
@@ -224,6 +229,14 @@ def chunk_gated_delta_rule(
     ``g_is_linear`` declares that ``g`` already holds ``alpha = exp(g_log)``
     (fp32), as emitted by ``fused_gdn_post_conv(g_linear=True)``; the wrapper
     then skips its own ``torch.exp``.
+
+    When ``checkpoint_every_n_tokens`` is nonzero, write packed intermediate
+    states into ``state_checkpoints``, shaped ``[total_checkpoints, H, V, K]``
+    in float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2.
+    ``checkpoint_cu_starts`` is a CUDA int32 or int64 tensor of shape
+    ``[num_sequences + 1]`` giving per-sequence row offsets. Its CPU
+    counterpart is required when workspace capacity splits the batch into
+    multiple groups.
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -239,6 +252,8 @@ def chunk_gated_delta_rule(
     assert g.dtype == torch.float32, f"g must be fp32, got {g.dtype}"
     assert cu_seqlens is not None, "cu_seqlens is required (varlen mode)"
     assert initial_state is not None, "initial_state is required"
+    if checkpoint_every_n_tokens:
+        assert state_checkpoints is not None and checkpoint_cu_starts is not None
     if inplace_indexed_state_update:
         assert initial_state_indices is not None, (
             "inplace_indexed_state_update=True requires initial_state_indices"
@@ -298,6 +313,7 @@ def chunk_gated_delta_rule(
     if (
         _INDEXED_STATE_IO
         and inplace_indexed_state_update
+        and not checkpoint_every_n_tokens
         and use_cp is False
         and cu_seqlens.shape[0] - 1 <= _INDEXED_STATE_IO_MAX_SEQS
         and is_sm_100f()
@@ -348,18 +364,40 @@ def chunk_gated_delta_rule(
     # regardless of the initial/output-state I/O dtype (the state tensors are
     # only the gmem load/store format), so passing bf16/fp16 state there is
     # numerically identical to the fp32 round-trip while moving half the bytes.
-    # SM90/SM120 still require fp32 state.
-    state_dtype = initial_state.dtype if is_sm_100f() else torch.float32
+    # The SM100/SM103 non-CP kernel uses the state I/O dtype for its
+    # checkpoint stores, so an FP32 checkpoint buffer needs FP32 state I/O
+    # when auto dispatch may select that kernel. Explicit CP accepts both dtypes.
+    native_state_io = is_sm_100f()
+    fp32_checkpoint_io = (
+        native_state_io
+        and use_cp is not True
+        and checkpoint_every_n_tokens > 0
+        and state_checkpoints is not None
+        and state_checkpoints.dtype == torch.float32
+    )
+    state_dtype = (
+        initial_state.dtype if native_state_io and not fp32_checkpoint_io else torch.float32
+    )
     num_seqs = cu_seqlens.shape[0] - 1
     if state_workspace is not None:
         assert len(state_workspace) == 2
         # Both buffers hold the same group of sequences.
         assert state_workspace[0].shape == state_workspace[1].shape
+        workspace_dtype = state_workspace[0].dtype
+        assert workspace_dtype == state_dtype or (
+            fp32_checkpoint_io and workspace_dtype == initial_state.dtype
+        )
         for buffer in state_workspace:
             assert buffer.shape[0] >= 1
             assert buffer.shape[1:] == initial_state.shape[1:]
-            assert buffer.dtype == state_dtype
+            assert buffer.dtype == workspace_dtype
             assert buffer.device == initial_state.device
+        if workspace_dtype != state_dtype:
+            rows = min(state_workspace[0].shape[0], max(num_seqs, 1))
+            state_workspace = (
+                torch.empty_like(state_workspace[0][:rows], dtype=state_dtype),
+                torch.empty_like(state_workspace[1][:rows], dtype=state_dtype),
+            )
 
     # Only allocate / request final state when a caller actually consumes it
     # (either inplace scatter back to the SSM pool, or return to the caller);
@@ -394,6 +432,11 @@ def chunk_gated_delta_rule(
             bounds.append(bounds[-1] + size + (group < extra))
         offsets = cu_seqlens_cpu.tolist()
         groups = [(lo, hi, offsets[lo], offsets[hi]) for lo, hi in zip(bounds[:-1], bounds[1:])]
+
+    if checkpoint_every_n_tokens and len(groups) > 1:
+        assert checkpoint_cu_starts_cpu is not None, (
+            "checkpoint_cu_starts_cpu is required when the batch exceeds the state workspace"
+        )
 
     for seq_lo, seq_hi, tok_lo, tok_hi in groups:
         group_seqs = seq_hi - seq_lo
@@ -442,6 +485,20 @@ def chunk_gated_delta_rule(
             use_cp=use_cp,
             output=output_buf[tok_lo:tok_hi],
         )
+        if checkpoint_every_n_tokens:
+            if len(groups) == 1:
+                checkpoint_rows = state_checkpoints
+                checkpoint_offsets = checkpoint_cu_starts
+            else:
+                ck_lo = checkpoint_cu_starts_cpu[seq_lo]
+                ck_hi = checkpoint_cu_starts_cpu[seq_hi]
+                checkpoint_rows = state_checkpoints[ck_lo:ck_hi]
+                checkpoint_offsets = checkpoint_cu_starts[seq_lo : seq_hi + 1] - ck_lo
+            flashinfer_args.update(
+                state_checkpoints=checkpoint_rows,
+                checkpoint_cu_starts=checkpoint_offsets,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            )
         if need_state:
             # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
             # fp32); FlashInfer writes the final state in this dtype and the scatter

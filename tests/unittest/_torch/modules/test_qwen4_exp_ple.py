@@ -43,6 +43,9 @@ from tensorrt_llm._torch.modules.qwen4_exp.ple import (
     _splitmix64,
     _uses_scaled_fp8_ngram_table,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
+    PeriodicSnapshotBatch,
+)
 
 # Parity is measured against an independent per-token reference whose GEMMs /
 # conv have a different reduction shape than the batched module. TF32 (default-on
@@ -551,6 +554,65 @@ def test_ple_parity_fp32():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ple_parity_bf16():
     _run_parity(torch.bfloat16, tol_max=6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-4), (torch.bfloat16, 6e-2)])
+def test_ple_periodic_snapshots_resume_prefill_suffix(dtype: torch.dtype, tol: float) -> None:
+    """A PLE snapshot carries both convolution and n-gram history into the suffix."""
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(20261123)
+    config = SimpleNamespace(
+        **{**vars(_make_config()), "hidden_size": 32, "hc_count": 2, "ple_embed_dim": 64}
+    )
+    module = Qwen4ExpPLE(config, dtype=dtype, ple_layer_index=0, layer_id=1).to(device)
+    module.eval()
+    _init_module_weights(module, gen, device, dtype)
+
+    tokens = 256
+    points, slot_ids = [64, 128, 192], [5, 2, 7]
+    ids = torch.randint(0, VOCAB_SIZE - 1, (tokens,), generator=gen, device=device)
+    hidden = torch.randn(tokens, module.conv_channels, generator=gen, device=device).to(dtype)
+    conv = torch.zeros(8, *module.conv_state_shape, device=device, dtype=dtype)
+    conv[0] = (0.1 * torch.randn(module.conv_state_shape, generator=gen, device=device)).to(dtype)
+    ngram = torch.full((8, module.ngram_context_len), EOS_TOKEN_ID, device=device, dtype=torch.long)
+    ngram[0] = torch.tensor([13, 17], device=device)
+    initial_conv, initial_ngram = conv.clone(), ngram.clone()
+
+    def metadata(input_ids: torch.Tensor, slot: int) -> PLEMetadata:
+        return PLEMetadata.build(
+            input_ids,
+            torch.tensor([len(input_ids)], device=device),
+            torch.tensor([slot], device=device),
+            is_decode=False,
+            eos_token_id=EOS_TOKEN_ID,
+            num_contexts=1,
+        )
+
+    cold_meta = metadata(ids, 0)
+    positions = torch.tensor(points, device=device)
+    slots = torch.tensor(slot_ids, device=device)
+    cold_meta.periodic_snapshot = PeriodicSnapshotBatch(
+        interval=64,
+        checkpoint_count=4,
+        checkpoint_cu_starts=torch.tensor([0, 4], device=device),
+        checkpoint_rows=torch.arange(3, device=device),
+        positions=positions,
+        conv_indices=torch.empty(0, device=device, dtype=torch.long),
+        slots=slots,
+    )
+    with torch.no_grad():
+        cold_output = module.forward(hidden, cold_meta, conv, ngram)
+        for point, slot in zip(points, slot_ids):
+            prefix_conv, prefix_ngram = initial_conv.clone(), initial_ngram.clone()
+            module.forward(hidden[:point], metadata(ids[:point], 0), prefix_conv, prefix_ngram)
+            assert (conv[slot].float() - prefix_conv[0].float()).abs().max().item() <= tol
+            assert torch.equal(ngram[slot], prefix_ngram[0])
+
+            resumed = module.forward(hidden[point:], metadata(ids[point:], slot), conv, ngram)
+            assert (resumed.float() - cold_output[point:].float()).abs().max().item() <= tol
+            assert (conv[slot].float() - conv[0].float()).abs().max().item() <= tol
+            assert torch.equal(ngram[slot], ngram[0])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

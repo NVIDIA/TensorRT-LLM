@@ -321,6 +321,12 @@ compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
 
+The prototype `mamba_state_config.enable_multi_snapshot_prefill` option
+allows supported recurrent models with V2, block reuse, and a positive
+`periodic_snapshot_interval` to cross multiple periodic boundaries in a
+single prefill iteration. It defaults to `false`, so existing configurations
+keep their periodic snapshot and chunking behavior.
+
 For hybrid Mamba models, `block_reuse_config.enable_branch_snapshot` also
 snapshots the recurrent state at the fork. The deprecated
 `mamba_state_config.enable_branch_snapshot` alias turns on the same option.

@@ -27,6 +27,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 from ...disaggregation import diagnostics as disagg_diagnostics
+from ..kv_cache.mamba_cache_manager.multi_snapshot import (
+    periodic_snapshot_allows_context,
+    periodic_snapshot_allows_decode,
+    plan_periodic_snapshot_chunk,
+)
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -232,6 +237,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._remote_tail_generation_ids: frozenset[int] = frozenset()
         self.max_num_tokens = max_num_tokens
         self._stalled_schedules = 0
+        self.periodic_snapshot_tp_enabled = False
+        self.periodic_snapshot_tp_mixed_decode_supported = False
+        self.periodic_snapshot_extra_budget = 0
+        self._drop_context_draft_ids: set[int] = set()
+        self._next_pp_context_draft_drop_ids: frozenset[int] | None = None
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
@@ -609,11 +619,19 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> tuple[LlmRequestState, LlmRequestState]:
         return self.no_schedule_until_state, self.no_schedule_after_state
 
+    def set_pp_context_draft_plan(self, drop_ids: frozenset[int]) -> None:
+        """Use the first PP rank's draft decision on the next local schedule."""
+        self._next_pp_context_draft_drop_ids = drop_ids
+
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         held_requests, self._transfer_held_requests = self._transfer_held_requests, []
+        pp_drop_ids = self._next_pp_context_draft_drop_ids
+        self._next_pp_context_draft_drop_ids = None
         self._sched_iter += 1
+        self.periodic_snapshot_extra_budget = 0
+        self._drop_context_draft_ids.clear()
         self._reuse_probes.clear()
         # A level that failed since the last pass (e.g. in an eviction WRITE during prepare_resources) has already
         # dropped pages from this rank's reuse tree only.
@@ -630,7 +648,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(
-            active_requests, inflight_request_ids, transfer_held_requests=held_requests
+            active_requests,
+            inflight_request_ids,
+            transfer_held_requests=held_requests,
+            pp_context_draft_drop_ids=pp_drop_ids,
         )
         # One that failed in this pass, e.g. in an eviction WRITE that the C++ retried past it, before the batch runs.
         self._raise_if_lockstep_remote_level_failed()
@@ -646,6 +667,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             paused_requests=evicted,
             recompute_paused_requests=recompute_paused,
             failed_requests=self._failed_requests,
+            drop_context_draft_ids=(
+                frozenset(
+                    self._drop_context_draft_ids.intersection(
+                        req.request_id for req in scheduled_ctx
+                    )
+                )
+                if self._drop_context_draft_ids
+                else frozenset()
+            ),
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
@@ -721,6 +751,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         defer_remote_tail_context=False,
         transfer_held_requests=(),
         prefix_waits=None,
+        pp_context_draft_drop_ids: frozenset[int] | None = None,
     ):
         scheduled_ctx: RequestList = []
         scheduled_remote_mode = None
@@ -1019,6 +1050,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         deferred_behind_contributor = False
         # Only context-only batches take Mamba snapshots inside the forward.
         self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
+        self._periodic_snapshot_request_id = None
+        periodic_batch_eligible = (
+            bool(pending_ctx)
+            and self.supports_periodic_snapshot_schedule
+            and (
+                not scheduled_gen
+                or (
+                    not self.kv_cache_manager.is_speculative()
+                    and periodic_snapshot_allows_decode(
+                        scheduled_gen,
+                        self.periodic_snapshot_tp_mixed_decode_supported
+                        if self.periodic_snapshot_tp_enabled
+                        else self.kv_cache_manager._periodic_snapshot_supports_mixed_decode,
+                    )
+                )
+            )
+        )
         first_chunk_contributors: dict = {}
         context_init_ids = (
             {
@@ -1041,9 +1089,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             pending_ctx, starved_ctx = (
                 sorted(
                     reqs,
-                    key=lambda r: not (
-                        r.state_value == self._context_init_state_value
-                        and self._pregrown_context_tokens(r) > 0
+                    key=lambda r: (
+                        not (
+                            r.state_value == self._context_init_state_value
+                            and self._pregrown_context_tokens(r) > 0
+                        )
                     ),
                 )
                 for reqs in (pending_ctx, starved_ctx)
@@ -1160,9 +1210,21 @@ class KVCacheV2Scheduler(RequestScheduler):
                     scheduled_encoder.append(req)
                     budget.commit(req, tokens, peft_pages)
                 else:
+                    # An expanded chunk ends this pass; let starved requests
+                    # consume their held shares first.
+                    allow_periodic_snapshot = (
+                        periodic_batch_eligible
+                        and not starved_ctx
+                        and not (scheduled_ctx or scheduled_encoder)
+                    )
                     try:
                         action, tokens, chunking_flag = self._try_schedule_context(
-                            req, budget, preempt_for_pages, token_cap
+                            req,
+                            budget,
+                            preempt_for_pages,
+                            token_cap,
+                            allow_periodic_snapshot=allow_periodic_snapshot,
+                            pp_context_draft_drop_ids=pp_context_draft_drop_ids,
                         )
                     except RemoteMemError as error:
                         # Raised by its cache's resume, before anything was taken for it.
@@ -1187,6 +1249,32 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if len(scheduled_ctx) == 1:
                         scheduled_remote_mode = remote_mode
                     budget.commit(req, tokens, peft_pages)
+                    tp_expansion_candidate = False
+                    if (
+                        self.periodic_snapshot_tp_enabled
+                        and allow_periodic_snapshot
+                        and not req.is_last_context_chunk
+                    ):
+                        interval = self.kv_cache_manager.kv_cache_config.mamba_state_config.periodic_snapshot_interval
+                        start = req.context_current_position
+                        end = start + req.context_chunk_size
+                        # All ranks have at least two staging rows. Retain the
+                        # budget only at the next aligned periodic boundary;
+                        # an earlier branch point must remain a normal chunk.
+                        tp_expansion_candidate = (
+                            start % interval == 0
+                            and end == start + interval
+                            and end in req.expect_snapshot_points
+                            and not any(start < point < end for point in req.expect_snapshot_points)
+                            and self._tp_periodic_snapshot_can_extend(
+                                req, budget.remaining_tokens, interval
+                            )
+                        )
+                    if (
+                        self._periodic_snapshot_request_id == req.py_request_id
+                        or tp_expansion_candidate
+                    ):
+                        ctx_stopped = True
                     # Register the block only once the request has cleared its
                     # budget and is committed. Registering earlier, inside the check
                     # above, would let a request that then fails to schedule defer
@@ -1212,6 +1300,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                         contributed_blocks.add(first_new_block)
                         if req.is_first_context_chunk:
                             first_chunk_contributors[first_new_block] = req.py_request_id
+                    if ctx_stopped:
+                        break
 
         self._prev_first_chunk_contributors = first_chunk_contributors
 
@@ -1240,6 +1330,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 inflight_request_ids,
                 defer_remote_tail_context=True,
                 prefix_waits=prefix_waits,
+                pp_context_draft_drop_ids=pp_context_draft_drop_ids,
             )
 
         if self._ctx_demote_uncached_tokens:
@@ -1266,6 +1357,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"{disagg_gate.num_skipped} generation-init requests"
             )
 
+        self.periodic_snapshot_extra_budget = budget.remaining_tokens
         return (
             scheduled_encoder,
             scheduled_ctx,
@@ -1652,6 +1744,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
         token_cap: Optional[int] = None,
+        allow_periodic_snapshot: bool = False,
+        pp_context_draft_drop_ids: frozenset[int] | None = None,
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a context request (chunked or non-chunked).
 
@@ -1673,7 +1767,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 # Nothing is claimed yet, so there is nothing to release.
                 return ScheduleAction.SKIP, 0, False
-            result = self._try_schedule_context_chunked(req, budget, preempt_for_pages, token_cap)
+            result = self._try_schedule_context_chunked(
+                req,
+                budget,
+                preempt_for_pages,
+                token_cap,
+                allow_periodic_snapshot,
+                pp_context_draft_drop_ids,
+            )
         else:
             result = self._try_schedule_context_full(req, budget, preempt_for_pages)
 
@@ -1738,6 +1839,40 @@ class KVCacheV2Scheduler(RequestScheduler):
             if manager is not None and req.py_request_id in manager.kv_cache_map:
                 manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+    @property
+    def supports_periodic_snapshot_schedule(self) -> bool:
+        """Whether this scheduler can consume the cache manager's snapshot staging."""
+        return (
+            self.chunking_enabled
+            and self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+            and self.kv_cache_manager.periodic_snapshot_capacity > 1
+            and self.draft_kv_cache_manager is None
+            and self.cross_kv_cache_manager is None
+            # Leave context-KV-cap admission to the ordinary scheduler.
+            and getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None) is None
+        )
+
+    def _tp_periodic_snapshot_can_extend(
+        self, req: LlmRequest, remaining_tokens: int | None, interval: int
+    ) -> bool:
+        """Whether the leftover budget reaches a legal end beyond the baseline chunk."""
+        chunk_size = req.context_chunk_size
+        desired = req.context_remaining_length
+        if remaining_tokens is not None:
+            desired = min(desired, chunk_size + remaining_tokens)
+        if self.max_context_length is not None:
+            desired = min(desired, self.max_context_length)
+        if desired <= chunk_size:
+            return False
+        # Future branch points are discovered from each rank's own cache.
+        # Leave them to the post-schedule proposal check so they cannot make
+        # one rank hold budget that its peers spend on other requests.
+        return (
+            req.context_current_position + desired == req.prompt_len
+            or desired // self.chunk_unit_size > chunk_size // self.chunk_unit_size
+            or desired >= chunk_size + interval
+        )
 
     def _try_schedule_context_full(
         self,
@@ -1856,6 +1991,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
         token_cap: Optional[int] = None,
+        allow_periodic_snapshot: bool = False,
+        pp_context_draft_drop_ids: frozenset[int] | None = None,
     ) -> tuple[ScheduleAction, int, bool]:
         """FCFS interleaved chunking for a single context request.
 
@@ -1869,6 +2006,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
         inforward_point = None
+        periodic_points: tuple[int, ...] = ()
+        periodic_reserved = False
         if self._inforward_snapshot_rows:
             # A mark from an earlier pass whose batch did not run this request
             # must not outlive that pass.
@@ -1943,7 +2082,42 @@ class KVCacheV2Scheduler(RequestScheduler):
             # With no remaining state to snapshot, avoid artificial boundaries.
             chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
-            if self._inforward_snapshot_rows_left > 0 and not has_recovery:
+            capacity = self.kv_cache_manager.periodic_snapshot_capacity
+            if (
+                allow_periodic_snapshot
+                and capacity > 1
+                and not getattr(
+                    self.kv_cache_manager, "periodic_snapshot_requires_consensus", False
+                )
+                and not req.py_periodic_snapshot_fallback
+                and not has_recovery
+                and periodic_snapshot_allows_context(req)
+                and self._pregrown_context_tokens(req) == 0
+            ):
+                desired = context_remaining
+                if remaining_budget is not None:
+                    desired = min(desired, remaining_budget)
+                if self.max_context_length is not None:
+                    desired = min(desired, self.max_context_length)
+                start = req.context_current_position
+                interval = self.kv_cache_manager.kv_cache_config.mamba_state_config.periodic_snapshot_interval
+                plan = plan_periodic_snapshot_chunk(
+                    start,
+                    start + desired,
+                    req.expect_snapshot_points,
+                    interval,
+                    self.kv_cache_manager.periodic_snapshot_alignment,
+                    capacity - 1,
+                )
+                if plan.points:
+                    chunk_size = plan.end - start
+                    periodic_points = plan.points
+            if (
+                not periodic_points
+                and not req.py_periodic_snapshot_fallback
+                and self._inforward_snapshot_rows_left > 0
+                and not has_recovery
+            ):
                 inforward_point = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
                 if inforward_point is not None:
                     chunk_size = context_remaining
@@ -1972,6 +2146,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             force_chunk and _is_forced_context_chunk_boundary(req, chunk_size)
         ):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
+            if periodic_points:
+                # A reached checkpoint is also a valid chunk boundary, even
+                # when the remaining budget is smaller than chunk_unit_size.
+                chunk_size = max(chunk_size, periodic_points[-1] - req.context_current_position)
 
         # Run exactly the pre-grown chunk, or wait for a pass with enough budget;
         # a longer chunk would grow the capacity again before the history catches up.
@@ -2006,38 +2184,80 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # Held whole for one pass: it keeps its prepared KV and its place in the queue,
                 # as on an exhausted budget.
                 return ScheduleAction.SKIP, 0, False
+        if periodic_points:
+            start = req.context_current_position
+            end = start + chunk_size
+            points = tuple(point for point in periodic_points if point < end)
+            if points:
+                periodic_reserved = self.kv_cache_manager.reserve_periodic_snapshots(
+                    req, end, points
+                )
+                if not periodic_reserved:
+                    chunk_size = points[0] - start
         budget_chunk_size = chunk_size
         # Decoder queries are a subset of these physical Encoder rows, including
         # recovery rows, so they fit the same iteration's input-token budget.
         req.context_chunk_size = min(chunk_size, context_remaining)
 
-        # Draft tokens only matter for last chunk (budget + resize)
-        chunk_tokens = budget_chunk_size + replay_tokens
-        resize_tokens = req.context_chunk_size
-        if req.is_last_context_chunk:
-            draft_len = get_draft_token_length(req)
-            if draft_len > 0:
-                chunk_tokens += draft_len
-                resize_tokens += draft_len
+        draft_len = get_draft_token_length(req) if req.is_last_context_chunk else 0
+        drop_drafts = False
+        if draft_len:
+            if pp_context_draft_drop_ids is None:
+                drop_drafts = (
+                    remaining_budget is not None
+                    and budget_chunk_size + draft_len > remaining_budget
+                )
+            else:
+                # A PP follower allocates for the leader's forward plan, even
+                # when its local scheduler would make a different budget decision.
+                drop_drafts = req.request_id in pp_context_draft_drop_ids
+        # A regular context forward does not verify a partial draft sequence.
+        # Keep the prompt and omit the optional drafts if they exceed the budget.
+        scheduled_draft_len = 0 if drop_drafts else draft_len
+        chunk_tokens = budget_chunk_size + replay_tokens + scheduled_draft_len
+        resize_tokens = req.context_chunk_size + scheduled_draft_len
 
-        # V2 resizes KV cache directly in the scheduler, so include
-        # draft tokens for last chunk.
-        if not self._try_allocate_context(req, resize_tokens):
-            # Out of pages, as in _try_schedule_context_full.
-            if preempt_for_pages(req):
-                return ScheduleAction.STOP, 0, False
-            return ScheduleAction.SKIP, 0, False
+        # V2 resizes KV cache in the scheduler, including only scheduled draft rows.
+        try:
+            if not self._try_allocate_context(req, resize_tokens):
+                if periodic_reserved:
+                    periodic_reserved = False
+                    self.kv_cache_manager.release_periodic_snapshots(req)
+                    req.py_periodic_snapshot_fallback = True
+                    # A failed first-chunk resize can suspend the cache, so
+                    # prepare it again before retrying the baseline boundary.
+                    return self._try_schedule_context_chunked(
+                        req, budget, preempt_for_pages, token_cap, False
+                    )
+                # Out of pages, as in _try_schedule_context_full.
+                if preempt_for_pages(req):
+                    return ScheduleAction.STOP, 0, False
+                return ScheduleAction.SKIP, 0, False
 
-        cross_action = self._try_schedule_cross_context(req)
-        if cross_action is not ScheduleAction.SCHEDULED:
-            self._suspend_request(req)
-            return cross_action, 0, False
+            cross_action = self._try_schedule_cross_context(req)
+            if cross_action is not ScheduleAction.SCHEDULED:
+                if periodic_reserved:
+                    periodic_reserved = False
+                    self.kv_cache_manager.release_periodic_snapshots(req)
+                self._suspend_request(req)
+                return cross_action, 0, False
+        except Exception:
+            if periodic_reserved:
+                self.kv_cache_manager.release_periodic_snapshots(req)
+            raise
 
+        if drop_drafts:
+            self._drop_context_draft_ids.add(req.request_id)
+        elif self._drop_context_draft_ids:
+            self._drop_context_draft_ids.discard(req.request_id)
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         if inforward_point is not None and req.context_chunk_size == context_remaining:
             req.py_mamba_inforward_snapshot_point = inforward_point
             self._inforward_snapshot_rows_left -= 1
+        if periodic_reserved:
+            self._periodic_snapshot_request_id = req.py_request_id
+        req.py_periodic_snapshot_fallback = False
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
 

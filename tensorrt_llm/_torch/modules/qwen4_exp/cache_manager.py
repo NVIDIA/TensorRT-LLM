@@ -208,9 +208,33 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     # Whether the model's GDN layers verify drafts with the fused kernels, which
     # commit in-layer at every batch size.
     gdn_fused_verify = False
+    _supports_periodic_snapshots = True
     # Whether the model's GDN layers can verify drafts with the GDN MTP replay
     # kernels (modules/mamba/gdn_mixer.py) instead of the cached replay.
     gdn_mtp_replay = False
+
+    @override
+    def _periodic_snapshot_min_window(self) -> int:
+        return max(
+            super()._periodic_snapshot_min_window(),
+            self._ple_conv_state_shape[-1] if self._ple_conv_state_shape else 0,
+            self._ple_ngram_context_shape[-1] if self._ple_ngram_context_shape else 0,
+        )
+
+    @override
+    def _periodic_snapshot_roles(self, layer_id: int) -> tuple:
+        roles = super()._periodic_snapshot_roles(layer_id)
+        if layer_id in self._ple_layer_ids:
+            roles += (PLE_CONV_STATE, PLE_NGRAM_CONTEXT)
+        return roles
+
+    @override
+    def _periodic_snapshot_staging_in_use_bytes(self) -> int:
+        return super()._periodic_snapshot_staging_in_use_bytes() + sum(
+            tensor.numel() * tensor.element_size()
+            for buffers in self._inforward_stage_ple.values()
+            for tensor in buffers
+        )
 
     # The parent opts in because its draft pool is attention-only. QSA's is
     # not: each draft layer adds a Role.INDEX_KEY buffer and a

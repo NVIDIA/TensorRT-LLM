@@ -4954,6 +4954,11 @@ def _create_kv_cache_manager(
             f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
+        manager_extra_kwargs["enable_periodic_snapshots"] = (
+            model_engine is not None
+            and getattr(model_engine.model, "_supports_periodic_snapshots",
+                        False) is True and
+            kv_cache_config.mamba_state_config.enable_multi_snapshot_prefill)
 
     if config_utils.is_glm5_next(config) or is_kimi_linear(config):
         # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
@@ -5130,6 +5135,9 @@ def _create_kv_cache_manager(
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
             # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
+            if mamba_manager_extra_kwargs["enable_periodic_snapshots"]:
+                mamba_manager_extra_kwargs[
+                    "periodic_snapshot_alignment"] = config.chunk_size
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

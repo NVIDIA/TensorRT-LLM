@@ -111,6 +111,75 @@ def _zero_initial_state(num_seqs, num_heads, head_dim, device, dtype=torch.float
     return torch.zeros(num_seqs, num_heads, head_dim, head_dim, dtype=dtype, device=device)
 
 
+@skip_unsupported
+@pytest.mark.parametrize("workspace_capacity", [None, 1])
+@pytest.mark.parametrize("lengths, offsets", [([192, 128], [0, 3, 5]), ([192, 32], [0, 3, 3])])
+def test_packed_checkpoints_match_independent_prefixes(workspace_capacity, lengths, offsets):
+    """Multiple checkpoints survive workspace grouping and match separate prefills."""
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+
+    interval = 64
+    q, k, v, g, beta, cu = _make_inputs(lengths, num_q_heads=2, num_v_heads=2, seed=73)
+    initial = torch.randn(2, 2, 128, 128, device=q.device, dtype=torch.float32) * 0.01
+    checkpoint_cu = torch.tensor(offsets, device=q.device, dtype=torch.int32)
+    checkpoints = torch.empty(offsets[-1], 2, 128, 128, device=q.device, dtype=torch.float32)
+    workspace = None
+    if workspace_capacity is not None:
+        dtype = initial.dtype if is_sm_100f() else torch.float32
+        workspace = tuple(
+            torch.empty(workspace_capacity, 2, 128, 128, device=q.device, dtype=dtype)
+            for _ in range(2)
+        )
+
+    actual, final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_workspace=workspace,
+        cu_seqlens_cpu=torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]),
+        use_cp=True,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=checkpoint_cu,
+        checkpoint_cu_starts_cpu=offsets,
+        checkpoint_every_n_tokens=interval,
+    )
+    baseline, baseline_final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        use_cp=True,
+    )
+    tol = dict(rtol=1.6e-2, atol=1e-3)
+    torch.testing.assert_close(actual, baseline, **tol)
+    torch.testing.assert_close(final, baseline_final, **tol)
+    start = 0
+    for seq, length in enumerate(lengths):
+        for checkpoint, point in enumerate(range(interval, length + 1, interval)):
+            _, expected = chunk_gated_delta_rule(
+                q[:, start : start + point],
+                k[:, start : start + point],
+                v[:, start : start + point],
+                g[:, start : start + point],
+                beta[:, start : start + point],
+                initial_state=initial[seq : seq + 1],
+                output_final_state=True,
+                cu_seqlens=torch.tensor([0, point], device=q.device, dtype=torch.int64),
+                use_cp=True,
+            )
+            torch.testing.assert_close(checkpoints[offsets[seq] + checkpoint], expected[0], **tol)
+        start += length
+
+
 # Pure-Python import smoke (no GPU required) ------------------------------
 
 
@@ -119,6 +188,156 @@ def test_wrapper_module_importable():
     from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (  # noqa: F401
         chunk_gated_delta_rule,
     )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("use_cp", ["auto", True, False])
+@pytest.mark.parametrize(
+    "with_checkpoints,checkpoint_dtype",
+    [(False, None), (True, torch.bfloat16), (True, torch.float32)],
+)
+@pytest.mark.parametrize("with_workspace", [False, True])
+def test_sm100_checkpoint_state_io_dtype(
+    monkeypatch, state_dtype, use_cp, with_checkpoints, checkpoint_dtype, with_workspace
+):
+    """FP32 checkpoint staging does not change the caller's state precision."""
+    import sys
+    from types import SimpleNamespace
+
+    import tensorrt_llm._torch.modules.fla.flashinfer_chunk as adapter
+
+    def gather(state, indices, *, out_dtype, output=None):
+        assert indices is None
+        result = state.to(out_dtype)
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
+
+    def scatter(source, destination, indices):
+        assert indices is None
+        destination.copy_(source.to(destination.dtype))
+
+    def kernel(**kwargs):
+        expected_dtype = (
+            torch.float32
+            if with_checkpoints and checkpoint_dtype == torch.float32 and use_cp is not True
+            else state_dtype
+        )
+        assert kwargs["initial_state"].dtype == expected_dtype
+        assert kwargs["output_state"].dtype == expected_dtype
+        assert kwargs["use_cp"] == use_cp
+        if with_checkpoints:
+            assert kwargs["state_checkpoints"].dtype == checkpoint_dtype
+        if (
+            with_workspace
+            and state_dtype == torch.bfloat16
+            and with_checkpoints
+            and checkpoint_dtype == torch.float32
+            and use_cp is not True
+        ):
+            expected_bytes = initial.numel() * torch.float32.itemsize
+            assert kwargs["initial_state"].untyped_storage().nbytes() == expected_bytes
+            assert kwargs["output_state"].untyped_storage().nbytes() == expected_bytes
+        kwargs["output_state"].zero_()
+        return kwargs["output"], kwargs["output_state"]
+
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(chunk_gated_delta_rule=kernel))
+    monkeypatch.setattr(adapter, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(adapter, "gather_cast_vk_to_fp32_vk", gather)
+    monkeypatch.setattr(adapter, "cast_scatter_fp32_vk_to_vk", scatter)
+    q, k, v, g, beta, cu = _make_inputs(
+        [128], num_q_heads=1, num_v_heads=48, head_dim=4, device="cpu"
+    )
+    initial = torch.zeros(1, 48, 4, 4, dtype=state_dtype)
+    workspace = (
+        tuple(torch.empty(8, 48, 4, 4, dtype=state_dtype) for _ in range(2))
+        if with_workspace
+        else None
+    )
+    checkpoint_args = {}
+    if with_checkpoints:
+        checkpoint_args = {
+            "state_checkpoints": torch.empty(2, 48, 4, 4, dtype=checkpoint_dtype),
+            "checkpoint_cu_starts": torch.tensor([0, 2], dtype=torch.int32),
+            "checkpoint_every_n_tokens": 64,
+        }
+
+    _, final = adapter.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        use_cp=use_cp,
+        state_workspace=workspace,
+        **checkpoint_args,
+    )
+
+    assert final.dtype == state_dtype
+
+
+@pytest.mark.skipif(
+    not _supported_arch() or not is_sm_100f(), reason="requires SM100/SM103 GDN prefill"
+)
+@pytest.mark.parametrize("use_cp", [False, True, "auto"])
+@pytest.mark.parametrize("with_workspace", [False, True])
+def test_sm100_bf16_state_with_fp32_checkpoints(use_cp, with_workspace):
+    """Save FP32 checkpoints from a BF16 pool without changing the scan result."""
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+
+    q, k, v, g, beta, cu = _make_inputs([128], num_q_heads=2, num_v_heads=48, seed=73)
+    initial = (torch.randn(1, 48, 128, 128, device=q.device) * 0.01).to(torch.bfloat16)
+    checkpoints = torch.empty(2, 48, 128, 128, device=q.device, dtype=torch.float32)
+    offsets = torch.tensor([0, 2], device=q.device, dtype=torch.int32)
+    workspace = tuple(torch.empty_like(initial) for _ in range(2)) if with_workspace else None
+
+    actual, final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_workspace=workspace,
+        use_cp=use_cp,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=offsets,
+        checkpoint_every_n_tokens=64,
+    )
+    baseline, baseline_final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_workspace=workspace,
+        use_cp=use_cp,
+    )
+    tol = dict(rtol=1.6e-2, atol=1e-3)
+    torch.testing.assert_close(actual, baseline, **tol)
+    torch.testing.assert_close(final, baseline_final, **tol)
+    for index, point in enumerate((64, 128)):
+        _, prefix_final = chunk_gated_delta_rule(
+            q[:, :point],
+            k[:, :point],
+            v[:, :point],
+            g[:, :point],
+            beta[:, :point],
+            initial_state=initial,
+            output_final_state=True,
+            cu_seqlens=torch.tensor([0, point], device=q.device, dtype=torch.int64),
+            use_cp=use_cp,
+        )
+        torch.testing.assert_close(checkpoints[index].to(initial.dtype), prefix_final[0], **tol)
 
 
 @skip_unsupported

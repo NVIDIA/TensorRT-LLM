@@ -218,6 +218,9 @@ def _shutdown_manager(manager, monkeypatch):
     """Exercise real shutdown while replacing only the native pool teardown."""
     manager._recurrent_buffers = {"buffer": object()}
     manager._branch_snapshot_points = {"request": object()}
+    manager.periodic_snapshot_plan = {"request": object()}
+    manager.periodic_snapshot_capacity = 3
+    manager._periodic_snapshot_stage = object()
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
@@ -228,6 +231,9 @@ def _shutdown_manager(manager, monkeypatch):
         assert manager.intermediate_conv_states is None
         assert not manager._recurrent_buffers
         assert not manager._branch_snapshot_points
+        assert not manager.periodic_snapshot_plan
+        assert manager.periodic_snapshot_capacity == 0
+        assert manager._periodic_snapshot_stage is None
         assert not manager.all_ssm_states and not manager.all_conv_states
         if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
