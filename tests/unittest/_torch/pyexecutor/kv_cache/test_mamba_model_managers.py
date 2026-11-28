@@ -34,6 +34,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayLayerCache,
     KDAReplayState,
     KimiK3HybridCacheManager,
+    create_kda_replay_state,
 )
 from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
@@ -325,11 +326,8 @@ def test_k3_initializes_only_the_selected_state(
         "KDAIntermediateState",
         intermediate_factory,
     )
-    monkeypatch.setitem(
-        manager_cls._initialize_spec_state.__globals__,
-        "KDAReplayState",
-        replay_factory,
-    )
+    # Both managers build the fused-verify state through create_kda_replay_state.
+    monkeypatch.setitem(create_kda_replay_state.__globals__, "KDAReplayState", replay_factory)
     monkeypatch.setitem(
         manager_cls._initialize_spec_state.__globals__,
         "get_kda_replay_num_spec",
@@ -392,9 +390,8 @@ def test_glm5_next_hands_the_models_draft_records_to_kda_replay(monkeypatch):
     manager.spec_config = SimpleNamespace(decoding_type="MTP", tokens_per_gen_step=3)
     _prepare_model_layout(manager)
     replay_factory = Mock(wraps=KDAReplayState)
-    monkeypatch.setitem(
-        Glm5NextCacheManager._initialize_spec_state.__globals__, "KDAReplayState", replay_factory
-    )
+    # The manager builds the fused-verify state through create_kda_replay_state.
+    monkeypatch.setitem(create_kda_replay_state.__globals__, "KDAReplayState", replay_factory)
 
     state = manager._initialize_spec_state()
 

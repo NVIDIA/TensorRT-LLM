@@ -3170,6 +3170,21 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"Reserved {reserved} from the device KV budget. "
                     f"New quota is {quota / (1 << 30)}GiB"
                 )
+        # Model-owned buffers beside the pools also come out of the byte budget
+        # before the pools are sized; max_tokens sizes the pools alone.
+        model_reserved_bytes = self._get_reserved_device_bytes()
+        self._model_reserved_bytes = model_reserved_bytes
+        if model_reserved_bytes > 0 and quota < sys.maxsize:
+            if model_reserved_bytes >= quota:
+                raise ValueError(
+                    f"{model_reserved_bytes / (1 << 30):.2f}GiB of buffers beside the KV cache "
+                    f"pools exceed the {quota / (1 << 30):.2f}GiB device KV budget."
+                )
+            quota -= model_reserved_bytes
+            logger.info(
+                f"Reserved {model_reserved_bytes / (1 << 30):.2f}GiB beside the KV cache pools. "
+                f"New quota is {quota / (1 << 30)}GiB"
+            )
         if kv_cache_config.max_tokens is not None:
             quota_from_max_tokens = self._gpu_quota_for_max_tokens(
                 kv_cache_config.max_tokens, max_util_for_resume
@@ -5209,6 +5224,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:
         """Return GPU storage owned outside the native pools for this capacity."""
+        return 0
+
+    def _get_reserved_device_bytes(self) -> int:
+        """GPU bytes a subclass allocates beside the pools, taken from the byte budget first.
+
+        Called once the regions are declared, before the device quota is set.
+        Unlike ``_get_external_cache_bytes``, these bytes do not depend on the
+        pools' capacity, so the pools are sized for what remains.
+        """
         return 0
 
     def _allocate_cache_pools(
@@ -9098,7 +9122,11 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             for window_size, pool_group_ids in self._storage_pool_groups_by_window().items()
         }
-        kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
+        # The memory estimate adds this back to the free memory it measured, so it
+        # also counts the model-owned buffers reserved beside the pools.
+        kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL) + getattr(
+            self, "_model_reserved_bytes", 0
+        )
 
         return kv_cache_stats
 

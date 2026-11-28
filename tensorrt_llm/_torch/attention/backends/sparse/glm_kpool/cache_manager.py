@@ -29,12 +29,22 @@ else:
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    Kda2Fp4LayerCache,
+    KDA2Fp4ReplayState,
     KDAIntermediateState,
+    KDAMtpReplayState,
     KDAReplayState,
     _is_disagg_context_server,
+    apply_kda_2fp4_state_layout,
+    create_kda_replay_state,
     get_kda_replay_num_spec,
+    kda_2fp4_states_bytes_per_layer,
 )
-from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
+from tensorrt_llm._torch.modules.kimi_kda.replay_region import (
+    REPLAY_STATE_REGION,
+    KDA2Fp4LiveHistory,
+    KDAReplayRegion,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
     unwrap_glm5_next_text_config,
@@ -43,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
+    MambaLayerCache,
     _host_slots_to_device,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
@@ -80,7 +91,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """
 
     kda_context_only = False
-    _kda_replay_region: KDAReplayRegion | None = None
+    _kda_replay_region: KDAReplayRegion | KDA2Fp4LiveHistory | None = None
+    _kda_mtp_replay = False
+    _kda_2fp4 = False
     # Its sparse MLA backend does not write or read mixed-precision high layers.
     _supports_mixed_precision_kv = False
 
@@ -97,6 +110,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         index_state_dim: int = 0,
         kda_replay_num_spec: int | None = None,
         kda_draft_records: bool = False,
+        kda_mtp_replay: bool = False,
+        kda_2fp4_replay: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -113,6 +128,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 place of the k / g / v / beta caches, for a model whose verify
                 replays from them. The replay buffers then share the
                 recurrent-state slot.
+            kda_mtp_replay: Whether the model's KDA layers can verify drafts
+                with the KDA MTP replay kernels instead of the fused verify.
+            kda_2fp4_replay: Whether the recurrent states are packed 2FP4
+                checkpoints replayed by ``KDA2Fp4ReplayState``
+                (``kv_cache_config.mamba_state_config.kda_2fp4_replay``).
         """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
@@ -137,8 +157,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
+        self._kda_mtp_replay = kda_mtp_replay
+        self._kda_2fp4 = kda_2fp4_replay
         self._kda_replay: KDAReplayState | None = None
-        self._kda_replay_region: KDAReplayRegion | None = None
+        self._kda_replay_region: KDAReplayRegion | KDA2Fp4LiveHistory | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -147,12 +169,16 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
+        if self._kda_2fp4:
+            return self._initialize_kda_2fp4_state()
         self.kda_context_only = self.kda_context_only and num_spec is not None
         if self.kda_context_only:
             return None
         if num_spec is not None:
-            self._kda_replay = KDAReplayState(
+            self._kda_replay = create_kda_replay_state(
                 num_spec,
+                self._state_layout,
+                kda_mtp_replay=self._kda_mtp_replay,
                 stochastic_rounding=self._mamba_ssm_stochastic_rounding,
                 draft_records=self._requested_draft_records,
             )
@@ -164,10 +190,71 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
 
+    def get_replay_dummy_request_mask(self) -> torch.Tensor | None:
+        """The batch-ordered dummy-request mask of the last state-index setup.
+
+        The KDA MTP replay skips dummy rows; the buffer address stays fixed.
+        """
+        return self._dummy_request_mask
+
+    @property
+    def use_kda_mtp_replay(self) -> bool:
+        return isinstance(self._kda_replay, KDAMtpReplayState)
+
+    @property
+    def use_kda_2fp4_replay(self) -> bool:
+        return self._kda_2fp4
+
+    @property
+    @override
+    def commits_every_generation_step(self) -> bool:
+        """Whether every generation step, drafts or not, needs ``update_mamba_states``.
+
+        The KDA MTP replay and the 2FP4 DSpark verification verify one-token
+        steps too and commit them after sampling.
+        """
+        replay = self._kda_replay
+        return self.use_kda_mtp_replay or (
+            isinstance(replay, KDA2Fp4ReplayState) and replay.verifies_drafts
+        )
+
+    def _initialize_kda_2fp4_state(self) -> KDA2Fp4ReplayState | None:
+        """Pack the recurrent states as 2FP4 checkpoints and select their replay state.
+
+        A disaggregated context worker keeps no replay history.
+        """
+        apply_kda_2fp4_state_layout(self)
+        if self.kda_context_only:
+            return None
+        spec_config = self.spec_config
+        self._kda_replay = KDA2Fp4ReplayState(
+            None if spec_config is None else spec_config.tokens_per_gen_step
+        )
+        self._kda_replay.validate(self._state_layout)
+        return self._kda_replay
+
+    @override
+    def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
+        if self._kda_2fp4:
+            state = self._kda_replay
+            return (state.make_layer_cache if state is not None else Kda2Fp4LayerCache)(
+                *(() if state is None else (self.mamba_layer_offsets[layer_idx],)),
+                conv=self.get_conv_states(layer_idx),
+                temporal=self.get_ssm_states(layer_idx),
+            )
+        return super().mamba_layer_cache(layer_idx)
+
     @override
     def _region_providers(self) -> Sequence[RegionProvider]:
         providers = super()._region_providers()
         if self._kda_replay is None or not self.mamba_pp_layers:
+            return providers
+        if isinstance(self._kda_replay, KDA2Fp4ReplayState):
+            self._kda_replay_region = KDA2Fp4LiveHistory(
+                self._kda_replay,
+                self._state_layout,
+                self._max_resident_sequences() + self._num_reserved_dummy_slots,
+            )
             return providers
         self._kda_replay_region = KDAReplayRegion(
             self._kda_replay,
@@ -222,6 +309,12 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return region.group_id if region is not None else None
 
     @property
+    def uses_replay_slots(self) -> bool:
+        """Whether the replay buffers have slots of their own instead of the recurrent ones."""
+        region = self._kda_replay_region
+        return region is not None and region.has_own_slots
+
+    @property
     def cuda_replay_state_indices(self) -> torch.Tensor:
         region = self._kda_replay_region
         return (
@@ -236,7 +329,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if request_ids is None:
             return self.cuda_replay_state_indices
         region = self._kda_replay_region
-        if region is None or region.group_id is None:
+        if region is None or not region.has_own_slots:
             # The replay buffers share the recurrent-state slots.
             return [self._request_id_to_state_index[rid] for rid in request_ids]
         return region.request_indices(request_ids)
@@ -292,6 +385,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 raise RuntimeError(
                     f"Request {request_id} is being suspended before update_resources "
                     "recorded the acceptance of its last verify in its KDA replay state"
+                )
+            if self._kda_replay_region is not None:
+                self._kda_replay_region.suspend(
+                    request_id, self._request_id_to_state_index[request_id], self._stream
                 )
             if request_id in replay.unseeded_requests:
                 # Its replay caches have not been seeded from the transferred
@@ -355,6 +452,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def prepare_resources(self, scheduled_batch) -> None:
+        if self._kda_2fp4 and self.kda_context_only:
+            # The packed-checkpoint forward reads no replay history here; only
+            # attention-DP padding dummies may run as generation rows.
+            if any(not request.is_dummy for request in scheduled_batch.generation_requests):
+                raise ValueError(
+                    "A KDA 2FP4 disaggregated context worker cannot run generation requests."
+                )
         super().prepare_resources(scheduled_batch)
         replay = self._kda_replay
         if replay is None or self.local_num_mamba_layers == 0:
@@ -393,6 +497,27 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             return 0
         return torch.int64.itemsize
 
+    @override
+    def _get_external_cache_bytes(self, cache) -> int:
+        external = super()._get_external_cache_bytes(cache)
+        if self._kda_replay is not None:
+            external += self._kda_replay.external_gpu_bytes(self._state_layout)
+        return external
+
+    @override
+    def _get_reserved_device_bytes(self) -> int:
+        reserved = super()._get_reserved_device_bytes()
+        if isinstance(self._kda_replay_region, KDA2Fp4LiveHistory):
+            reserved += self._kda_replay_region.reserved_gpu_bytes()
+        return reserved
+
+    @classmethod
+    @override
+    def _states_bytes_per_layer(cls, params, mapping: Mapping, *, kv_cache_config) -> int:
+        if kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            return kda_2fp4_states_bytes_per_layer(params, mapping)
+        return super()._states_bytes_per_layer(params, mapping, kv_cache_config=kv_cache_config)
+
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
@@ -418,7 +543,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     ) -> None:
         if self.kda_context_only:
             return
-        if state_indices is not None and self.replay_layer_group_id is not None:
+        if state_indices is not None and self.uses_replay_slots:
             metadata = getattr(attn_metadata, "mamba_metadata", None)
             if getattr(metadata, "replay_state_indices", None) is None:
                 raise RuntimeError("PRIVATE replay state needs mamba_metadata.replay_state_indices")
@@ -606,8 +731,28 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         kv_cache_config: KvCacheConfig,
         **kwargs,
     ) -> int:
+        if kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            # The 2FP4 histories live beside the pools (_estimate_reserved_device_bytes).
+            return 0
         return KDAReplayRegion.estimate_fixed_bytes(
             model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
+        )
+
+    @classmethod
+    @override
+    def _estimate_reserved_device_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        if not kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            return 0
+        return KDA2Fp4ReplayState.estimate_reserved_bytes(
+            model_config, mapping, max_batch_size, **kwargs
         )
 
     def get_index_state_buffer(self, layer_idx: int) -> torch.Tensor | None:

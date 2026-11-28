@@ -59,6 +59,18 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             max_batch_size, dtype=torch.int32, device="cuda"
         )
         self.generation_replay_state_indices: torch.Tensor | None = None
+        # The generation requests' (state slot, replay slot) pairs, interleaved
+        # so the KDA MTP replay reads both with one 8-byte load per row.
+        self._generation_slot_pairs = torch.empty(
+            (max_batch_size, 2), dtype=torch.int32, device="cuda"
+        )
+        self.generation_slot_pairs: torch.Tensor | None = None
+        # Packed 2FP4 prefill state indices: slot, or ~slot for a context
+        # without an initial state. Shared by all layers of a batch.
+        self._kda_packed_state_indices = torch.empty(
+            max_batch_size, dtype=torch.int32, device="cuda"
+        )
+        self.kda_packed_state_indices: torch.Tensor | None = None
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()
@@ -71,35 +83,50 @@ class KimiK3MambaMetadata(Mamba2Metadata):
 
         self.generation_state_indices = None
         self.generation_replay_state_indices = None
+        self.generation_slot_pairs = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
-        if (
-            getattr(attn_metadata.kv_cache_manager, "use_kda_replay_update", False)
-            and batch_size > num_contexts
-        ):
-            self.generation_state_indices = self._aligned_generation_indices(
-                self.state_indices, self._generation_state_indices, num_contexts, batch_size
-            )
-            if self.replay_state_indices is self.state_indices:
-                self.generation_replay_state_indices = self.generation_state_indices
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        if getattr(kv_cache_manager, "use_kda_replay_update", False) and batch_size > num_contexts:
+            if getattr(kv_cache_manager, "use_kda_mtp_replay", False):
+                # The KDA MTP replay reads only the pairs, whatever the slices' alignment.
+                pairs = self._generation_slot_pairs[: batch_size - num_contexts]
+                pairs[:, 0].copy_(self.state_indices[num_contexts:batch_size])
+                pairs[:, 1].copy_(self.replay_state_indices[num_contexts:batch_size])
+                self.generation_slot_pairs = pairs
             else:
-                self.generation_replay_state_indices = self._aligned_generation_indices(
-                    self.replay_state_indices,
-                    self._generation_replay_state_indices,
-                    num_contexts,
-                    batch_size,
+                self.generation_state_indices = self._aligned_generation_indices(
+                    self.state_indices, self._generation_state_indices, num_contexts, batch_size
                 )
+                if self.replay_state_indices is self.state_indices:
+                    self.generation_replay_state_indices = self.generation_state_indices
+                else:
+                    self.generation_replay_state_indices = self._aligned_generation_indices(
+                        self.replay_state_indices,
+                        self._generation_replay_state_indices,
+                        num_contexts,
+                        batch_size,
+                    )
 
         self.kda_max_seqlen = max(context_lengths, default=0)
         n = len(context_lengths)
         self.kda_seq_order = self._kda_schedule[0, :n]
         self.kda_cu_chunks = self._kda_schedule[1, : n + 1]
+        self.kda_packed_state_indices = None
         if not n:
             self.kda_cu_seqlens_cpu = None
             self.kda_cu_seqlens = None
             return
         self.kda_cu_seqlens = self.query_start_loc_long[: n + 1]
         self.kda_cu_seqlens_cpu = torch.tensor([0] + context_lengths, dtype=torch.long).cumsum_(0)
+        if getattr(attn_metadata.kv_cache_manager, "use_kda_2fp4_replay", False):
+            slots = self.state_indices[:n]
+            self.kda_packed_state_indices = torch.where(
+                self.has_initial_states[:n],
+                slots,
+                torch.bitwise_not(slots),
+                out=self._kda_packed_state_indices[:n],
+            )
         order = sorted(range(n), key=lambda i: (-context_lengths[i], i))
         chunks = list(accumulate(((length + 15) // 16 for length in context_lengths), initial=0))
         width = self._kda_schedule.shape[1]
@@ -117,7 +144,10 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         """Fill the static replay-slot buffer, or alias the state slots."""
         kv_cache_manager = attn_metadata.kv_cache_manager
         request_ids = attn_metadata.request_ids
-        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None or request_ids is None:
+        uses_replay_slots = getattr(kv_cache_manager, "uses_replay_slots", None)
+        if uses_replay_slots is None:
+            uses_replay_slots = getattr(kv_cache_manager, "replay_layer_group_id", None) is not None
+        if not uses_replay_slots or request_ids is None:
             self.replay_state_indices = self.state_indices
             return
         batch_size = attn_metadata.seq_lens.shape[0]

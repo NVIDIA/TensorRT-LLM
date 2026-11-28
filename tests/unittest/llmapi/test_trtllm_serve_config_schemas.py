@@ -57,6 +57,48 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"max_batch_size": 8}, True),
         (generator.SERVE_SCHEMA, {"max_batch_szie": 8}, False),
         (generator.SERVE_SCHEMA, {"max_batch_size": "eight"}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"mamba_state_config": {"kda_2fp4_replay": True}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"mamba_state_config": {"kda_2fp4_replai": True}}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "use_kv_cache_manager_v2": False,
+                    "mamba_state_config": {"kda_2fp4_replay": True},
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "enable_kv_pool_rebalance": True,
+                    "mamba_state_config": {"kda_2fp4_replay": True},
+                }
+            },
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "generation_servers": {
+                    "kv_cache_config": {
+                        "use_kv_cache_manager_v2": False,
+                        "mamba_state_config": {"kda_2fp4_replay": True},
+                    }
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"disk_io_threads": -1}}, False),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"disk_io_threads": 257}}, False),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"disk_write_through": "yes"}}, False),

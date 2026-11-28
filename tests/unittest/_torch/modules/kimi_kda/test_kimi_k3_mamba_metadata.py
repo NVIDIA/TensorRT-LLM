@@ -420,3 +420,88 @@ def test_k3_prepare_materializes_stable_aligned_generation_replay_indices() -> N
     metadata.prepare(attn_metadata)
     assert metadata.replay_state_indices is metadata.state_indices
     assert metadata.generation_replay_state_indices is metadata.generation_state_indices
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_prepare_encodes_packed_prefill_state_indices(packed: bool) -> None:
+    metadata = KimiK3MambaMetadata(max_batch_size=4, chunk_size=128, max_num_tokens=512)
+    metadata.state_indices.copy_(torch.tensor([3, 1, 2, 0], dtype=torch.int32, device="cuda"))
+    attn_metadata = _make_attention_metadata([16, 32, 48])
+    attn_metadata.kv_cache_manager = SimpleNamespace(use_kda_2fp4_replay=packed)
+    attn_metadata.kv_cache_params.num_cached_tokens_per_seq = torch.tensor(
+        [5, 0, 7], dtype=torch.int
+    )
+
+    metadata.prepare(attn_metadata)
+
+    if not packed:
+        assert metadata.kda_packed_state_indices is None
+        return
+    # Contexts without an initial state are encoded as ~slot.
+    torch.testing.assert_close(
+        metadata.kda_packed_state_indices,
+        torch.tensor([3, -2, 2], dtype=torch.int32, device="cuda"),
+    )
+    data_ptr = metadata.kda_packed_state_indices.data_ptr()
+
+    attn_metadata.kv_cache_params.num_cached_tokens_per_seq = torch.zeros(3, dtype=torch.int)
+    metadata.prepare(attn_metadata)
+    assert metadata.kda_packed_state_indices.data_ptr() == data_ptr
+    torch.testing.assert_close(
+        metadata.kda_packed_state_indices,
+        torch.tensor([-4, -2, -3], dtype=torch.int32, device="cuda"),
+    )
+
+    metadata.prepare(_make_attention_metadata([]))
+    assert metadata.kda_packed_state_indices is None
+
+
+@pytest.mark.parametrize("mtp_replay", [True, False])
+def test_k3_prepare_interleaves_generation_slots_for_the_mtp_replay(mtp_replay: bool) -> None:
+    """The KDA MTP replay reads each generation row's (state slot, replay slot) as one pair."""
+
+    class KdaCacheManager:
+        use_kda_replay_update = True
+        replay_layer_group_id = 1
+        use_kda_mtp_replay = mtp_replay
+
+        def __init__(self) -> None:
+            self._state_indices_buffer = DeviceCopyBuffer(
+                torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+            )
+            self.replay_slots = {10: 3, 11: 0, 12: 5}
+
+        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
+            return self._state_indices_buffer.tensor[: len(request_ids)]
+
+        def get_replay_state_indices(self, request_ids: list[int]) -> list[int]:
+            return [self.replay_slots[request_id] for request_id in request_ids]
+
+    metadata = KimiK3MambaMetadata(max_batch_size=3, chunk_size=8, max_num_tokens=8)
+    seq_lens = torch.tensor([2, 1, 1], dtype=torch.int)
+    metadata.prepare(
+        SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=1,
+            num_ctx_tokens=2,
+            kv_cache_manager=KdaCacheManager(),
+            request_ids=[10, 11, 12],
+            kv_cache_params=SimpleNamespace(
+                num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int),
+            ),
+        )
+    )
+    torch.cuda.synchronize()
+    pairs = metadata.generation_slot_pairs
+    if not mtp_replay:
+        assert pairs is None
+        # The fused verify takes 16-byte-aligned copies of the misaligned slices.
+        assert metadata.generation_state_indices.tolist() == [4, 7]
+        assert metadata.generation_replay_state_indices.tolist() == [0, 5]
+        return
+    # The replay reads only the pairs: no aligned copies are made.
+    assert metadata.generation_state_indices is None
+    assert metadata.generation_replay_state_indices is None
+    assert pairs.tolist() == [[4, 0], [7, 5]]
+    assert pairs[:, 1].data_ptr() == pairs[:, 0].data_ptr() + 4
