@@ -406,6 +406,15 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
             }
 
             uint32_t bar_c = __cvta_generic_to_shared(&bar_data_consumed[stage]);
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
             asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(bar_c));
 
             stage = next_stage;
