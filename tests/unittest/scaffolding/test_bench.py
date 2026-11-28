@@ -1,5 +1,7 @@
 import asyncio
 import math
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Iterator, List
 
 import numpy as np
@@ -12,7 +14,8 @@ from tensorrt_llm.scaffolding import (GenerationTask,
                                       NativeGenerationController,
                                       ScaffoldingBenchRequest, ScaffoldingLlm,
                                       Task, TaskCollection, TaskStatus, Worker,
-                                      async_scaffolding_benchmark)
+                                      async_scaffolding_benchmark, benchmark,
+                                      load_generation_strategy)
 from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy, ConstantRateStrategy, LoadGenerationStrategy,
     PoissonRateStrategy, SynchronousStrategy, ThroughputStrategy)
@@ -31,6 +34,50 @@ def _restore_native_generation_controller() -> Iterator[None]:
 
     NativeGenerationController.__init__ = original_init
     NativeGenerationController.process = original_process
+
+
+@contextmanager
+def _mock_benchmark_clock() -> Iterator[None]:
+    current_time = 1000.0
+    sleepers: dict[asyncio.Future[None], float] = {}
+
+    def now() -> float:
+        return current_time
+
+    def advance() -> None:
+        nonlocal current_time
+        for future in list(sleepers):
+            if future.cancelled():
+                del sleepers[future]
+        if not sleepers:
+            return
+        current_time = min(sleepers.values())
+        ready = [
+            future for future, deadline in sleepers.items()
+            if deadline == current_time
+        ]
+        for future in ready:
+            del sleepers[future]
+            future.set_result(None)
+        if sleepers:
+            asyncio.get_running_loop().call_soon(advance)
+
+    async def sleep(delay: float) -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        if not sleepers:
+            loop.call_soon(advance)
+        sleepers[future] = current_time + delay
+        await future
+
+    clock = SimpleNamespace(time=now)
+    benchmark_asyncio = SimpleNamespace(**vars(asyncio))
+    benchmark_asyncio.sleep = sleep
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(benchmark, "time", clock)
+        monkeypatch.setattr(load_generation_strategy, "time", clock)
+        monkeypatch.setattr(benchmark, "asyncio", benchmark_asyncio)
+        yield
 
 
 class DummyWorker(Worker):
@@ -67,26 +114,24 @@ def test_scaffolding_benchmark():
     workers = {NativeGenerationController.WorkerTag.GENERATION: dummy_worker}
     scaffolding_llm = ScaffoldingLlm(prototype_controller, workers)
 
-    requests_num = 100
-    requests = [
-        ScaffoldingBenchRequest(prompt="Is today a nice day?")
-        for _ in range(requests_num)
-    ]
+    try:
+        requests_num = 100
+        requests = [
+            ScaffoldingBenchRequest(prompt="Is today a nice day?")
+            for _ in range(requests_num)
+        ]
 
-    concurrency = 10
+        concurrency = 10
 
-    results, requests_start_time, requests_execution_time, total_time = asyncio.run(
-        async_scaffolding_benchmark(scaffolding_llm, task_collection_types,
-                                    requests, concurrency))
+        results, requests_start_time, requests_execution_time, total_time = asyncio.run(
+            async_scaffolding_benchmark(scaffolding_llm, task_collection_types,
+                                        requests, concurrency))
 
-    scaffolding_llm.shutdown()
-
-    assert len(results) == requests_num
-    assert len(requests_execution_time) == requests_num
-    assert results[0].outputs[
-        0].text == OUTPUT_STR, f"Expected {OUTPUT_STR} but got {results[0].outputs[0].text}"
-    assert results[0].task_collections[
-        "bench_dummy_collection"].output_len == len(OUTPUT_STR)
+        assert len(results) == requests_num
+        assert len(requests_start_time) == requests_num
+        assert len(requests_execution_time) == requests_num
+    finally:
+        scaffolding_llm.shutdown()
 
 
 def setup_scaffolding():
@@ -157,28 +202,96 @@ def test_scaffolding_benchmark_strategies():
     task_collection_types = {"bench_collection": DummyTaskCollection}
     scaffolding_llm = setup_scaffolding()
 
-    strategies = [
-        ("Synchronous", SynchronousStrategy(), 10),
-        ("Concurrent@3", ConcurrentStrategy(concurrency=3), 10),
-        ("Throughput", ThroughputStrategy(), 10),
-        ("ConstantRate@10", ConstantRateStrategy(rate=2.0), 100),
-        ("PoissonRate@10", PoissonRateStrategy(rate=2.0), 100),
-    ]
-    for name, strategy, num_requests in strategies:
-        print(f"==============  Testing {name} strategy ==================")
-        requests = create_requests(num_requests=num_requests)
+    try:
+        with _mock_benchmark_clock():
+            strategies = [
+                ("Synchronous", SynchronousStrategy(), 10),
+                ("Concurrent@3", ConcurrentStrategy(concurrency=3), 10),
+                ("Throughput", ThroughputStrategy(), 10),
+                ("ConstantRate@10", ConstantRateStrategy(rate=2.0), 100),
+                ("PoissonRate@10", PoissonRateStrategy(rate=2.0), 100),
+            ]
+            for name, strategy, num_requests in strategies:
+                print(
+                    f"==============  Testing {name} strategy =================="
+                )
+                requests = create_requests(num_requests=num_requests)
 
-        results, requests_start_time, requests_execution_time, total_time = asyncio.run(
-            async_scaffolding_benchmark(scaffolding_llm,
-                                        task_collection_types,
-                                        requests,
-                                        strategy=strategy))
+                results, requests_start_time, requests_execution_time, total_time = asyncio.run(
+                    async_scaffolding_benchmark(scaffolding_llm,
+                                                task_collection_types,
+                                                requests,
+                                                strategy=strategy))
 
-        # Verify strategy timing characteristics
-        verify_strategy_timing(strategy, requests_start_time, rtol=0.3)
+                assert len(results) == num_requests
+                assert len(requests_start_time) == num_requests
+                assert len(requests_execution_time) == num_requests
+                assert results[0].outputs[
+                    0].text == OUTPUT_STR, f"Expected {OUTPUT_STR} but got {results[0].outputs[0].text}"
+                assert results[0].task_collections[
+                    "bench_collection"].output_len == len(OUTPUT_STR)
 
-    print(f"before shutdown")
-    scaffolding_llm.shutdown()
+                # Verify strategy timing characteristics
+                verify_strategy_timing(strategy, requests_start_time, rtol=0.3)
+    finally:
+        scaffolding_llm.shutdown()
+
+
+@pytest.mark.parametrize("cancel_parent", [False, True])
+def test_benchmark_clock_cancellation(cancel_parent: bool) -> None:
+
+    async def check_cancellation() -> None:
+        loop = asyncio.get_running_loop()
+        callback_errors: list[dict[str, object]] = []
+        callback_error = asyncio.Event()
+
+        def record_error(_event_loop: asyncio.AbstractEventLoop,
+                         context: dict[str, object]) -> None:
+            callback_errors.append(context)
+            callback_error.set()
+
+        async def wait_for_sleepers() -> list[BaseException | None]:
+            sleepers = [
+                asyncio.create_task(benchmark.asyncio.sleep(0.01)),
+                asyncio.create_task(benchmark.asyncio.sleep(0.02)),
+            ]
+            if cancel_parent:
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                loop.call_soon(current_task.cancel)
+            else:
+                loop.call_soon(sleepers[0].cancel)
+            return await asyncio.gather(*sleepers, return_exceptions=True)
+
+        original_handler = loop.get_exception_handler()
+        loop.set_exception_handler(record_error)
+        parent = asyncio.create_task(wait_for_sleepers())
+        error_waiter = asyncio.create_task(callback_error.wait())
+        try:
+            completed, _pending = await asyncio.wait(
+                (parent, error_waiter),
+                timeout=10,
+                return_when=asyncio.FIRST_COMPLETED)
+            assert not callback_errors
+            assert parent in completed
+            if cancel_parent:
+                assert parent.cancelled()
+            else:
+                results = parent.result()
+                assert isinstance(results[0], asyncio.CancelledError)
+                assert results[1] is None
+        finally:
+            parent.cancel()
+            error_waiter.cancel()
+            await asyncio.gather(parent, error_waiter, return_exceptions=True)
+            loop.set_exception_handler(original_handler)
+
+    with _mock_benchmark_clock():
+        assert benchmark.asyncio.sleep is not asyncio.sleep
+        start_time = benchmark.time.time()
+        asyncio.run(check_cancellation())
+        if cancel_parent:
+            assert benchmark.time.time() == start_time
 
 
 if __name__ == "__main__":
