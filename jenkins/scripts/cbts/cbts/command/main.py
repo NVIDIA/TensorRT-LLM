@@ -136,7 +136,7 @@ class SelectionResult:
     sanity_required: bool = True
     # Legacy perf-relevance signal kept in decision JSON for diagnostics.
     perfsanity_required: bool = True
-    # set by coverage tier; Groovy re-adds multiGpuJobs under MULTI_GPU_FILE_CHANGED gate
+    # Full-size multi-GPU opt-in; coverage selects these via affected_stages.
     enable_multi_gpu: bool = False
     coverage_dropped_stages: list[str] = field(default_factory=list)
     # Post-merge build the consulted touch DB came from; makes a decision replayable.
@@ -580,7 +580,6 @@ def _run(args: _Args) -> int:
                 {r.scope for _, r in selector.pairs if r.scope and r.scope != "noop"} | {"coverage"}
             )
             result.affected_stages = tier.affected_stages
-            result.enable_multi_gpu = True
             result.coverage_dropped_stages = sorted(tier.dropped)
             result.coverage_no_diff_files = int(tier.detail.get("no_diff_files") or 0)
             if tier.removed:

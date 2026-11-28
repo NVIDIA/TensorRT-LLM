@@ -275,19 +275,22 @@ Trailing `ISOLATION` directives are removed from the lookup identity, like `TIME
 annotations. Kept entries retain their original directives so Jenkins still runs them in isolation.
 Matching the normalized identity does not bypass impact or capture-completeness checks.
 
-A block is left untouched unless every stage family it serves is instrumented — coverage is
-collected on single-GPU post-merge stages only, so blocks belonging to multi-GPU or
-Post-Merge-only stages are never pruned.
+A block is left untouched unless every stage family it serves has coverage. Single-node
+single-GPU and multi-GPU stages can both be narrowed, including Post-Merge-only stages when
+scheduled. Blocks shared with multi-node stages are never pruned.
 
-Single-GPU stages left with nothing go into `coverage_dropped_stages`. Multi-GPU stages are
-omitted here and re-added by Groovy under the `MULTI_GPU_FILE_CHANGED` gate.
+Single-node stages left with nothing go into `coverage_dropped_stages`. Remaining multi-GPU
+stages are included in `affected_stages` and can have their splits resized. Groovy intersects
+the selection with the baseline-eligible stages, preserving the multi-GPU scheduling gates.
+Missing or untrusted coverage keeps cases running; empty stages are not re-added at baseline.
 
 ## 8. Where the DB comes from
 
-Only one producer exists: the `LLM/main/L0_PostMerge` job. After each architecture's single-GPU
-stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
-`cbts_pystart_report_SBSA.tar.gz`. Every pair therefore describes one revision of `main`
-(`artifact.COVERAGE_BRANCH`). The later full-report tarball is not used for test selection.
+Only one producer exists: the `LLM/main/L0_PostMerge` job. Selection uses only the final
+`cbts_pystart_report.tar.gz`, which includes single-node single-GPU and multi-GPU coverage.
+A build with only early architecture archives is skipped. The compact DB in the final report
+is validated and used directly. Each candidate describes one revision of `main`
+(`artifact.COVERAGE_BRANCH`).
 
 ### 8.1 Resolution
 
@@ -301,10 +304,10 @@ read helper, pin at <PR number>/<PR head>:
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
-      read helper --exists, both tarballs         → skip b unless both exist,
+      read helper --exists, final report          → skip b when absent,
                                                     or when a read fails in transfer
       GET build_info.txt, parse `commit=`         → sha; skip when absent
-      first complete pair with a known sha        → latest coverage DB
+      first final report with a known sha        → latest coverage DB
    Python writes the build/commit pin locally
    Jenkins uploads that file                      → stable for this PR head
 compare <sha>...<PR base>                        → record topology and absolute distance
@@ -317,7 +320,7 @@ cherry-pick it onto the DB revision
 
 The pin lives under
 `LLM/main/cbts/coverage-db-pins/v1/<PR number>/<PR head>/cbts_db_pin.json`. A new PR head has no
-pin and therefore receives the freshest complete pair available at its first CBTS run. Repeated
+pin and therefore receives the freshest final report available at its first CBTS run. Repeated
 `/bot run` commands for the same head reuse that build even after newer post-merge DBs appear.
 `artifact.py --resolve-pin` owns pin lookup, schema validation, build selection, local pin
 creation, and fail-closed reasons. It reads the pin with the read helper
@@ -327,10 +330,11 @@ identity and uses Jenkins' authenticated artifact uploader when Python reports
 and first-write upload fail closed; CBTS never silently substitutes a newer build when a pin
 cannot be read or written. Preparation also verifies that the pinned build's `build_info.txt`
 still names the commit recorded in the pin, so an overwritten or corrupted build cannot silently
-change a repeated run.
+change a repeated run. A pinned build without a final report declines Tier 2; it does not
+switch to early archives or another build.
 
-Requiring the architecture pair prevents the selector from narrowing only one CPU architecture.
-For an unpinned head, builds are probed newest first and the first complete pair with commit
+The final report covers both CPU architectures. Early architecture archives are not selection inputs.
+For an unpinned head, builds are probed newest first and the first final report with commit
 metadata is the only DB considered. The selector does not substitute an older DB merely because
 it is closer to the PR base or because the selected DB conflicts with the PR diff.
 
@@ -382,7 +386,7 @@ large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge 
 
 After Tier 1 computes the residual, `--resolve-pin FILE` returns a reuse/create/decline plan.
 Groovy uploads `FILE` only for a create plan, before any large download. `--prepare DIR --build
-BUILD --paths-json PATH` then resolves the PR base, validates the pinned pair's residual
+BUILD --paths-json PATH` then resolves the PR base, validates the pinned report's residual
 compatibility, downloads both tarballs with the read helper, unpacks their identically named
 SQLite files separately, and unions them with `compact_db.merge_databases`.
 It writes the selection JSON

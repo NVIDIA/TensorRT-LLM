@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import math
-import re
 import shutil
 from collections import Counter
 from dataclasses import dataclass, field
@@ -59,14 +58,6 @@ class CoverageTierResult:
     reason: str = ""
     must_run_reasons: dict[str, int] = field(default_factory=dict)
     detail: dict[str, object] = field(default_factory=dict)
-
-
-# Mirrors L0_Test.groovy multiGpuJobs: pre-merge stages with N_GPUs token.
-_MULTI_GPU_RE = re.compile(r"\d+_GPUs")
-
-
-def _is_multi_gpu(stage_name: str) -> bool:
-    return bool(_MULTI_GPU_RE.search(stage_name)) and "Post-Merge" not in stage_name
 
 
 def _rule_kept_entries(block, prefix_to_waives: dict[str, set[str]]) -> set[str]:
@@ -140,8 +131,12 @@ def _build_narrowing(
             if s.yaml_stem == block.yaml_stem and block_matches_stage(block, s)
         ]
         served_families = sorted({stage_family(name) for name in served})
-        # shared-block rule: prune only when every served stage is instrumented
-        if not served or any(f not in instrumented for f in served_families):
+        # Shared blocks must preserve multi-node cases, even if the DB has rows.
+        if (
+            not served
+            or any("_Nodes" in name for name in served)
+            or any(f not in instrumented for f in served_families)
+        ):
             continue
         key = (block.yaml_stem, block.block_index)
         keep_rule = rule_kept.get(key, set())
@@ -157,7 +152,7 @@ def _build_narrowing(
 
     dropped: set[str] = set()
     for name, stage in stages.items():
-        if stage_family(name) not in instrumented:
+        if "_Nodes" in name or stage_family(name) not in instrumented:
             continue
         total = kept = 0
         for block in yaml_index.blocks:
@@ -240,9 +235,6 @@ def apply_coverage_tier(
     removed, dropped, must_run_reasons = _build_narrowing(
         cov, stages, yaml_index, rule_block_filters, known, untrusted
     )
-    # Multi-GPU stages are outside coverage selection; Groovy controls stage scheduling.
-    dropped = {s for s in dropped if not _is_multi_gpu(s)}
-
     n_impacted = sum(len(v) for v in cov.impacted.values())
     n_removed = sum(len(v) for v in removed.values())
     narrowed = bool(removed or dropped)
@@ -250,7 +242,7 @@ def apply_coverage_tier(
         reason = (
             f"coverage: {len(residual)} core file(s), {n_impacted} impacted test(s), "
             f"{cov.n_untrusted} untrusted forced-run; "
-            f"removed {n_removed} case(s), dropped {len(dropped)} single-GPU stage(s){nd}"
+            f"removed {n_removed} case(s), dropped {len(dropped)} single-node stage(s){nd}"
         )
     else:
         reason = (
@@ -258,8 +250,7 @@ def apply_coverage_tier(
             f"{cov.n_untrusted} untrusted; nothing removable (all impacted / untrusted / not-in-DB){nd}"
         )
     result = CoverageTierResult(
-        # single-GPU only; multi-GPU re-added in Groovy under MULTI_GPU_FILE_CHANGED gate
-        affected_stages=({s for s in stages if not _is_multi_gpu(s)} - dropped)
+        affected_stages=(set(stages) - dropped)
         | {stage for _, rule in pairs for stage in rule.affected_stages},
         removed=removed,
         dropped=dropped,
