@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import is_blackwell_datacenter
+
 
 @cache
 def _kernel_type() -> type:
@@ -321,12 +323,16 @@ def _max_active_clusters(cluster_size: int) -> int:
 
 # Rows from which 2-CTA 256x256 tiles beat 256x192 ones on GB300.
 _FP8_QUERY_WIDE_TILE_MIN_ROWS = 4096  # 4K
+# Up to this many rows one 128x256 tile per CTA beats two 128x128 tiles on SM100/SM103.
+_FP8_QUERY_WIDE_N_MAX_ROWS = 64
 
 
-def _fp8_query_tile(m: int) -> tuple[int, int]:
+def _fp8_query_tile(m: int, n: int = 0) -> tuple[int, int]:
     # Measured on GB300: with only the E4M3 output, 2-CTA 256x192 tiles beat 256x256 ones
     # from 129 to 3072 rows; from 257 to 384 rows, where a second 256-row tile is mostly
     # padding, 128x128 tiles beat both.
+    if m <= _FP8_QUERY_WIDE_N_MAX_ROWS and n % 256 == 0 and is_blackwell_datacenter():
+        return (128, 256)
     if m <= 128 or 256 < m <= 384:
         return (128, 128)
     return (256, 192) if m < _FP8_QUERY_WIDE_TILE_MIN_ROWS else (256, 256)
@@ -394,7 +400,7 @@ def fp8_query_gemm(
         )
     ):
         raise ValueError("CSA2 FP8 query needs a contiguous E4M3 [M, N] output and an int32 word")
-    tile = tile or _fp8_query_tile(m)
+    tile = tile or _fp8_query_tile(m, n)
     cluster = cluster or (tile[0] // 128, 1)
     active = _max_active_clusters(cluster[0] * cluster[1])
     if cluster == (tile[0] // 128, 1) and m <= tile[0]:
