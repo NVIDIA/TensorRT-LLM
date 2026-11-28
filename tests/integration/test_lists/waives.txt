@@ -20,7 +20,6 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5838199)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] SKIP (https://nvbugs/5838199)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] SKIP (https://nvbugs/5838199)
-disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2 SKIP (https://nvbugs/7020399)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_fp8_i2v_smoke SKIP (https://nvbugs/7099462)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_fp8_t2i_smoke SKIP (https://nvbugs/7095865)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_fp8_t2v_smoke SKIP (https://nvbugs/7099462)
