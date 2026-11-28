@@ -18,7 +18,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 _MODULE = "tensorrt_llm._torch.attention.backends.sparse.offload"
+_INTEGRITY_MODULE = "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend"
 _EXECUTOR_MODULE = "tensorrt_llm._torch.pyexecutor.py_executor"
 
 
@@ -73,7 +74,7 @@ def _observe_scheduler(module: ModuleType) -> None:
     module.PyExecutor._schedule = scheduled_wave
 
 
-def _observe(module: ModuleType) -> None:
+def _observe(module: ModuleType, *, integrity_enabled: bool) -> None:
     import torch
 
     from tensorrt_llm._utils import mpi_rank
@@ -107,7 +108,7 @@ def _observe(module: ModuleType) -> None:
                 hits, misses = state.batch.peek_hit_miss_counter()
                 units = unit_lengths.detach().cpu().flatten().tolist()
                 for request_id, member in new_members:
-                    starts[id(self), request_id, id(member.cache)] = {
+                    record = {
                         "rank": mpi_rank(),
                         "request_id": request_id,
                         "first_fetch_ns": time.monotonic_ns(),
@@ -118,6 +119,9 @@ def _observe(module: ModuleType) -> None:
                         "hits": int(hits),
                         "misses": int(misses),
                     }
+                    if integrity_enabled:
+                        record["offload_layers"] = sorted(state.layers)
+                    starts[id(self), request_id, id(member.cache)] = record
         return fetch(
             self, state, layer_idx, topk_indices, request_indices, unit_lengths, unit_masks
         )
@@ -139,6 +143,13 @@ def _observe(module: ModuleType) -> None:
                     hits, misses = self._sparse_batch.peek_hit_miss_counter()
                     record["hits"] = int(hits) - record["hits"]
                     record["misses"] = int(misses) - record["misses"]
+                    if integrity_enabled:
+                        if TYPE_CHECKING:
+                            from .sparse_offload_integrity import finish_request
+                        else:
+                            from sparse_offload_integrity import finish_request
+
+                        record["integrity"] = finish_request(self, request_id, member.cache)
                     record["release_ns"] = time.monotonic_ns()
                     with (directory / f"rank-{os.getpid()}.jsonl").open("a") as output:
                         output.write(json.dumps(record) + "\n")
@@ -149,38 +160,57 @@ def _observe(module: ModuleType) -> None:
 
 
 class _ObserverLoader(importlib.abc.Loader):
-    def __init__(self, loader: importlib.abc.Loader) -> None:
+    def __init__(
+        self, loader: importlib.abc.Loader, callback: Callable[[ModuleType], None]
+    ) -> None:
         self._loader = loader
+        self._callback = callback
 
     def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
         return self._loader.create_module(spec)
 
     def exec_module(self, module: ModuleType) -> None:
         self._loader.exec_module(module)
-        if module.__name__ == _EXECUTOR_MODULE:
-            _observe_scheduler(module)
-        else:
-            _observe(module)
+        self._callback(module)
 
 
 class _ObserverFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, callbacks: dict[str, Callable[[ModuleType], None]]) -> None:
+        self._callbacks = callbacks
+
     def find_spec(
         self,
         fullname: str,
         path: Sequence[str] | None,
         target: ModuleType | None = None,
     ) -> importlib.machinery.ModuleSpec | None:
-        if fullname not in (_MODULE, _EXECUTOR_MODULE):
+        callback = self._callbacks.get(fullname)
+        if callback is None:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
-        assert spec is not None and spec.loader is not None, "Sparse offload module not found"
-        spec.loader = _ObserverLoader(spec.loader)
+        assert spec is not None and spec.loader is not None, (
+            f"Observer module not found: {fullname}"
+        )
+        spec.loader = _ObserverLoader(spec.loader, callback)
         return spec
 
 
 def install() -> None:
     """Observe the real library when imported, without initializing MPI or CUDA early."""
-    assert all(name not in sys.modules for name in (_MODULE, _EXECUTOR_MODULE)), (
-        "Observer must be installed before the sparse backend and executor"
-    )
-    sys.meta_path.insert(0, _ObserverFinder())
+    integrity_enabled = os.environ.get("TLLM_TEST_SPARSE_OFFLOAD_INTEGRITY") == "1"
+    callbacks: dict[str, Callable[[ModuleType], None]] = {
+        _MODULE: functools.partial(_observe, integrity_enabled=integrity_enabled),
+        _EXECUTOR_MODULE: _observe_scheduler,
+    }
+    if integrity_enabled:
+        if TYPE_CHECKING:
+            from .sparse_offload_integrity import observe
+        else:
+            from sparse_offload_integrity import observe
+
+        callbacks[_INTEGRITY_MODULE] = observe
+    for module_name in callbacks:
+        assert module_name not in sys.modules, (
+            f"Observer must be installed before importing {module_name}"
+        )
+    sys.meta_path.insert(0, _ObserverFinder(callbacks))
