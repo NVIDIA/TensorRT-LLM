@@ -32,6 +32,7 @@ from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -170,6 +171,38 @@ def test_cpp_deprecation_warning_is_emitted_once(
     ]
     assert len(warnings) == 1
     assert native_constructor.call_count == 2
+
+
+# Every combination reaches the same check, so each value appears once.
+@pytest.mark.parametrize(
+    "runtime,backend,manager_cls",
+    [
+        (None, "NIXL", KVCacheManagerV2),
+        ("CPP", "UCX", MambaHybridCacheManagerV2),
+        ("auto", "UCX", KVCacheManagerV2),
+    ],
+)
+def test_cpp_transceiver_rejects_v2_manager(
+    runtime: str | None, backend: str, manager_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = CacheTransceiverConfig(backend=backend, transceiver_runtime=runtime)
+    manager = object.__new__(manager_cls)
+    constructor = Mock()
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
+    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
+    monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_enabled_cache", None)
+
+    with pytest.raises(ValueError, match=r"kv_cache_config.use_kv_cache_manager_v2=False"):
+        transceiver_module.create_kv_cache_transceiver(
+            mapping=None,
+            dist=None,
+            kv_cache_manager=manager,
+            attention_type=transceiver_module.AttentionTypeCpp.DEFAULT,
+            cache_transceiver_config=config,
+            mamba_cache_manager=(manager if manager_cls is MambaHybridCacheManagerV2 else None),
+        )
+
+    constructor.assert_not_called()
 
 
 def test_python_runtime_rejects_separate_legacy_mamba_manager() -> None:

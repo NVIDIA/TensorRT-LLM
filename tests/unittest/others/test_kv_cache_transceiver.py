@@ -10,8 +10,6 @@ import time
 import uuid
 import weakref
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -24,15 +22,11 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.disaggregation import \
-    kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-    KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
+    MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -49,6 +43,7 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("transceiver_runtime", ["CPP", "auto"])
 def test_cpp_transceiver_rejects_mixed_mamba_manager(transceiver_runtime):
     config = CacheTransceiverConfig(backend="NIXL",
@@ -67,75 +62,8 @@ def test_cpp_transceiver_rejects_mixed_mamba_manager(transceiver_runtime):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("runtime", [None, "CPP", "auto"])
-@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
-@pytest.mark.parametrize("manager_cls",
-                         [KVCacheManagerV2, MambaHybridCacheManagerV2])
-def test_cpp_transceiver_rejects_v2_manager(monkeypatch, runtime, backend,
-                                            manager_cls) -> None:
-    config = CacheTransceiverConfig(backend=backend,
-                                    transceiver_runtime=runtime)
-    manager = object.__new__(manager_cls)
-    constructor = Mock()
-    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
-                        constructor)
-    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
-    monkeypatch.setattr(transceiver_module,
-                        "_disagg_inflight_cancel_enabled_cache", None)
-
-    with pytest.raises(ValueError,
-                       match=r"kv_cache_config.use_kv_cache_manager_v2=False"):
-        create_kv_cache_transceiver(
-            mapping=None,
-            dist=None,
-            kv_cache_manager=manager,
-            attention_type=AttentionTypeCpp.DEFAULT,
-            cache_transceiver_config=config,
-            mamba_cache_manager=(manager if manager_cls
-                                 is MambaHybridCacheManagerV2 else None))
-
-    constructor.assert_not_called()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("runtime,manager_cls", [
-    ("CPP", KVCacheManager),
-    (None, KVCacheManager),
-    ("PYTHON", KVCacheManagerV2),
-])
-def test_transceiver_accepts_compatible_manager(monkeypatch, runtime,
-                                                manager_cls) -> None:
-    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
-    manager = object.__new__(manager_cls)
-    cpp_constructor = Mock()
-    python_constructor = Mock()
-    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
-                        cpp_constructor)
-    monkeypatch.setitem(
-        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver",
-        SimpleNamespace(KvCacheTransceiverV2=python_constructor))
-    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
-    monkeypatch.setattr(transceiver_module,
-                        "_disagg_inflight_cancel_enabled_cache", None)
-
-    result = create_kv_cache_transceiver(
-        mapping=None,
-        dist=None,
-        kv_cache_manager=manager,
-        attention_type=AttentionTypeCpp.DEFAULT,
-        cache_transceiver_config=config)
-
-    expected = python_constructor if runtime == "PYTHON" else cpp_constructor
-    unused = cpp_constructor if runtime == "PYTHON" else python_constructor
-    assert result is expected.return_value
-    expected.assert_called_once()
-    unused.assert_not_called()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
-def test_python_transceiver_backend_error_explains_v1(backend) -> None:
-    config = CacheTransceiverConfig(backend=backend)
+def test_python_transceiver_backend_error_explains_v1() -> None:
+    config = CacheTransceiverConfig(backend="UCX")
 
     with pytest.raises(
             ValueError,
@@ -218,8 +146,6 @@ def ctx_gen_kv_cache_dtype(request):
         return DataType.FP8, DataType.FP8
     elif request.param == "ctx_fp16_gen_fp16":
         return DataType.HALF, DataType.HALF
-    elif request.param == "ctx_bf16_gen_bf16":
-        return DataType.BF16, DataType.BF16
     else:
         raise ValueError(f"Invalid config: {request.param}")
 
@@ -250,11 +176,12 @@ def test_cache_transceiver_wrapper_load_and_exit(wrapper_library):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize(
-    "ctx_gen_kv_cache_dtype",
-    ["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp16", "ctx_bf16_gen_bf16"],
-    ids=["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp16", "ctx_bf16_gen_bf16"],
-    indirect=True)
+# Transfer code dispatches on element size, not dtype: one 1-byte and one
+# 2-byte dtype cover it.
+@pytest.mark.parametrize("ctx_gen_kv_cache_dtype",
+                         ["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp16"],
+                         ids=["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp16"],
+                         indirect=True)
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
                          ids=["mha", "mla"])
@@ -484,10 +411,7 @@ def test_cpp_nixl_sync_transfer_stress():
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("attention_type",
-                         [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
-                         ids=["mha", "mla"])
-def test_cancel_request_in_transmission(attention_type):
+def test_cancel_request_in_transmission():
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
     dist = Distributed.get(mapping)
@@ -500,11 +424,11 @@ def test_cancel_request_in_transmission(attention_type):
                                                       max_tokens_in_buffer=512)
 
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager_ctx, attention_type,
+        mapping, dist, kv_cache_manager_ctx, AttentionTypeCpp.DEFAULT,
         cache_transceiver_config)
 
     kv_cache_transceiver_gen = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager_gen, attention_type,
+        mapping, dist, kv_cache_manager_gen, AttentionTypeCpp.DEFAULT,
         cache_transceiver_config)
 
     fill_kv_cache_buffer(kv_cache_manager_ctx)

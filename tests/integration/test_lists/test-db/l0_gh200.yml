@@ -15,6 +15,8 @@ l0_gh200:
       backend: pytorch
   tests:
   - unittest/bindings
+  # C++ cache transceiver sender wake-up race on aarch64 (l0_b200 covers x86; -k: see l0_sanity_check).
+  - unittest/others/test_kv_cache_transceiver.py -k "test_cpp_nixl_sync_transfer_stress"
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_quickstart
   - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough

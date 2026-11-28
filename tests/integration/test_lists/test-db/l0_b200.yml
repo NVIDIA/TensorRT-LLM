@@ -68,7 +68,8 @@ l0_b200:
   # numerics on CUTLASS; MXFP8 index-projection scales per simulated TP4 rank.
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_nvfp4_experts_load_and_run_on_cutlass
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank
-  - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
+  # C++ cache transceiver logic regressions and MLA transfers, in one pytest process (-k: see l0_sanity_check).
+  - unittest/others/test_kv_cache_transceiver.py -k "test_cpp_nixl_sync_transfer_stress or test_cancel_request_in_transmission or test_async_transfer_keeps_llm_request_alive or test_kv_transfer_timeout or test_context_transfer_bounded_poll_keeps_request_in_progress or test_kv_cache_transceiver_single_process and mla and ctx_fp8_gen_fp8"
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
