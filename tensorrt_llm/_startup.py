@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from tensorrt_llm._startup_errors import mark_startup_stage
+from tensorrt_llm._startup_events import publish_phase_completion
 from tensorrt_llm.logger import logger
 
 
@@ -57,6 +58,7 @@ class _StartupTimer:
         *,
         metrics: dict[str, float] | None = None,
         metric_name: str | None = None,
+        completion_rank: int | None = None,
     ) -> Iterator[None]:
         """Record outermost elapsed time, including failures, and log status.
 
@@ -65,6 +67,13 @@ class _StartupTimer:
         did, and its completion marker is explicitly labelled ``failed``.
         When ``metrics`` is provided, accumulate the same elapsed value under
         ``metric_name`` (or ``name``), including nested phases.
+
+        Args:
+            name: Name of the phase.
+            metrics: Optional metrics accumulator.
+            metric_name: Override for this phase's key in the accumulator.
+            completion_rank: When set, publish a successful completion for this
+                rank if `TRTLLM_STARTUP_EVENT_DIR` is configured.
         """
         logger.info(f"[startup][pid={os.getpid()}] {self.name}/{name}: start")
         start = time.perf_counter()
@@ -77,6 +86,9 @@ class _StartupTimer:
         except BaseException as exc:
             mark_startup_stage(exc, f"{self.name}/{name}")
             raise
+        else:
+            if completion_rank is not None:
+                publish_phase_completion(name, completion_rank)
         finally:
             elapsed = time.perf_counter() - start
             self.depth -= 1

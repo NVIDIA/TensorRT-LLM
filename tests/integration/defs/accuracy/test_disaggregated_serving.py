@@ -39,6 +39,8 @@ import requests
 import yaml
 from datasets import load_dataset
 from defs.common import single_host_ucx_env, wait_for_reported_addr
+from test_common.disagg_timeout import (configure_weight_loading,
+                                        require_worker_startup_events)
 from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
                                      sm100f_moe_tactic_or_cutlass)
 
@@ -52,9 +54,9 @@ from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer, load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
-                        skip_pre_hopper)
+from ..conftest import (get_device_count, get_sm_version, llm_models_root,
+                        parametrize_with_ids, skip_no_hopper, skip_no_rubin,
+                        skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
                             GSM8KInferenceX, LlmapiAccuracyTestHarness,
@@ -469,6 +471,13 @@ def launch_disaggregated_llm(
 
         gen_servers.append((env, gen_server_args))
 
+    readiness = configure_weight_loading([(worker_env, ctx_total_gpus)
+                                          for worker_env, _ in ctx_servers] +
+                                         [(worker_env, gen_total_gpus)
+                                          for worker_env, _ in gen_servers])
+    safety_timeout = (readiness.safety_timeout
+                      if readiness is not None else server_waiting_timeout)
+
     worker_log_paths = []
     capture_worker_logs = bool(assert_worker_log_contains
                                or assert_worker_log_excludes)
@@ -498,6 +507,8 @@ def launch_disaggregated_llm(
         log_files = []
         try:
             for i, (env, args) in enumerate(server_configs):
+                if server_name in ("ctx", "gen"):
+                    require_worker_startup_events(env)
                 if enable_redirect_log:
                     log_path = os.path.join(temp_dir.name,
                                             f"output_{server_name}_{i}.log")
@@ -526,8 +537,7 @@ def launch_disaggregated_llm(
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
         disaggregated_serving_config_path, "--server_start_timeout",
-        str(server_waiting_timeout), "-r", "360000", "--report_addr",
-        disagg_addr_path
+        str(safety_timeout), "-r", "360000", "--report_addr", disagg_addr_path
     ]
     # The disagg server must come up first: it owns the cluster storage the
     # workers register with, and only it knows the port the kernel handed it.
@@ -539,8 +549,12 @@ def launch_disaggregated_llm(
     ):
         server_processes = server_stack.enter_context(
             multi_popen([(base_env, server_cmd)], "disagg"))
+        address_timeout = server_waiting_timeout
+        if readiness is not None:
+            address_timeout = readiness.limit_address_timeout(
+                address_timeout, time.monotonic())
         _, serve_port = wait_for_reported_addr(disagg_addr_path,
-                                               server_waiting_timeout,
+                                               address_timeout,
                                                server_processes[0])
         print(f"Using HTTP service discovery at http://localhost:{serve_port}")
         write_worker_configs(f"http://localhost:{serve_port}")
@@ -556,8 +570,12 @@ def launch_disaggregated_llm(
                         enable_redirect_log=capture_worker_logs))
 
         def wait_ready() -> None:
-            deadline = time.monotonic() + server_waiting_timeout
+            start = time.monotonic()
+            deadline = start + safety_timeout
             while time.monotonic() < deadline:
+                if readiness is not None:
+                    readiness.remaining(start, server_waiting_timeout,
+                                        time.monotonic())
                 for process in itertools.chain(ctx_processes, gen_processes,
                                                server_processes):
                     if process.poll() is not None:
@@ -571,13 +589,16 @@ def launch_disaggregated_llm(
                     response.raise_for_status()
                     cluster_info = response.json()
                     if cluster_info.get("is_ready"):
+                        if readiness is not None:
+                            readiness.require_complete()
+                            readiness.remaining(start, server_waiting_timeout,
+                                                time.monotonic())
                         print(f"Cluster ready: {cluster_info}")
                         return
                 except requests.exceptions.ConnectionError:
                     pass
                 time.sleep(5)
-            pytest.fail(
-                f"Server is not ready after {server_waiting_timeout} seconds")
+            pytest.fail(f"Server is not ready after {safety_timeout} seconds")
 
         wait_ready()
 
@@ -2299,6 +2320,7 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(10800)
 @skip_pre_blackwell
+@pytest.mark.disagg_weight_loading(7200)
 class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
@@ -2367,9 +2389,14 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        readiness_timeout = (3000 if get_sm_version() == 107 else
+                             DEFAULT_SERVER_WAITING_TIMEOUT)
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                server_waiting_timeout=readiness_timeout) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
@@ -2592,9 +2619,15 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                                   reasoning_effort="xhigh"),
     )
 
-    @pytest.mark.parametrize(
-        "snapshot_policy", [None, "interval", "offsets"],
-        ids=["no_reuse", "prefix_cache", "prefix_cache_offsets"])
+    @pytest.mark.parametrize("snapshot_policy", [
+        None,
+        "interval",
+        pytest.param("offsets", marks=pytest.mark.disagg_weight_loading(7200)),
+    ],
+                             ids=[
+                                 "no_reuse", "prefix_cache",
+                                 "prefix_cache_offsets"
+                             ])
     def test_fp8_nixl_python(self, mocker, snapshot_policy):
         """Tensor/expert-parallel-2 context to attention-DP2 generation.
 
@@ -2699,6 +2732,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
                              ids=["cache_mgr_v2"])
+    @pytest.mark.disagg_weight_loading(7200)
     def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
@@ -3181,6 +3215,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(14400)
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.disagg_weight_loading(7200)
 class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash-Base"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-Base"
@@ -3235,12 +3270,13 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        # Same long-init reason as TestDeepSeekV4Flash above.
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      server_waiting_timeout=3600) as llm:
+        readiness_timeout = 5400 if get_sm_version() == 107 else 3600
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                server_waiting_timeout=readiness_timeout) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 

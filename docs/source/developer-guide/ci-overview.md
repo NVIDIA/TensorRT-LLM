@@ -28,6 +28,7 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 6. [Waiving tests](#waiving-tests)
 7. [Multi-GPU Tests](#multi-gpu-tests)
 8. [Triggering CI Best Practices](#triggering-ci-best-practices)
+9. [Experimental disaggregated QA timeout budgets](#experimental-disaggregated-qa-timeout-budgets)
 
 ## CI pipelines
 
@@ -221,3 +222,50 @@ Being selective keeps CI turnaround fast and conserves hardware resources.
 ### Avoiding unnecessary `--disable-fail-fast` usage
 
 Avoid habitually using `--disable-fail-fast` as it wastes scarce hardware resources. The CI system automatically reuses successful test stages when commits remain unchanged, and subsequent `/bot run` commands only retry failed stages. Overusing `--disable-fail-fast` keeps failed pipelines consuming resources (like DGX-H100s), increasing queue backlogs and reducing team efficiency.
+
+## Experimental disaggregated QA timeout budgets
+
+Selected disaggregated cases in L0 pre-merge and post-merge use
+`@pytest.mark.disagg_weight_loading(seconds)` to separate two wall-clock budgets:
+
+1. From pytest setup until every context and generation rank has returned from
+   loading its main model, including checkpoint preparation and weight finalization.
+2. From the last rank's loading completion until the test finishes, including
+   remaining communication initialization, compilation, warmup, registration,
+   inference or accuracy evaluation, and teardown. This budget is the existing
+   `pytest.mark.timeout` value (or `--timeout` for cases without that marker).
+
+The opt-in markers on individual tests define the loading budgets. Set
+`TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT` to a positive number of seconds to override
+the loading budget for every marked test. Selected standalone tests specify
+their execution budgets explicitly so Jenkins can provide a larger group timeout.
+
+While any rank's loading event is missing, the launchers reserve up to 60
+seconds or one quarter of the loading budget, whichever is smaller, to report
+the failure and clean up workers. The coordinator's address wait also observes
+this deadline. The watchdog still enforces the hard loading budget if a
+blocked launcher or a short override leaves too little time for cleanup. After
+all ranks have loaded, the test's service readiness limit applies within the
+execution budget.
+
+This version supports one cluster launch per test attempt and single-host
+PyTorch workers with the main/one-model checkpoint. It does not separate the
+loading of an additional external draft model or later worker reloads. Each
+attempt has its own shared state directory. The runtime's startup timer publishes
+an atomic `model_weight_loading` completion event for each rank that finishes
+loading successfully. The phase boundary uses the last event on the shared
+host clock. Some initialization precedes or overlaps loading and is included in
+the first budget. A separate Python process checks for startup event support
+before launching each supervised worker with `trtllm-serve`. Build the wheel
+from the same checkout as the tests and use a PATH that selects Python 3 and
+`trtllm-serve` from the same environment.
+
+Use `--timeout-method=thread` with a whole-test pytest timeout to enable the
+supervisor. It emits `[disagg-timeout] phase=weight_loading` and
+`phase=post_loading` messages and preserves exact-nodeid timeout evidence and
+hang tracebacks. Local signal timeouts and `func_only=True` use pytest-timeout's
+single timer. Set Jenkins process and group limits to cover both budgets,
+cleanup, and any configured retries.
+
+CPU regression checks are in `tests/unittest/tools/test_disagg_timeout.py`,
+already covered by the `unittest/tools` parent entry in the CPU test list.

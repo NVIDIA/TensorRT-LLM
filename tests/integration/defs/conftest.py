@@ -47,6 +47,7 @@ from _pytest.mark import ParameterSet
 # entries are usable). The wrappers below forward to the plugin; hooks are
 # idempotent, so a repo-root run that also dispatches from tests/conftest.py
 # is harmless.
+from test_common import disagg_timeout as _disagg_timeout
 from test_common import session_prefetcher_hooks as _prefetch_hooks
 
 from .perf.gpu_clock_lock import GPUClockLock
@@ -60,7 +61,8 @@ from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
                                    makedirs, print_info, print_warning,
                                    wsl_to_win_path)
 from .utils.periodic_junit import (PeriodicJUnitXML,
-                                   register_pytest_timeout_evidence)
+                                   register_pytest_timeout_evidence,
+                                   report_test_timeout)
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -1161,6 +1163,7 @@ def pytest_configure(config):
     periodic = config.getoption("--periodic-junit", default=False)
     if periodic:
         register_pytest_timeout_evidence(config)
+    _disagg_timeout.register(config, report_timeout=report_test_timeout)
 
     # xdist worker processes must not register PeriodicJUnitXML: all worker
     # reports are forwarded to the controller via xdist and processed there,
