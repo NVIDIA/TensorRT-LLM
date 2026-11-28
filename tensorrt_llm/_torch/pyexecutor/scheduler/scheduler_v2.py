@@ -700,6 +700,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._raise_if_lockstep_remote_level_failed()
         self._failed_requests: RequestList = []
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        # gen_init_pause_after_release: consumed once per pass, so the loop's internal retry
+        # (defer_remote_tail_context) keeps the pause the first attempt applied.
+        pause_gen_init, self._gen_release_pending = self._gen_release_pending, False
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -710,7 +713,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(
-            active_requests, inflight_request_ids, transfer_held_requests=held_requests
+            active_requests,
+            inflight_request_ids,
+            transfer_held_requests=held_requests,
+            pause_gen_init=pause_gen_init,
         )
         # One that failed in this pass, e.g. in an eviction WRITE that the C++ retried past it, before the batch runs.
         self._raise_if_lockstep_remote_level_failed()
@@ -801,6 +807,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         defer_remote_tail_context=False,
         transfer_held_requests=(),
         prefix_waits=None,
+        pause_gen_init=False,
     ):
         scheduled_ctx: RequestList = []
         scheduled_remote_mode = None
@@ -910,8 +917,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         # --- Phase 1: generation / disagg only ---
         # Membership costs two binding calls per request; the set is usually empty.
         has_inflight = len(inflight_request_ids) > 0
-        pause_gen_init = self._gen_release_pending
-        self._gen_release_pending = False
         while req_it < req_it_end:
             req = requests_list[req_it]
 
@@ -1052,6 +1057,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             if self._claim_hold:
                 pending_ctx = self._hold_first_seen(pending_ctx, demoted_ids)
 
+        # Pages given back by deferred closes or released claims in this pass: progress for the
+        # deadlock detector, as a preemption is, since the request that needed them retries.
+        reclaimed_pages = False
+
         def preempt_for_pages(req: LlmRequest) -> bool:
             """Free pages for `req` by giving up one started request.
 
@@ -1063,11 +1072,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Pages held by deferred closes (defer_context_only_release) or by caches
             # claimed ahead for waiting requests come back first; `req` retries next
             # pass, as after a preemption.
+            nonlocal reclaimed_pages
             if self.kv_cache_manager.flush_deferred_closes():
+                reclaimed_pages = True
                 return True
             if self._reclaim_context_claims and self.kv_cache_manager.release_claims_ahead():
                 # Claims pinned pages a request needed: hold nobody for a while.
                 self._claim_hold_off_until = self._sched_iter + _CLAIM_HOLD_PAGES_PASSES + 1
+                reclaimed_pages = True
                 return True
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
@@ -1327,6 +1339,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             or deferred_behind_contributor
             # A decoder-batching hold defers a request by one pass on purpose.
             or self._ctx_decoder_held
+            or reclaimed_pages
         )
         if (
             self.remote_tail_phase is None
@@ -1342,6 +1355,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 inflight_request_ids,
                 defer_remote_tail_context=True,
                 prefix_waits=prefix_waits,
+                pause_gen_init=pause_gen_init,
             )
 
         if self._claim_hold:
@@ -1669,12 +1683,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if left is not None and rid not in demoted_ids:
                         left -= req.context_remaining_length
                     continue
-                if (
-                    rid in demoted_ids
-                    or rid in waits
-                    or rid in waited_for
-                    or manager.context_claim_given_up(rid)
-                ):
+                if rid in demoted_ids or rid in waits or rid in waited_for:
+                    continue
+                if manager.context_claim_given_up(rid):
+                    # Not claimed again, but the next pass still admits it in its turn.
+                    if left is not None:
+                        left -= self._claim_estimate(req)
                     continue
                 if not manager.has_context_claim(rid):
                     picked.append(req)
@@ -1731,9 +1745,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         return self._uncached_tokens(req)
 
     def _record_prompt(self, req: LlmRequest) -> None:
-        """Remember the prompt of a context request whose first chunk was just scheduled, up
-        to the depth its prefill leaves reusable (`committed_prompt_depth`)."""
-        if not req.is_first_context_chunk or req.multimodal_hashes is not None:
+        """Remember the prompt of a context request whose last context chunk was just scheduled,
+        up to the depth its prefill leaves reusable (`committed_prompt_depth`).
+
+        Not at its first chunk: a request cancelled or preempted between its chunks has not
+        committed that depth, and its record would outlive its cache. The record still waits for
+        the request to drop its cache before it is trusted (`proven_depth`)."""
+        if (
+            req.context_chunk_size < req.context_remaining_length
+            or req.multimodal_hashes is not None
+        ):
             return
         tokens = req.get_tokens_view(0)
         depth = min(self.kv_cache_manager.committed_prompt_depth(req.prompt_len), len(tokens) - 1)
