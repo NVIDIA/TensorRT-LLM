@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
 from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 
@@ -441,13 +442,34 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
     def test_qwen3_text_embedding_cuda_graph_matches_eager(
-        self, model_name, model_path, graph_replays
+        self, model_name, model_path, graph_replays, monkeypatch
     ):
         """Graph replay must pool each prompt's own last token.
 
         The prompts have different lengths and are packed into one batch; the
         reversed three-prompt call replays a padded bucket with other lengths.
+        Every captured attention output is NaN before each replay, as stale
+        graph-pool memory can be, so a replay must write each row it reads.
         """
+        captured_outputs = []
+        create_output = TrtllmAttention.create_output
+
+        def recording_create_output(attention, q, **kwargs):
+            outputs = create_output(attention, q, **kwargs)
+            if torch.cuda.is_current_stream_capturing():
+                captured_outputs.extend(outputs)
+            return outputs
+
+        replay = EncoderCUDAGraphRunner.replay
+
+        def poisoned_replay(runner, key, inputs):
+            for output in captured_outputs:
+                output.fill_(float("nan"))
+            return replay(runner, key, inputs)
+
+        monkeypatch.setattr(TrtllmAttention, "create_output", recording_create_output)
+        monkeypatch.setattr(EncoderCUDAGraphRunner, "replay", poisoned_replay)
+
         _, llm_dtype = _resolve_checkpoint_dtype(model_path)
         batches = [PROMPTS, PROMPTS[:0:-1]]
         model_kwargs = {"architectures": ["Qwen3ForTextEmbedding"]}

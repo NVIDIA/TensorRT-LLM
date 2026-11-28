@@ -3917,21 +3917,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if out_dtype is None:
             out_dtype = q.dtype
         v_head_size = self.out_head_size(is_gen_only)
+        # An encoder graph replay runs over rows past its last sequence that
+        # no kernel writes; they must stay finite for the masked K/V loads of
+        # the next layer.
+        new_output = (q.new_zeros if metadata.max_context_q_len_override
+                      is not None else q.new_empty)
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
             size_per_token = self.num_heads * v_head_size
-            output = q.new_empty(
+            output = new_output(
                 (num_tokens,
                  size_per_token // num_nvfp4_elements_per_container),
                 dtype=torch.uint8)
             padded_row, padded_col = compute_swizzled_sf_shape(
                 num_tokens, size_per_token // scaling_vector_size)
-            output_sf = q.new_empty(padded_row * padded_col, dtype=torch.uint8)
+            output_sf = new_output(padded_row * padded_col, dtype=torch.uint8)
             return [output, output_sf]
         return [
-            q.new_empty((num_tokens, self.num_heads * v_head_size),
-                        dtype=out_dtype)
+            new_output((num_tokens, self.num_heads * v_head_size),
+                       dtype=out_dtype)
         ]
 
     @property
