@@ -1030,6 +1030,9 @@ def _load_moe_layer(monkeypatch,
             for expert_id in range(_EXPERTS)
             for name, shape in shapes.items()
         }
+    # Hand the weights over on the host, as the model loader does, before the
+    # measurement, so it counts only the load.
+    weights = {name: w.cpu() for name, w in weights.items()}
     counters = MemoryCounters.instance()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
