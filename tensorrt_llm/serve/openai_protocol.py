@@ -77,6 +77,28 @@ _LOGIT_BIAS_MAX = 100.0
 EarlyStopping: TypeAlias = Union[bool, Literal["never"]]
 
 
+def _check_stream_best_of(request):
+    """Reject a streamed request that asks for more candidates than it returns.
+
+    With sampling and ``best_of > n`` the executor ranks the candidates by
+    cumulative logprob on every response, so the ``n`` returned choices can
+    change identity while the stream is in flight. A chunk already sent cannot
+    be taken back, so the stream cannot honour the ranking (OpenAI also
+    disallows streaming with ``best_of``). Beam search returns its beams in a
+    fixed order and is not affected.
+
+    Runs on the parsed request so that coerced values (``best_of=2.0``,
+    ``n=2.0``, ``stream="false"``, ``use_beam_search="false"``) are judged as
+    the engine will see them.
+    """
+    if (request.stream and request.best_of is not None
+            and request.best_of > request.n and not request.use_beam_search):
+        raise ValueError(
+            "best_of greater than n is not supported with stream=true; "
+            "set best_of to n or disable streaming.")
+    return request
+
+
 def _early_stopping_to_int(value: Optional[EarlyStopping]) -> Optional[int]:
     """Translate the HF-style tri-state into the engine's integer encoding.
 
@@ -967,6 +989,10 @@ class CompletionRequest(OpenAIBaseModel):
             raise ValueError("suffix is not supported")
         return data
 
+    @model_validator(mode="after")
+    def check_stream_best_of(self):
+        return _check_stream_best_of(self)
+
 
 class FunctionCall(OpenAIBaseModel):
     name: str
@@ -1602,6 +1628,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
         return data
+
+    @model_validator(mode="after")
+    def check_stream_best_of(self):
+        return _check_stream_best_of(self)
 
     @field_validator("cache_salt")
     @classmethod
