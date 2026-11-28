@@ -127,11 +127,21 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmo
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (
     silu_and_mul_rows,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.draft_continue_rows__decode import (  # noqa: E501
+    draft_continue_select,
+    draft_rows_gather,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (
     qsa_canonical_selection,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
+    index_scores_groups as index_scores_groups_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
+    serves as _index_groups_cute_serves,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_mtp_reuse_topk import (
     qsa_mtp_reuse_topk,
@@ -162,6 +172,18 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback
     qsa_rollback_gather,
     qsa_rollback_restore,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_grouped_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    qsa_topk_expand_cluster,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    supports as _topk_expand_cluster_supports,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
     orders_rows as _topk_expand_orders_rows,
 )
@@ -177,6 +199,16 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_sel
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.spec_rollback_commit import (
     spec_rollback_commit,
     spec_rollback_stage,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.embed_rows__decode import (
+    embed_rows,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (  # noqa: E501
+    MAX_ROWS as _HC_ROWS_TC_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (  # noqa: E501
+    qwen4_exp_hc_decode_rows_first,
+    qwen4_exp_hc_decode_rows_mix,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_first_rescale_tc import (
     BK as _HC_RESCALE_BK,
@@ -210,6 +242,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inje
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fused_sigmoid_gate_mul_add import (
     fused_sigmoid_gate_mul_add,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.mtp_moe_combine_inject__decode import (  # noqa: E501
+    mtp_moe_combine_inject,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
     renorm_moe_routing_op,
@@ -266,27 +301,18 @@ from .. import ple_host_table as _ple_host
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
-from .ops.attention.draft_continue_rows__decode import draft_continue_select, draft_rows_gather
 from .ops.attention.qsa_fp8_pages_to_bf16__prefill import qsa_fp8_pages_to_bf16
 from .ops.attention.qsa_index_scores_cute__prefill import qsa_index_scores_prefill
 from .ops.attention.qsa_index_scores_cute__prefill import supports as _index_scores_cute_supports
-from .ops.attention.qsa_index_scores_groups_cute__decode import (
-    index_scores_groups as index_scores_groups_cute,
-)
-from .ops.attention.qsa_index_scores_groups_cute__decode import serves as _index_groups_cute_serves
 from .ops.attention.qsa_index_split_plan__decode import index_split_plan
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
 from .ops.attention.qsa_paged_sparse_gqa import qsa_paged_sparse_gqa
-from .ops.attention.qsa_sparse_gqa_grouped_cute__decode import qsa_sparse_gqa_grouped_cute
 from .ops.attention.qsa_sparse_gqa_rowtile__prefill import qsa_sparse_gqa_rowtile
-from .ops.attention.qsa_sparse_gqa_splitk_cute__decode import qsa_sparse_gqa_splitk_cute
 from .ops.attention.qsa_spec_step_metadata__decode import (
     SpecStepMetadataPrologue,
     take_step_positions,
 )
-from .ops.attention.qsa_topk_expand_cluster__decode import qsa_topk_expand_cluster
-from .ops.attention.qsa_topk_expand_cluster__decode import supports as _topk_expand_cluster_supports
 from .ops.attention.qsa_topk_rows_cute__prefill import qsa_topk_rows
 from .ops.attention.qsa_topk_rows_cute__prefill import supports as _topk_rows_supports
 from .ops.attention.qsa_triton_kernels__stable_jit import splitk_launch_config as _gqa_splitk_config
@@ -300,13 +326,7 @@ from .ops.comm.lamport_allgather__index_split import lamport_allgather
 from .ops.comm.mnnvl_allreduce__tp_sum import mnnvl_tp_sum, mnnvl_workspace_args
 from .ops.comm.moe_a2a__dp_dispatch_combine import build_strategy as _build_moe_a2a
 from .ops.comm.moe_a2a__dp_dispatch_combine import moe_a2a_combine, moe_a2a_dispatch
-from .ops.embedding.embed_rows__decode import embed_rows
 from .ops.gemm.low_m_bf16_mm__decode import low_m_bf16_mm
-from .ops.hc.qwen4_exp_hc_decode_rows_tc__decode import MAX_ROWS as _HC_ROWS_TC_ROWS
-from .ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (
-    qwen4_exp_hc_decode_rows_first,
-    qwen4_exp_hc_decode_rows_mix,
-)
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import MAX_ROWS as _HC_TC_FIRST_ROWS
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import precompile as hc_tc_first_precompile
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import qwen4_exp_hc_decode_tc_first
@@ -325,7 +345,6 @@ from .ops.moe.moe_tpb_decode__decode import MAX_ROWS as _MOE_TPB_ROWS
 from .ops.moe.moe_tpb_decode__decode import BlockExperts as _BlockExperts
 from .ops.moe.moe_tpb_decode__decode import SharedBlocks as _TpbShared
 from .ops.moe.moe_tpb_decode__decode import moe_tpb_decode
-from .ops.moe.mtp_moe_combine_inject__decode import mtp_moe_combine_inject
 from .ops.ssm.causal_conv1d_token_major__verify import causal_conv1d_token_major
 from .ops.ssm.flashinfer_chunk_gated_delta_rule import INPLACE_MAX_TOKENS as _GDN_INPLACE_MAX_TOKENS
 from .ops.ssm.flashinfer_chunk_gated_delta_rule import _chunk_carried as _gdn_chunk_carried
@@ -511,7 +530,7 @@ _GDN_CONV_PDL_WAIT = get_env_enable_pdl()
 #: Whether a decode step's QSA index scoring (`_decode_index_selection`) launches with PDL: its
 #: kernels wait before their first read and the decode prologue triggers at its start.
 _INDEX_SCORES_PDL = get_env_enable_pdl()
-#: Request groups (this rank's share) from which verify index scoring takes this target's CuTe
+#: Request groups (this rank's share) from which verify index scoring takes the CuTe
 #: kernel (`qsa_index_scores_groups_cute__decode`) over the family's Triton one. It sums in another
 #: order (~7e-8 relative), so a row's top-k can differ only at a near-tie.
 _INDEX_SCORES_CUTE_MIN_GROUPS = 8

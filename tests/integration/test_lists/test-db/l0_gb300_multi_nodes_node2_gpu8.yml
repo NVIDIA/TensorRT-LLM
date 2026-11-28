@@ -33,3 +33,9 @@ l0_gb300_multi_nodes_node2_gpu8:
   # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
   # Measured 34 min on 2x4 GB300 (batch 1).
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)
+  # The Qwen3.8-Flash-Next NVFP4 target at dep8 (attention DP over the two trays) with the MoE round
+  # trip on the Lamport transport over MNNVL peer memory, host-indexed slots.
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k[dep8_lamport_step] TIMEOUT (60)
+  # The same at dep8 over FP8 KV with every opt-in attention-DP form the AgentX front points run
+  # (host-indexed Lamport slots, the router front, the bf16 output projections, both row ranges).
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep8_fp8_kv_front_stack] TIMEOUT (60)

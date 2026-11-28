@@ -1,0 +1,266 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""A decode MoE block's routing, pre-routed tables and NVFP4 activation in one launch.
+
+After the router GEMM, the trtllm-gen NVFP4 runner normally quantizes its input (`fp4_quantize`)
+and routes it itself (a histogram and a scan, or a cluster kernel). The route front
+(`kernels/blackwell/moe_route_front`, thread-block clusters) does all three in one launch over a
+step's gathered rows: the top-10 of the 512 router logits with the Renormalize weights, the
+runner's pre-routed tables for an expert window (expanded -> permuted index, permuted index ->
+token, CTA -> local expert, CTA -> row limit, CTA count, padded rows), and the NVFP4 codes with
+linear e4m3 block scales at the layer's global scale. The runner then enters pre-routed
+(`run_moe_prerouted`) at the tactic whose tile the tables were built for.
+
+Up to `LEAN_MAX_ROWS` rows the lean form runs (one cheaper count exchange; it releases its
+dependent, the runner's FC1, at its start, whose own wait still holds it until this grid
+completes); past them clusters of 16 and the default release.
+
+Bitwise: the experts and weights are `renorm_moe_routing_op`'s, the codes and scales
+`fp4_quantize`'s; the tables match the runner's own routing up to the row order inside an
+expert's tile, which no output depends on.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
+)
+
+#: The routing geometry the kernel is written for: 512 experts, top-10.
+NUM_EXPERTS = 512
+TOP_K = 10
+#: Rows a launch takes: clusters of 8 to 256 rows (the lean form), clusters of 16 to 1024.
+MAX_ROWS = 1024
+LEAN_MAX_ROWS = 256
+_SF_VEC = 16
+
+_COMPILED: dict = {}
+
+
+def max_num_tiles(rows: int, top_k: int, num_local: int, tile: int) -> int:
+    """The runner's CTA bound of a pre-routed problem (`getMaxNumCgasInBatchDim`)."""
+    remaining = rows * top_k
+    filled = min(num_local, remaining)
+    remaining -= filled
+    return filled + (remaining // tile if remaining > 0 else 0)
+
+
+def table_sizes(rows: int, top_k: int, num_local: int, tile: int) -> list[int]:
+    """int32 sizes of the six pre-routed tables in one flat buffer, in `run_moe_prerouted`'s
+    order: expanded -> permuted index, permuted index -> token (one tile of slack), CTA -> local
+    expert, CTA -> row limit, CTA count, padded row count."""
+    ctas = max_num_tiles(rows, top_k, num_local, tile)
+    return [rows * top_k, (ctas + 1) * tile, ctas, ctas, 1, 1]
+
+
+def table_views(flat: torch.Tensor, rows: int, top_k: int, num_local: int, tile: int) -> list:
+    """The six tables of `flat` (`table_sizes` order) as int32 views."""
+    sizes = table_sizes(rows, top_k, num_local, tile)
+    return list(torch.split(flat[: sum(sizes)], sizes))
+
+
+def _threads(rows: int, hidden: int, num_local: int) -> int:
+    """Threads a CTA of the lean form: the fewest of 256 / 512 / 1024 that keep one token a
+    routing warp, one thread a local expert and one quantization pass at 7 clusters."""
+    tokens_per_cta = -(-rows // 8)
+    for threads in (256, 512, 1024):
+        if (
+            32 * tokens_per_cta <= threads
+            and num_local <= threads
+            and rows * (hidden // 16) <= 7 * 8 * threads
+        ):
+            return threads
+    return 1024
+
+
+def compile_front(rows: int, hidden: int, row_stride: int, num_local: int, tile: int):
+    """Compile (once) the launch of `rows` gathered rows of `hidden` (row stride `row_stride`)
+    for a window of `num_local` experts at tile `tile`; False where the kernel does not take the
+    shape. Outside CUDA-graph capture only; `__call__` then finds it."""
+    key = (rows, hidden, row_stride, num_local, tile, bool(get_env_enable_pdl()))
+    if key in _COMPILED:
+        return _COMPILED[key] is not None
+    assert not torch.cuda.is_current_stream_capturing(), "compile outside graph capture"
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from tensorrt_llm._torch.kernels.blackwell.moe_route_front import (
+        ROUTE_CLUSTER,
+        ROUTE_CLUSTER_WIDE,
+        ROUTE_THREADS,
+        MoeRouteFrontKernel,
+    )
+
+    lean = rows <= LEAN_MAX_ROWS
+    config = dict(
+        num_rows=rows,
+        k_extent=hidden,
+        num_experts=NUM_EXPERTS,
+        top_k=TOP_K,
+        num_local=num_local,
+        tile=tile,
+        a_stride=row_stride,
+        cluster=ROUTE_CLUSTER if lean else ROUTE_CLUSTER_WIDE,
+        quant_clusters=7 if lean else 3,
+        threads=_threads(rows, hidden, num_local) if lean else ROUTE_THREADS,
+        lean=lean,
+    )
+    if not 1 <= rows <= MAX_ROWS or not MoeRouteFrontKernel.supports(**config):
+        _COMPILED[key] = None
+        return False
+    kernel = MoeRouteFrontKernel(use_pdl=key[-1], **config)
+    z = cutlass.Int64(0)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _COMPILED[key] = cute.compile(kernel, z, z, z, z, z, z, z, z, cutlass.Int32(0), stream)
+    return True
+
+
+def _cell(rows: int, offset: int, tile: int, why: str, num_local: int = 128) -> Cell:
+    return Cell(
+        why=why,
+        spec=dict(rows=rows, hidden=2560, local_offset=offset, num_local=num_local, tile=tile),
+    )
+
+
+class MoeRouteFront(OpWrapper):
+    """`xq, xsf, ids, wts = moe_route_front(logits, x, global_scale, tables, tile, local_offset,
+    num_local)`: over `x` `[T, H]` bf16 (`T` = the gathered rows, `compile_front`d) and its
+    router logits `[T, 512]` bf16 (contiguous), the NVFP4 codes `[T, H / 2]` uint8 with linear
+    block scales `[T, H / 16]` uint8 at `global_scale`, the top-10 experts `[T, 10]` int32 and
+    their Renormalize weights `[T, 10]` bf16, and the pre-routed tables of the window
+    `[local_offset, local_offset + num_local)` written into `tables` (int32, at least
+    `table_sizes` long; `table_views` reads them) for tile `tile`."""
+
+    ARCHS = frozenset({Arch.SM_103})
+    CELLS: tuple[Cell, ...] = (
+        _cell(48, 0, 8, "dep4 MTP-3: 3 requests a rank gathered (48 rows), window 0, tile 8"),
+        _cell(96, 128, 16, "dep4 MTP-3: 6 requests a rank (96 rows), window 1, tile 16"),
+        _cell(256, 384, 32, "dep4 MTP-3: 16 a rank (256 rows, the lean form's last), window 3"),
+        _cell(512, 256, 32, "dep4 MTP-3: 32 a rank (512 rows, clusters of 16), window 2"),
+        _cell(1024, 0, 64, "dep4 MTP-3: 64 a rank (1024 rows, the launch's last), tile 64"),
+        _cell(4, 384, 8, "tep4 MTP-3: 1 request (4 rows, the rank's own), window 3, tile 8"),
+        _cell(16, 128, 8, "tep4 MTP-3: 4 requests (16 rows, the rank's own), window 1, tile 8"),
+        _cell(96, 448, 16, "dep8 MTP-3: 3 requests a rank (96 rows), window 7 of 64", 64),
+        _cell(448, 64, 32, "dep8 MTP-3: 14 a rank (448 rows, clusters of 16), window 1", 64),
+        _cell(896, 320, 64, "dep8 MTP-3: 28 a rank (896 rows), window 5, tile 64", 64),
+    )
+
+    note = """
+    Source: `kernels/blackwell/moe_route_front` (CuTe DSL clusters; lean to 256 rows), compiled
+    per shape by `compile_front` outside capture. Certified for 128-expert windows of the
+    512-expert / top-10 layer at hidden 2560 on GB300 (dep4's gathered rows, tep4's own 4-16
+    rows), tiles 8 to 64; written for 64-expert windows (dep8's gathered rows, the last three
+    cells). Not certified: other routing geometries.
+    """
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        x: torch.Tensor,
+        global_scale: torch.Tensor,
+        tables: torch.Tensor,
+        tile: int,
+        local_offset: int,
+        num_local: int,
+    ):
+        import cuda.bindings.driver as cuda
+        import cutlass
+
+        rows, hidden = x.shape
+        key = (rows, hidden, x.stride(0), num_local, tile, bool(get_env_enable_pdl()))
+        fn = _COMPILED.get(key)
+        assert fn is not None, f"no route front compiled for {key}: `compile_front` first"
+        dev = x.device
+        xq = torch.empty([rows, hidden // 2], dtype=torch.uint8, device=dev)
+        xsf = torch.empty([rows, hidden // _SF_VEC], dtype=torch.uint8, device=dev)
+        ids = torch.empty([rows, TOP_K], dtype=torch.int32, device=dev)
+        wts = torch.empty([rows, TOP_K], dtype=torch.bfloat16, device=dev)
+        p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
+        fn(
+            p64(logits),
+            p64(x),
+            p64(global_scale),
+            p64(xq),
+            p64(xsf),
+            p64(ids),
+            p64(wts),
+            p64(tables),
+            cutlass.Int32(local_offset),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+        return xq, xsf, ids, wts
+
+    def reference(
+        self,
+        logits: torch.Tensor,
+        x: torch.Tensor,
+        global_scale: torch.Tensor,
+        tables: torch.Tensor,
+        tile: int,
+        local_offset: int,
+        num_local: int,
+    ):
+        """The composed path it replaces, without the tables (they are checked by their meaning,
+        `check_tables`): `fp4_quantize` with linear scales, `renorm_moe_routing_op`."""
+        xq, xsf = fp4_quantize(x, global_scale, _SF_VEC, False, False)
+        ids, wts = renorm_moe_routing_op(logits, TOP_K, torch.bfloat16)
+        return xq, xsf.reshape(x.shape[0], -1), ids, wts
+
+    def is_valid(self, logits, x, global_scale, tables, tile, local_offset, num_local) -> None:
+        rows, hidden = x.shape
+        assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.data_ptr() % 16 == 0
+        assert logits.dtype == torch.bfloat16 and logits.is_contiguous()
+        assert logits.shape == (rows, NUM_EXPERTS) and 1 <= rows <= MAX_ROWS
+        assert 0 <= local_offset and local_offset + num_local <= NUM_EXPERTS
+        assert tables.dtype == torch.int32 and tables.is_contiguous()
+        assert tables.numel() >= sum(table_sizes(rows, TOP_K, num_local, tile))
+
+
+def check_tables(views, ids: torch.Tensor, local_offset: int, num_local: int, tile: int) -> str:
+    """What is wrong with the pre-routed tables `views` (`table_views`) of the experts `ids`,
+    or "": every (row, slot) of the window has a permuted index whose token is the row and whose
+    CTA serves its expert, every other slot -1; each expert's slots fill whole tiles from its
+    first CTA; the CTA count and the padded rows match."""
+    e2p, p2t, cta_expert, cta_limit, n_ctas, n_padded = (v.cpu() for v in views)
+    ids = ids.cpu().to(torch.int64)
+    rows = ids.shape[0]
+    local = ids - local_offset
+    inside = (local >= 0) & (local < num_local)
+    counts = torch.bincount(local[inside], minlength=num_local)
+    tiles = (counts + tile - 1) // tile
+    if int(n_ctas[0]) != int(tiles.sum()) or int(n_padded[0]) != int(tiles.sum()) * tile:
+        return f"CTA count {int(n_ctas[0])} / padded {int(n_padded[0])}, want {int(tiles.sum())}"
+    e2p = e2p.view(rows, -1).to(torch.int64)
+    if bool((e2p[~inside] != -1).any()):
+        return "a slot outside the window has a permuted index"
+    perm = e2p[inside]
+    if bool((perm < 0).any()) or perm.unique().numel() != perm.numel():
+        return "the window's slots do not have distinct permuted indices"
+    if bool((perm >= int(n_padded[0])).any()):
+        return "a permuted index sits past the padded rows (a CTA the runner does not launch)"
+    tokens = torch.arange(rows).unsqueeze(1).expand_as(e2p)[inside]
+    if not torch.equal(p2t[perm].to(torch.int64), tokens):
+        return "a permuted index names another token"
+    if not torch.equal(cta_expert[perm // tile].to(torch.int64), local[inside]):
+        return "a permuted index sits in another expert's CTA"
+    if bool((perm >= cta_limit[perm // tile].to(torch.int64)).any()):
+        return "a permuted index sits past its CTA's row limit"
+    # The rows the runner serves -- CTA c's rows from c * tile up to its limit -- are exactly
+    # the live permuted indices (in any order within a tile): a stale row below a limit would
+    # be served too.
+    served = [
+        torch.arange(c * tile, int(cta_limit[c]), dtype=torch.int64) for c in range(int(n_ctas[0]))
+    ]
+    served = torch.cat(served) if served else torch.empty(0, dtype=torch.int64)
+    if not torch.equal(served.sort().values, perm.sort().values):
+        return "the rows below the CTA limits are not exactly the live permuted indices"
+    return ""
+
+
+moe_route_front = MoeRouteFront()

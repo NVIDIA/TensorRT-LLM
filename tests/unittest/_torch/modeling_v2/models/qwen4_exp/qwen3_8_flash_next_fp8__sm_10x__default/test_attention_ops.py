@@ -17,6 +17,28 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_generation_token_mapping,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (  # noqa: E501
+    qsa_index_scores_groups_cute__decode as _igc,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute__decode as mod,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.draft_continue_rows__decode import (  # noqa: E501
+    draft_continue_select,
+    draft_rows_gather,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_grouped_cute as _sgg_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute as _sgc_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    qsa_topk_expand_cluster as _tkc_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    supports,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
     qsa_topk_expand_decode as family_op,
 )
@@ -30,20 +52,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
     qsa_index_scores_cute__prefill as _isc,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
-    qsa_index_scores_groups_cute__decode as _igc,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
     qsa_sparse_gqa_rowtile__prefill as _module,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
-    qsa_sparse_gqa_splitk_cute__decode as mod,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
     qsa_triton_kernels__stable_jit as _stable,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.draft_continue_rows__decode import (  # noqa: E501
-    draft_continue_select,
-    draft_rows_gather,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_fp8_pages_to_bf16__prefill import (  # noqa: E501
     qsa_fp8_pages_to_bf16 as _f2b_op,
@@ -60,26 +72,14 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
     qsa_paged_sparse_gqa,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
-    qsa_sparse_gqa_grouped_cute as _sgg_op,
-)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     qsa_sparse_gqa_rowtile as _rtl_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     rows_per_group,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
-    qsa_sparse_gqa_splitk_cute as _sgc_op,
-)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_spec_step_metadata__decode import (  # noqa: E501
     qsa_spec_step_metadata,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
-    qsa_topk_expand_cluster as _tkc_op,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
-    supports,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_rows_cute__prefill import (  # noqa: E501
     qsa_topk_rows as _tkr_op,
@@ -1174,7 +1174,7 @@ def test_sparse_gqa_splitk_first_decode_call_compiles_every_plan(spec, monkeypat
     compile nothing at any plan (at tp2/tep2, 164..256 and 324..512 rows take three splits),
     nor do gated calls, and the results stay within the reference band."""
     monkeypatch.setattr(mod, "_COMPILED", {})
-    monkeypatch.setattr(mod, "_PLANNED", set())
+    monkeypatch.setattr(mod, "_PLANNED", {})
     args = _sgc_build(spec, seed=4242)
     q, k = args["q"], args["k_cache"]
     cap = mod.MAX_ROWS[(q.shape[1], k.shape[1], k.dtype)]
@@ -1255,7 +1255,9 @@ def _check_sparse_gqa_grouped(cell, monkeypatch) -> None:
     _assert_straddles(args)
     q, k = args["q"], args["k_cache"]
     rows = q.shape[0]
-    assert _sgg_op.serves(q, k, args["selected_tokens"], args["rows_per_request"])
+    # A cell below `MIN_GROUPS` groups is served for a caller that asks (`min_groups`).
+    floor = {"min_groups": spec["min_groups"]} if "min_groups" in spec else {}
+    assert _sgg_op.serves(q, k, args["selected_tokens"], args["rows_per_request"], **floor)
     out = _sgg_op(**args)
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
@@ -1268,6 +1270,34 @@ def _check_sparse_gqa_grouped(cell, monkeypatch) -> None:
     if spec.get("capture"):
         refill = lambda: _refill(args, seed + 1, lambda a: _sgg_selection(spec, seed + 8))  # noqa: E731
         _replay_in_a_graph(_sgg_op, args, refill, out)
+
+
+def test_sparse_gqa_grouped_plans_from_the_callers_floor(monkeypatch) -> None:
+    """A caller that routes from 2 groups (`min_groups=2`, the dep8 verify floor) and first
+    calls at 5 groups plans every launch from 2 groups up: a later 2-group call of the same
+    geometry compiles nothing, and both stay within the reference band."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
+        qsa_sparse_gqa_grouped_cute__decode as grouped,
+    )
+
+    cell = next(c for c in _sgg_op.CELLS if c.why.startswith("dep8 MTP-3 verify at 5 requests"))
+    spec, seed = cell.spec, sum(map(ord, cell.why))
+    args = _sgc_build({k: v for k, v in spec.items() if k != "holes"}, seed)
+    args["selected_tokens"].copy_(_sgg_selection(spec, seed + 5))
+    args["rows_per_request"] = rpr = spec["rows_per_request"]
+    monkeypatch.setattr(grouped, "_COMPILED", {})
+    monkeypatch.setattr(grouped, "_PLANNED", set())
+    out = _sgg_op(**args, min_groups=2)
+    torch.cuda.synchronize()
+    _gqa_compare(out, _sgg_op.reference(**args))
+    compiled = set(grouped._COMPILED)
+    sliced = ("q", "selected_tokens", "request_indices", "output_gate")
+    two = {n: (v[: 2 * rpr] if n in sliced else v) for n, v in args.items()}
+    assert _sgg_op.serves(two["q"], two["k_cache"], two["selected_tokens"], rpr, min_groups=2)
+    out = _sgg_op(**two, min_groups=2)
+    torch.cuda.synchronize()
+    assert set(grouped._COMPILED) == compiled, "the 2-group call compiled a plan"
+    _gqa_compare(out, _sgg_op.reference(**two))
 
 
 TKC_K, TKC_CR, TKC_TOKEN_TOPK = 512, 4, 2048
@@ -1320,7 +1350,9 @@ def _tkc_build(spec, seed):
 
 def _check_topk_expand_cluster(cell, monkeypatch) -> None:
     args = _tkc_build(cell.spec, seed=_seed(cell.why) % 2**31)
-    assert supports(args[0]), "a cell outside the target's routing to this entry"
+    # A cell past `MAX_ROWS` is served for a caller that asks (`max_rows`).
+    floor = {"max_rows": cell.spec["max_rows"]} if "max_rows" in cell.spec else {}
+    assert supports(args[0], **floor), "a cell outside the callers' routing to this entry"
     want_topk, want_sel = _tkc_op.reference(*args)
     sel = _tkc_op(*args)
     assert sel.dtype == torch.int32 and sel.shape == want_sel.shape

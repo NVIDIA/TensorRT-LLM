@@ -164,6 +164,13 @@ l0_gb300:
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
   # run post-merge (l0_gb300_multi_gpus).
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+  # qwen4_exp family, pre-merge: the Lamport MoE round trip against NCCL's ring, 4 ranks, both slot
+  # protocols and the dep8 target's pointer entry (`buffers_from_pointers` + `build_on`); the
+  # 8-rank cells need eight GPUs in one node and skip here.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_dep_lamport_round_trip.py
+  # qwen4_exp family, pre-merge: the tep4 fused MoE finalize all-reduce against its reference,
+  # 4 ranks, one rank held back before each graph replay.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_tep_finalize_allreduce.py
   # Qwen3.5 TP decode: KV-replica FP8 decode (TP2 / TP4), the MNNVL all-reduce + RMSNorm kernels and the LL TP
   # exchanges (sampling, RoPE gather, group merge) at group sizes 2 and 4.
   - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py

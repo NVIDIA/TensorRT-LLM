@@ -41,6 +41,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     modeling as target_modeling,
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import get_sm_version, is_flashinfer_gdn_decode_supported_arch
 from tensorrt_llm.executor.utils import RequestError, get_spawn_proxy_process_env
 from tensorrt_llm.inputs import VideoData
@@ -53,6 +54,7 @@ from tensorrt_llm.inputs.utils import (
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
+    MambaStateConfig,
     MoeConfig,
     MTPDecodingConfig,
     QSASparseAttentionConfig,
@@ -410,16 +412,97 @@ _TP4 = dict(
 )
 # Attention replicated, each rank serving its own requests; the routed experts by expert.
 _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+# The same over two nodes of four GPUs.
+_DEP8 = dict(
+    tensor_parallel_size=8,
+    moe_expert_parallel_size=8,
+    enable_attention_dp=True,
+    gpus_per_node=4,
+)
 
 # The quantized KV pools: NVFP4 at tp4 with the breakable prefill graph (routed at attention
 # TP only); FP8 at dep4 (MTP under attention DP, each rank drafting for its own requests); FP8
 # at tep4 over FlashInfer's ring replay (`TRTLLM_USE_GDN_FLASHINFER_REPLAY=force`, which fails
 # the build if the ring cannot run); NVFP4 at tep4 with chunked prefill and block reuse off, so
 # the engine leaves its paged-context attention off and the target takes it for the NVFP4 pool.
-# The attention-TP cases run 6 query heads a KV head on each rank.
+# The attention-TP cases run 6 query heads a KV head on each rank. FP8 at dep4 once more with the
+# MoE round trip on the Lamport transport (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport`, SM103 only),
+# once more with host-indexed slots and the router front (`lamport_step` and
+# `TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT=1`, class S: the bf16 trunk router at 48-112 gathered rows),
+# and FP8 at tep4 once more with each decode MoE block's finalize and all-reduce in one Lamport
+# launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only). FP8 at dep4 once more with both
+# output projections on the bf16 mid-rows GEMM (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in,
+# another K split; SM103 only), and once more with the two opt-in attention-DP row ranges: the
+# grouped sparse GQA from 2 requests a rank (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another
+# summation order than split-K) and the cluster top-k up to 256 rows
+# (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`). Then the whole attention-DP stack the AgentX
+# front points run, every opt-in form together on top of the default ones (host-indexed Lamport
+# slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
+# widest; SM103 only), at dep4 and at dep8 (two nodes of one rack).
+_DP_FRONT_STACK = dict(lamport="lamport_step", router_front=True, out_proj_bf16="all", dp_rows=True)
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(lamport="lamport"),
+        id="dep4_fp8_kv_lamport",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(lamport="lamport_step", router_front=True),
+        id="dep4_fp8_kv_lamport_step_router_front",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(out_proj_bf16="all"),
+        id="dep4_fp8_kv_out_proj_bf16",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103,
+            reason="the bf16 mid-rows output projections are measured on SM103",
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(dp_rows=True),
+        id="dep4_fp8_kv_dp_rows",
+        marks=pytest.mark.skipif(
+            get_sm_version() not in (103, 107),
+            reason="the grouped sparse GQA serves an e4m3 pool on SM103/SM107",
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        _DP_FRONT_STACK,
+        id="dep4_fp8_kv_front_stack",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
+    pytest.param(
+        _DEP8,
+        "fp8",
+        _DP_FRONT_STACK,
+        id="dep8_fp8_kv_front_stack",
+        marks=[
+            skip_not_in_a_world_across_nodes,
+            pytest.mark.skip_less_mpi_world_size(8),
+            pytest.mark.skipif(
+                get_sm_version() != 103, reason="the Lamport MoE round trip runs on SM103"
+            ),
+        ],
+    ),
     pytest.param(
         _TEP4,
         "fp8",
@@ -428,11 +511,23 @@ _QUANTIZED_KV = [
         marks=skip_without_flashinfer_ring,
     ),
     pytest.param(_TEP4, "nvfp4", dict(paged_context=False), id="tep4_nvfp4_kv_no_reuse"),
+    pytest.param(
+        _TEP4,
+        "fp8",
+        dict(finar="early"),
+        id="tep4_fp8_kv_finar",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103,
+            reason="the fused MoE finalize all-reduce is certified on SM103",
+        ),
+    ),
 ]
 
 
 # tp2 (attention TP2, every expert split by intermediate), dep2 (attention DP, experts EP2) and
-# dep8 (attention DP over two nodes of four GPUs).
+# dep8 (attention DP over two nodes of four GPUs), the last once more with the MoE round trip on
+# the Lamport transport with host-indexed slots (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport_step`,
+# SM103 only; MNNVL peer memory, so both nodes in one rack). Each case: (layout, extra env).
 _MTP3_LAYOUTS = [
     pytest.param(
         dict(
@@ -441,23 +536,33 @@ _MTP3_LAYOUTS = [
             moe_expert_parallel_size=1,
             enable_attention_dp=False,
         ),
+        {},
         id="tp2",
         marks=pytest.mark.skip_less_device(2),
     ),
     pytest.param(
         dict(tensor_parallel_size=2, moe_expert_parallel_size=2, enable_attention_dp=True),
+        {},
         id="dep2",
         marks=pytest.mark.skip_less_device(2),
     ),
     pytest.param(
-        dict(
-            tensor_parallel_size=8,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=True,
-            gpus_per_node=4,
-        ),
+        _DEP8,
+        {},
         id="dep8",
         marks=[skip_not_in_a_world_across_nodes, pytest.mark.skip_less_mpi_world_size(8)],
+    ),
+    pytest.param(
+        _DEP8,
+        {"TRTLLM_QWEN4_EXP_DP_MOE_COMM": "lamport_step"},
+        id="dep8_lamport_step",
+        marks=[
+            skip_not_in_a_world_across_nodes,
+            pytest.mark.skip_less_mpi_world_size(8),
+            pytest.mark.skipif(
+                get_sm_version() != 103, reason="the Lamport MoE round trip runs on SM103"
+            ),
+        ],
     ),
 ]
 
@@ -563,6 +668,16 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         kv_cache_config=TP1_KV_CACHE,
         cuda_graph_config=CudaGraphConfig(),
         moe_config=MOE,
+    )
+
+    # The same engine with block reuse off: no snapshots, so no in-forward split.
+    TP1_ENGINE_NO_REUSE = dict(
+        TP1_ENGINE,
+        kv_cache_config=KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float32",
+        ),
     )
 
     # These buckets cover the prompts of `test_tp1_breakable_prefill_matches_eager`.
@@ -776,11 +891,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         assert_acceptance_length(self.ACCEPTANCE_KEY_LONG_CONTEXT, acceptance_length)
 
     @skip_unserved_gpu
-    @pytest.mark.parametrize("parallel", _MTP3_LAYOUTS)
-    def test_mtp3_gsm8k(self, mocker, request, parallel):
+    @pytest.mark.parametrize("parallel, env", _MTP3_LAYOUTS)
+    def test_mtp3_gsm8k(self, mocker, request, parallel, env):
         """gsm8k with three drafts over bf16 KV: the tep4 case's engine at tp2, dep2 and dep8."""
         with (
-            scoped_env_overrides(_VALIDATE) as rank_env,
+            scoped_env_overrides({**_VALIDATE, **env}) as rank_env,
             LLM(
                 self.MODEL_PATH,
                 speculative_config=self.MTP3,
@@ -821,6 +936,17 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         env = dict(_VALIDATE)
         if variant.get("flashinfer_ring"):
             env["TRTLLM_USE_GDN_FLASHINFER_REPLAY"] = "force"
+        if variant.get("lamport"):
+            env["TRTLLM_QWEN4_EXP_DP_MOE_COMM"] = variant["lamport"]
+        if variant.get("router_front"):
+            env["TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT"] = "1"
+        if variant.get("finar"):
+            env["TRTLLM_QWEN4_EXP_TEP_FINAR"] = variant["finar"]
+        if variant.get("out_proj_bf16"):
+            env["TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"] = variant["out_proj_bf16"]
+        if variant.get("dp_rows"):
+            env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
+            env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
         with (
             scoped_env_overrides(env) as rank_env,
@@ -1163,6 +1289,164 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             self.TP1_ACCEPTANCE_KEY_MTP7_LONG_CONTEXT,
             "tp1 mtp7 nvfp4 kv bf16 state long context",
         )
+
+    @skip_unserved_gpu
+    def test_tp1_inforward_snapshot_turn2_restore(self, monkeypatch):
+        """A second turn restored from an in-forward Mamba snapshot answers as a cold prefill.
+
+        Turn one prefills a 3000-token pass key document in one chunk that reaches the prompt
+        end L, with a recurrent-state snapshot two tokens before it: the GDN and PLE layers split
+        their state at P = L - 2 inside that forward (`PrefillTarget._gdn_inforward`,
+        `_ple_block`), and the manager commits the state at P and restores the one at L after
+        it. Turn two is turn one's tokens, its answer and a new question: its prefix comes from
+        that snapshot (`cached_tokens`), so a state left wrong at P or at L shows in its answer.
+        It must name the pass key and agree on its first four tokens with the same prompt
+        prefilled cold on an engine without block reuse (another chunking moves the logits as a
+        different batch shape does). The split must have run on the first engine only.
+        """
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        splits = []
+        split = target_modeling.flashinfer_chunk_gdn_inforward_split
+
+        def counting_split(*args, **kwargs):
+            splits.append(1)
+            return split(*args, **kwargs)
+
+        monkeypatch.setattr(target_modeling, "flashinfer_chunk_gdn_inforward_split", counting_split)
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        prompt, key = _passkey_prompts(tokenizer, (3000,))[0]
+        turn1 = tokenizer.encode(prompt)
+        greedy = SamplingParams(max_tokens=48, temperature=0)
+        end_of_turn = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        follow_up = tokenizer.encode(
+            "<|im_end|>\n<|im_start|>user\nRepeat the secret pass key once more, digits only."
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        snapshot = KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=True,
+            mamba_ssm_cache_dtype="float32",
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=0, additional_snapshot_offsets_from_end=[2]
+            ),
+        )
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **dict(self.TP1_ENGINE, kv_cache_config=snapshot),
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            # The executor's warmup runs a split of its own (`_warm_inforward_split`): count
+            # turn one's only.
+            splits.clear()
+            first = llm.generate({"prompt_token_ids": turn1}, greedy, use_tqdm=False)
+            assert splits, "turn one took no in-forward snapshot split"
+            answer = list(first.outputs[0].token_ids)
+            if answer and answer[-1] == end_of_turn:
+                answer.pop()
+            turn2 = turn1 + answer + follow_up
+            second = llm.generate({"prompt_token_ids": turn2}, greedy, use_tqdm=False)
+        assert 0 < second.cached_tokens <= len(turn1) - 2, (second.cached_tokens, len(turn1))
+
+        splits.clear()
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **self.TP1_ENGINE_NO_REUSE,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            cold = llm.generate({"prompt_token_ids": turn2}, greedy, use_tqdm=False)
+        assert not splits, "an engine without block reuse took an in-forward snapshot split"
+
+        assert key in first.outputs[0].text, first.outputs[0].text
+        assert key in second.outputs[0].text, second.outputs[0].text
+        assert key in cold.outputs[0].text, cold.outputs[0].text
+        restored, fresh = second.outputs[0].token_ids, cold.outputs[0].token_ids
+        assert restored[:4] == fresh[:4], (restored, fresh)
+
+    @skip_unserved_gpu
+    @pytest.mark.parametrize("offsets", [[0, 128], [128]], ids=["end_and_128", "128"])
+    def test_tp1_long_snapshot_tail_keeps_two_iterations(self, monkeypatch, offsets):
+        """A snapshot tail past the in-forward split's keeps the two-iteration path.
+
+        The split runs a tail of at most `inforward_snapshot_max_tail` tokens (FlashInfer's
+        in-place path); a longer one no longer fails the bind. With `[0, 128]` the final
+        snapshot is at the prompt end, and with `[128]` the tail is twice the split's: neither
+        prompt is split in its forward. Turn one's prefill takes two context steps, one that
+        ends at the snapshot L - 128 and one over the 128-token tail. A second turn restores
+        its prefix from the last snapshot the first committed (L with `[0, 128]`, L - 128 with
+        `[128]`) and names the pass key.
+        """
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        splits = []
+        split = target_modeling.flashinfer_chunk_gdn_inforward_split
+
+        def counting_split(*args, **kwargs):
+            splits.append(1)
+            return split(*args, **kwargs)
+
+        monkeypatch.setattr(target_modeling, "flashinfer_chunk_gdn_inforward_split", counting_split)
+        # Each context step of every request, as (prompt length, first position, end).
+        steps = []
+        move = LlmRequest.move_to_next_context_chunk
+
+        def recording_move(request):
+            begin = request.context_current_position
+            steps.append((request.prompt_len, begin, begin + request.context_chunk_size))
+            return move(request)
+
+        monkeypatch.setattr(LlmRequest, "move_to_next_context_chunk", recording_move)
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        prompt, key = _passkey_prompts(tokenizer, (3000,))[0]
+        turn1 = tokenizer.encode(prompt)
+        greedy = SamplingParams(max_tokens=48, temperature=0)
+        end_of_turn = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        follow_up = tokenizer.encode(
+            "<|im_end|>\n<|im_start|>user\nRepeat the secret pass key once more, digits only."
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        snapshot = KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=True,
+            mamba_ssm_cache_dtype="float32",
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=0, additional_snapshot_offsets_from_end=offsets
+            ),
+        )
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **dict(self.TP1_ENGINE, kv_cache_config=snapshot),
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            # The executor's warmup runs requests of its own: record turn one's steps only.
+            splits.clear()
+            steps.clear()
+            first = llm.generate({"prompt_token_ids": turn1}, greedy, use_tqdm=False)
+            assert not splits, "a tail past the split's took the in-forward split"
+            n = len(turn1)
+            turn1_steps = [(begin, end) for length, begin, end in steps if length == n]
+            assert turn1_steps == [(0, n - 128), (n - 128, n)], (turn1_steps, n)
+            answer = list(first.outputs[0].token_ids)
+            if answer and answer[-1] == end_of_turn:
+                answer.pop()
+            second = llm.generate(
+                {"prompt_token_ids": turn1 + answer + follow_up}, greedy, use_tqdm=False
+            )
+        # The last snapshot turn one committed: the prompt end with `[0, 128]`, else L - 128.
+        restored = n if 0 in offsets else n - 128
+        assert second.cached_tokens == restored, (second.cached_tokens, restored, n)
+        assert key in first.outputs[0].text, first.outputs[0].text
+        assert key in second.outputs[0].text, second.outputs[0].text
 
     # The target's AgentX deployment environment at tp1 on both engines: PDL, eight K/V
     # transfer threads and every opt-in projection of the target.

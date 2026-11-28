@@ -35,9 +35,13 @@ The forward is cut per rank; what the layout settles is settled once, at constru
   same way. Under attention DP each rank holds its own rows: they are padded to the group's
   largest row count, gathered (`comm/allgather`), routed and run through the window, and
   reduce-scattered back (`comm/reducescatter`), each row's window partials summed once
-  (`_expert_sum_op`). The router and the bf16 shared expert are replicated and run on this
-  rank's rows, so the block output `routed + sigmoid(gate) * shared` is formed by the next
-  hyper-connection site on the reduced routed rows.
+  (`_expert_sum_op`); at dep4 and dep8 `DP_MOE_COMM_ENV=lamport|lamport_step` runs the pair as
+  one Lamport launch each (`ops/moe/dep_lamport_round_trip`). A captured decode step routes the
+  gathered rows, builds the window's pre-routed tables and quantizes them in one launch and enters the runner pre-routed
+  (`DP_ROUTE_FRONT_ENV`, `ops/moe/moe_route_front__decode`). The router and the bf16 shared
+  expert are replicated and run on this rank's rows, so the block output
+  `routed + sigmoid(gate) * shared` is formed by the next hyper-connection site on the reduced
+  routed rows.
 * **Hyper-connections, PLE, the embedding** run replicated on every rank's rows;
   `lm_head` is the shell's (vocab-parallel under attention TP, gathered by the shell's head;
   whole under attention DP, over this rank's own rows).
@@ -66,11 +70,21 @@ rows (`_sparse_gqa_nvfp4_context`); and the opt-in FP8 / NVFP4 copies of the den
 projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP4_ENV`,
 `_TARGET_HEAD_NVFP4_ENV`, `_MTP_HEAD_NVFP4_ENV`, `_MTP_MOE_NVFP4_ENV`, `_MTP_DENSE_FP8_ENV`).
 
+**tep4.** A rank of attention TP4 with 128-expert windows takes some of those forms at its shard
+for a captured generation-only step (`tep_fast`, `TEP_FAST_DECODE_ENV`, on by default): the
+decode hyper-connection sites' rows pairs (`hc_decode_pairs`), the CuTe split-K sparse GQA over
+its e4m3 KV head, and the MoE route front over its own rows. With `TEP_FINAR_ENV` (opt-in) such a
+MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`).
+
 **QSA sparse attention.** The index plane is maintained on every step so a request can
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
 core (index scores, block top-k and expansion, sparse GQA) replaces the dense op, and the
 main K/V append becomes this layer's own call. The raw index key is stored before anything
-normalizes it: the compression applies the norm and the rotation itself.
+normalizes it: the compression applies the norm and the rotation itself. Past one rank a
+generation step's sparse core runs on the family's decode ops, which the FP8 target runs too,
+at its row table: request-grouped index scores, the cluster top-k, and the CuTe sparse GQA over
+a bf16 or e4m3 pool with the output gate in its store (`_decode_index_scores`, `_selection`,
+`_sparse_gqa_decode`).
 
 **KV storage.** The paged K/V pool holds the checkpoint's bf16, fp8-e4m3 under
 `kv_cache_config.dtype: fp8` (`QM_FP8_KV_CACHE`) or NVFP4 under `nvfp4` (`QM_NVFP4_KV_CACHE`,
@@ -114,6 +128,10 @@ runs every generation request's `max_draft_len + 1` verify rows:
   (the trunk step's tokens on the first, one row a request on the rest, attention-DP dummy
   requests included) without writing them into the metadata; `_dp_pad_rows` pads this rank's
   rows by them, so every rank issues the same collectives at every draft step.
+* A generation-only draft-extend step past one rank runs the attention core and the tail on
+  each request's continuing row only (`_draft_continue`); every row still writes its K/V and
+  index key. Under attention DP it does so only when the group's counts show every rank
+  generation-only, and its MoE round trip then pads by the group's request counts.
 * A verify step's Gated-DeltaNet rows take the multi-token conv with per-step window snapshots
   and the stock Triton cached replay over the bf16 pool, which commits a full history in the
   kernel below `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests and leaves it to the
@@ -182,11 +200,21 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmo
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (
     silu_and_mul_rows,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.draft_continue_rows__decode import (  # noqa: E501
+    draft_continue_select,
+    draft_rows_gather,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (
     qsa_canonical_selection,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
+    index_scores_groups as index_scores_groups_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
+    serves as _index_groups_cute_serves,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_mtp_reuse_topk import (
     qsa_mtp_reuse_topk,
@@ -237,8 +265,35 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback
     qsa_rollback_gather,
     qsa_rollback_restore,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    SMALL_MIN_GROUPS as _GROUPED_SMALL_MIN_GROUPS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_grouped_cute,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_rowtile import (
     qsa_sparse_gqa_rowtile as one_rank_sparse_gqa_rowtile,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    HEAD_DIM as _SPLITK_HEAD_DIM,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    TILE as _SPLITK_TILE,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    MAX_ROWS as _TOPK_CLUSTER_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    PAIR_MAX_ROWS as _TOPK_CLUSTER_PAIR_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    qsa_topk_expand_cluster,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    supports as _topk_expand_cluster_supports,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
@@ -268,6 +323,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.verify_step_
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.verify_step_setup import (
     verify_step_setup,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.embed_rows__decode import (
+    embed_rows,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.bf16_gemv_pdl import (
     MAX_ROWS as _GEMV_MAX_ROWS,
 )
@@ -287,9 +345,14 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_per_tensor_mm
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
+    MAX_ROWS as _MID_ROWS_MAX,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MidWeight,
+    mid_mm_raw,
     mid_rows_mm_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import Plan as MidPlan
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     precompile as mid_rows_precompile,
 )
@@ -336,6 +399,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_lowran
     qwen4_exp_hc_lowrank_act,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
+    precompile as hc_up_precompile,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
     qwen4_exp_hc_up_gate_mean,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (
@@ -345,17 +411,43 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gat
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
+    tep_finalize_allreduce as _TEP_FINAR,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (  # noqa: E501
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (
     cute_dsl_nvfp4_grouped_gemm,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    LamportSteps,
+    dep_lamport_round_trip,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    buffers_from_pointers as dep_lamport_buffers_from_pointers,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    build as dep_lamport_build,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    build_on as dep_lamport_build_on,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    workspace_bytes as dep_lamport_workspace_bytes,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_permuted import (
     fp4_block_scale_moe_renorm_permuted,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
+    DECODE_TACTICS as _MOE_DECODE_TACTICS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
+    ROUTING_RENORMALIZE,
     fp4_block_scale_moe_renorm_routed,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
+    _runner as _moe_runner,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_moe_renorm_cute_dsl import (
     fp4_moe_renorm_cute_dsl,
@@ -366,12 +458,41 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_mo
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fused_sigmoid_gate_mul_add import (
     fused_sigmoid_gate_mul_add,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    MAX_ROWS as _ROUTE_FRONT_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    NUM_EXPERTS as _ROUTE_FRONT_EXPERTS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    TOP_K as _ROUTE_FRONT_TOP_K,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    check_tables as _route_front_check_tables,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    compile_front as _route_front_compile,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    moe_route_front,
+    table_sizes,
+    table_views,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_sort import moe_sort
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_unpermute_inplace import (
     moe_unpermute_inplace,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.mtp_moe_combine_inject__decode import (  # noqa: E501
+    mtp_moe_combine_inject,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
     renorm_moe_routing_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allreduce import (
+    build as tep_finar_build,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allreduce import (
+    tep_finalize_allreduce,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (
     flashinfer_gemma_rmsnorm,
@@ -403,6 +524,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_g
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (
     flashinfer_chunk_gated_delta_rule,
+    flashinfer_chunk_gdn_inforward_split,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update,
@@ -426,11 +548,17 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     FLASHINFER_REPLAY_RING_SIZE,
     flashinfer_cached_replay_update,
 )
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
+from tensorrt_llm._torch.speculative.vocab_parallel import vocab_parallel_argmax_enabled
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    is_gdn_replay_enabled,
+    last_positive_power_of_2,
+)
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -444,7 +572,12 @@ from .ops.attention.qsa_fp8_pages_to_bf16__prefill import qsa_fp8_pages_to_bf16
 from .ops.attention.qsa_sparse_gqa_rowtile__prefill import qsa_sparse_gqa_rowtile
 from .ops.attention.qwen4_exp_attn_decode_prologue__decode import qwen4_exp_attn_decode_prologue
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import MAX_ROWS as _HC_TC_FIRST_ROWS
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import ROWSN_ROWS as _HC_ROWSN_ROWS
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import TILE64_MAX_ROWS as _HC_TILE64_MAX_ROWS
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import precompile as hc_tc_first_precompile
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import (
+    precompile_rowsn as hc_tc_first_precompile_rowsn,
+)
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
@@ -471,6 +604,57 @@ _MODULE_ONLY_STRATEGIES = frozenset({int(AllReduceStrategy.MNNVL), int(AllReduce
 #: Overrides the stock model's attention-DP MoE round trip; `check_deployment` declines any value
 #: but `ALLGATHER`, the round trip this target runs.
 MOE_COMM_METHOD_ENV = "TRTLLM_FORCE_COMM_METHOD"
+#: The transport of the attention-DP MoE round trip's two collectives: `nccl` (the default),
+#: `lamport` or `lamport_step`, one Lamport launch each (`ops/moe/dep_lamport_round_trip`) for
+#: every round trip of up to `dep_lamport_round_trip.MAX_ROWS` rows a rank (more keep NCCL): the
+#: same rows in the same rank order, a -0.0 lane traveling as +0.0, the partials summed in a fixed
+#: chain per owning rank (NCCL's ring order within a node; at dep8 across two nodes NCCL orders its
+#: sum by its own topology, so there the sum is a same-precision reorder of NCCL's).
+#: - `lamport`: the slot of a launch comes from a device counter the kernel reads and advances.
+#: - `lamport_step`: from the host, `(base + the launch's index in the step) mod 3`; the shell's
+#:   whole forward -- trunk, heads and every draft pass -- is one region (`LamportSteps`), at whose
+#:   end one 1-thread launch moves the base. Each reader re-arms the vector it took and every
+#:   receive loop issues its first probe of every peer before it waits on any. The same bytes in
+#:   the same slots as `lamport`: bitwise the same results, fewer device-side atomics and loads.
+#: A CTA polls for its peers' CTAs, so a launch needs all of its CTAs resident at once. Certified
+#: on a dep4 worker (one node, torch symmetric memory) on SM103; written for dep8 over the two
+#: nodes of one rack (`distributed.peer_buffers.PeerBuffers`: MNNVL memory), which a
+#: `--segment`-style allocation keeps in one NVLink domain. `check_deployment` and the build hold
+#: it to those layouts. Read once, when the target is built.
+DP_MOE_COMM_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_COMM"
+_DP_MOE_COMMS = ("nccl", "lamport", "lamport_step")
+#: The layouts the Lamport transport serves, by attention-DP group size.
+_LAMPORT_LAYOUTS = {4: "dep4", 8: "dep8"}
+#: Off by default (class S). At a dep4 / dep8 rank on the Lamport transport
+#: (`DP_MOE_COMM_ENV`), two launches of a captured decode step's trunk MoE block change, each at
+#: the gathered row counts of the CUDA-graph batch sizes inside its own range:
+#: - the round trip's Lamport gather releases its PDL dependents at its start
+#:   (`_DP_ROUTER_FRONT_RELEASE_ROWS`); the rows, slots and bytes are the plain gather's. The
+#:   gather is no PDL launch itself, so everything before it has completed when a dependent starts.
+#: - the trunk router runs on `mid_rows_mm`'s bf16 kernel (`_DP_ROUTER_FRONT_ROWS` gathered rows):
+#:   a PDL launch that streams its [512, 2560] weight while the gather publishes and polls, and
+#:   reads the gathered rows after its own `griddepcontrol.wait`; cuBLAS elsewhere. Its logits
+#:   differ from cuBLAS's by one bf16 ulp on 0.02-0.08% of the entries (the nearer one to the
+#:   exact product), which can move a near-tie of the top-10. Every rank of the group runs the
+#:   kernel the gathered row count picks, so the ranks agree on every row's experts.
+#: The build checks every router row count against the fp32 product (one bf16 ulp) on every rank
+#: and engages on every rank or none. Read once, when the target is built; set at another
+#: layout or without the Lamport transport it warns and does nothing.
+DP_ROUTER_FRONT_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT"
+#: Gathered rows the bf16 router serves (3..7 requests of four rows at dep4; the kernel loses to
+#: cuBLAS from 8 a rank there), and, by group size, the gathered rows whose gather releases (dep4
+#: 1..24 requests a rank; dep8 1..24, where 32 and more a rank measured a loss).
+_DP_ROUTER_FRONT_ROWS = (33, 112)  # capacity: fixed: dispatch thresholds
+_DP_ROUTER_FRONT_RELEASE_ROWS = {4: (16, 384), 8: (32, 768)}  # capacity: fixed: thresholds
+
+
+def _dp_moe_comm() -> str:
+    """`DP_MOE_COMM_ENV`, lower-cased, `nccl` when unset; ValueError on another value."""
+    comm = os.environ.get(DP_MOE_COMM_ENV, "nccl").strip().lower() or "nccl"
+    if comm not in _DP_MOE_COMMS:
+        raise ValueError(f"{DP_MOE_COMM_ENV}={comm!r}: one of {', '.join(_DP_MOE_COMMS)}")
+    return comm
+
 
 # Recurrent-state cache dtypes the target serves, checked at bind: at one rank the checkpoint's
 # fp32 too.
@@ -654,6 +838,46 @@ _HC_RSTD_MIN_ROWS = 3072  # capacity: fixed: a dispatch threshold, not a buffer 
 #: Decode rows up to which a bf16 pool's gated sparse GQA runs the one-launch decode kernel
 #: (`qsa_paged_sparse_gqa_decode`) at one rank, and the index scores prefetch their block table.
 _SPARSE_DECODE_MAX_ROWS = 64  # capacity: fixed: a dispatch threshold
+#: The other layouts' sparse generation steps (trunk verify and draft rows) score, select and
+#: attend on the family's decode ops at the FP8 target's row table (`_decode_index_scores`,
+#: `_selection`, `_sparse_gqa_decode`):
+#: - Whether their index scoring launches with PDL (its kernels wait before their first read);
+#:   off with TRTLLM_ENABLE_PDL=0.
+_INDEX_SCORES_PDL = get_env_enable_pdl()
+#: - Rows from which a step with several rows a request scores over request groups
+#:   (`qsa_paged_index_scores`' `rows_per_request`: one key gather serves a request's rows,
+#:   bitwise its row-wise kernel); smaller steps keep the entry's own choice.
+_INDEX_GROUP_MIN_ROWS = 17  # capacity: fixed: a dispatch threshold, not a buffer size
+#: - Request groups from which grouped scoring takes the CuTe kernel
+#:   (`qsa_index_scores_groups_cute__decode`, 2 or 3 rows a request). It sums in another order
+#:   (~7e-8 relative), so a row's top-k can differ only at a near-tie.
+_INDEX_SCORES_CUTE_MIN_GROUPS = 8  # capacity: fixed: a dispatch threshold
+#: - Requests from which rows over an e4m3 pool take `qsa_sparse_gqa_grouped_cute` (each selected
+#:   K/V token loaded and widened once for a request's rows, over the union of their selections)
+#:   instead of the per-row `qsa_sparse_gqa_splitk_cute`. Both run within the decode op's band of
+#:   the fp32 reference, not bitwise `qsa_paged_sparse_gqa`, which keeps every call they decline.
+_GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
+#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=<n>` (n in
+#: `_GROUPED_SMALL_MIN_GROUPS`..`_GROUPED_DECODE_MIN_REQUESTS`; unset is the row above) takes the
+#: request-grouped kernel from n requests of `p` rows a rank instead of 32, the split-K kernel
+#: below n. Class S against split-K (another summation order; both within the decode op's band).
+#: Below the op's own `MIN_GROUPS` (8) the op plans those launches on its first such call. What
+#: was measured is a grouped verify kernel of the same lineage against the per-row kernel with a
+#: separate merge and gate launch (not split-K): grouped from 8 requests a rank, and from 2 with
+#: -0.12..-0.24 ms a step at 2-7 requests a rank (dep4, GB300); every dep8 point of the AgentX
+#: front ran caps 3-28 a rank, where this table runs split-K. Read once, when the core is built;
+#: set at a layout without attention DP it warns and does nothing.
+DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
+#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
+#: `_TOPK_CLUSTER_MAX_ROWS` + 1..`_TOPK_CLUSTER_PAIR_MAX_ROWS`; unset is the op's own 37) lets a
+#: generation step's selection (`_selection`, not a context part) take the cluster top-k up to
+#: n rows, in clusters of two CTAs past 37 rows, instead of the one-CTA-a-row kernel. The same
+#: selection (exact top-k, the tie rule), so not a numerics question; opt-in because only our own
+#: cluster kernel was measured at these rows (dep4: 2 CTAs a row at 39-76 rows, with the verify
+#: head shard x 277.0 -> 289.0 at cap 12; trunk 153-256 and draft 39-64 rows -0.19..-0.28 ms a
+#: step at graphs 40-52, bitwise), not this one. Read once, when the core is built; set at a
+#: layout without attention DP it warns and does nothing.
+DP_TOPK_CLUSTER_ROWS_ENV = "TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"
 _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 # The compressed index keys rotate at coordinate 0 alone (no mRoPE section), as the index
 # query does.
@@ -672,6 +896,11 @@ _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer 
 # Over an fp8 pool the launch reads its requests' pages widened into a bf16 scratch; a launch
 # whose scratch would pass this many bytes stays on the per-row kernel.
 _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch allocation
+# A step past `_ROWTILE_MIN_ROWS` context rows whose fp8 scratch is cut into groups
+# (`_fp8_context_groups`) runs a group of at least this many rows on the row-tile pass. GB300,
+# 24 q / 2 kv heads, 200k-token histories: the widen and the pass take 0.55-0.64 ms a group
+# whatever its rows, the per-row kernel about 0.8 us a row (0.49 ms at 512 rows, 0.69 ms at 768).
+_FP8_GROUP_ROWTILE_MIN_ROWS = 768  # capacity: fixed: a dispatch threshold, not a buffer size
 # A step with more context rows than this over an NVFP4 pool attends them on the row-tile pass
 # over a bf16 scratch of their requests' pages (`_sparse_gqa_nvfp4_context`): at one rank 16384
 # context rows 1.36 ms a layer there against 77-948 ms for the NVFP4 per-row kernel.
@@ -894,10 +1123,593 @@ def _check_switches(one_rank: bool) -> None:
 #: 656 vs 882.
 _CUTE_DSL_MOE_MIN_ROWS = 4096  # capacity: fixed: a dispatch threshold, not a buffer size
 _CUTE_DSL_MOE_MAX_ROWS = 16384  # capacity: fixed: the op's certified rows
+#: At one rank without that copy, a context-step launch of more than `_MOE_MAX_ROWS` rows and at
+#: most this many is one trtllm-gen runner call (the routed op's certified rows over the whole
+#: layer): the runner streams the layer's experts once instead of once a chunk. GB300, 16384
+#: rows: 1356 -> 1059 us a layer, an engine step's GPU forward 225.4 -> 212.5 ms. A CTX whose
+#: `max_num_tokens` is 24576 steps that many rows in one launch too (every row bitwise the
+#: chunks at 20480 and 24576 rows); with that chunk size its saturated context loop took 5-7%
+#: more tokens a second than at 16384.
+_MOE_ONE_LAUNCH_MAX_ROWS = 24576  # capacity: fixed: the routed op's certified rows
 # Whether one rank keeps that second copy (about 1.3 GiB a layer). No engine arg owns it, hence
 # an env var read at construction (`_switch`, default on); off drops the copy and every launch
 # runs on trtllm-gen.
 _MOE_PREFILL_COPY_ENV = "TRTLLM_MODELING_V2_MOE_PREFILL_COPY"
+#: Switch, on by default: a captured generation-only step at an attention-DP rank on SM103
+#: (trtllm-gen trunk MoE, a 128-expert window of the 512 experts at dep4, a 64-expert one at dep8,
+#: `_ROUTE_FRONT_WINDOWS`) runs each trunk MoE block's
+#: routing, the window's pre-routed tables and the NVFP4 quantization of the gathered rows in
+#: one launch (`ops/moe/moe_route_front__decode`) and enters the runner pre-routed at the tactic
+#: the tables were built for (`_ROUTE_FRONT_TACTICS`): it replaces `fp4_quantize` and the
+#: runner's own routing launches. The same bits (the build checks every layer once, `_RouteFront`).
+#: `0` keeps today's path. Read once, when the target is built.
+DP_ROUTE_FRONT_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FRONT"
+#: Gathered rows a route front serves: from 3 requests of 4 rows at dep4 to the kernel's last.
+_ROUTE_FRONT_MIN_ROWS = 48  # capacity: fixed: a dispatch threshold
+#: The expert window the route front and `_ROUTE_FRONT_TACTICS` are certified for (dep4, tep4).
+_ROUTE_FRONT_WINDOW = 128  # capacity: fixed: the certified window, not a buffer size
+#: The window an attention-DP group of this size serves the route front at: dep4's 128 experts
+#: (`_ROUTE_FRONT_TACTICS`) and dep8's 64 (`_ROUTE_FRONT_TACTICS_W64`). dep2's 256 keeps the
+#: runner's routing.
+_ROUTE_FRONT_WINDOWS = {4: _ROUTE_FRONT_WINDOW, 8: 64}  # capacity: fixed: certified windows
+#: `(gathered rows below, (tileN, FC1 x FC2 config))`: the trtllm-gen tactic pinned per row
+#: count, the tile the tables are built for. A 128-expert window under real routing is hit by
+#: 45-100 experts with a few pairs each, so the smaller tiles cut an expert into more tiles than
+#: it needs past 96 rows (GB300 dep4, every listed config bitwise one another). A tactic the
+#: runner does not list for the shape falls back to `_ROUTE_FRONT_TACTICS_BASE`'s.
+_ROUTE_FRONT_TACTICS = ((96, (8, 53)), (192, (16, 32)), (704, (32, 32)), (1025, (64, 4)))
+_ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
+#: The same for dep8's 64-expert window (8 ranks of 3..32 requests of four rows). The runner sizes
+#: its configs for "every pick of a row lands in this window" (a dep8 window gets 1.25 of a row's
+#: 10 picks), so it lists tile 32 only at 256 rows, tile 64 and up at 512-768 and tile 128 and up
+#: from 1024; the smaller tiles below run fewer, fuller tiles. GB300, 8 ranks over two nodes, each
+#: on its own window under recorded routing: [32, 32] 40.2 against the listed [64, 4] 41.8 us a
+#: layer at 512 rows, [64, 5] 50.6 against [128, 4] 54.6 at 1024; [32, 32] up to 895 rows took
+#: -0.10 / -0.05 ms a step at 20 / 24 requests a rank against [64, 4] from 640 rows. A tactic the
+#: runner does not list for the row count is pinned only once its window output is bitwise a
+#: listed tactic's (`_route_front_check` against `_route_front_w64_tactic`'s listed reference);
+#: a row count whose check fails keeps the runner's routing.
+_ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (1025, (64, 5)))
+#: Switch, on by default: a tep4 rank (attention TP over four ranks without attention DP, the
+#: routed experts as 128-expert windows) runs a captured generation-only step on the forms the
+#: one-rank target runs, at its shard:
+#: - every trunk hyper-connection site of up to `_HC_DECODE_ROWS_MAX` rows on the one-rank GEMV
+#:   or tcgen05 rows pair (`hc_decode_pairs`). The sites are replicated work on the all-reduced
+#:   rows, so the four ranks still compute the same bits; `hc_out` is bitwise, the mixer output
+#:   the pair's rounding of the same sums (1-2 bf16 ulp from the three-launch site's).
+#: - the gated sparse GQA of the rank's 6 q heads on its one e4m3 KV head, up to
+#:   `_TEP_SPLITK_MAX_ROWS` rows, on `qsa_sparse_gqa_splitk_cute` (the gate in its merge) in
+#:   place of the per-row Triton kernel and the gate launch: exactly widened K/V, q and P in f16,
+#:   fp32 accumulation, so the output moves by an ulp on some elements.
+#: - each trunk MoE block on the route front (`_RouteFront`) up to `_TEP_ROUTE_FRONT_MAX_ROWS`
+#:   rows, the runner entered pre-routed over the window on the site's NVFP4 codes. Routing and
+#:   codes are bitwise (build-checked); the runner runs `DECODE_TACTICS`' tactic where the stock
+#:   window call runs the AutoTuner's, so the block is bitwise today's as far as the trtllm-gen
+#:   tactics agree (measured bitwise one another on the whole layer, not on the window).
+#: The first two are same-precision reorders: a draft or target token can move at a near-tie.
+#: `0` keeps today's forms. Read once, when the target is built; set to 1 at another layout it
+#: warns and does nothing.
+TEP_FAST_DECODE_ENV = "TRTLLM_QWEN4_EXP_TEP_FAST_DECODE"
+#: The group the fast forms are written and measured for: tep4 (6 q heads on 1 KV head a rank).
+_TEP_RANKS = 4  # capacity: fixed: the certified layout
+#: Rows per (q heads, KV heads, pool dtype) up to which a tep4 rank sends a gated decode GQA to
+#: `qsa_sparse_gqa_splitk_cute` beyond the op's own table (`serves`, which the FP8 target routes
+#: by): 1-4 requests of four verify rows over the e4m3 pool.
+_TEP_SPLITK_MAX_ROWS = {(6, 1, torch.float8_e4m3fn): 16}
+#: Rows up to which a tep4 rank's trunk MoE takes the route front (1-4 requests of four rows).
+#: Its tactic is `DECODE_TACTICS`' pin for the row count's bucket: measured on the whole
+#: 512-expert layer (one rank), where the tactics compared were bitwise one another. A stock tep4
+#: window call is not pinned (`fp4_block_scale_moe_renorm_routed` pins the whole layer only) and
+#: runs the AutoTuner's tactic; the build check compares at the pinned tactic.
+_TEP_ROUTE_FRONT_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
+
+
+def _dp_gqa_min_requests(core) -> int:
+    """`DP_GQA_MIN_REQUESTS_ENV` at this core's layout: the requests from which a generation
+    step's rows take `qsa_sparse_gqa_grouped_cute` (`_GROUPED_DECODE_MIN_REQUESTS` unset or at a
+    layout without attention DP). A value outside the op's range raises."""
+    raw = os.environ.get(DP_GQA_MIN_REQUESTS_ENV, "").strip()
+    if not raw:
+        return _GROUPED_DECODE_MIN_REQUESTS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not _GROUPED_SMALL_MIN_GROUPS <= value <= _GROUPED_DECODE_MIN_REQUESTS:
+        raise ValueError(
+            f"{DP_GQA_MIN_REQUESTS_ENV}={raw!r}: expected an integer in "
+            f"{_GROUPED_SMALL_MIN_GROUPS}..{_GROUPED_DECODE_MIN_REQUESTS}"
+        )
+    if core.dp_size == 1:
+        logger.warning(
+            f"{DP_GQA_MIN_REQUESTS_ENV} is set but ignored: it serves attention-DP ranks; this "
+            f"rank has attention DP {core.dp_size}"
+        )
+        return _GROUPED_DECODE_MIN_REQUESTS
+    return value
+
+
+def _dp_topk_cluster_rows(core) -> int:
+    """`DP_TOPK_CLUSTER_ROWS_ENV` at this core's layout: the most rows a generation step's
+    selection takes the cluster top-k at (`_TOPK_CLUSTER_MAX_ROWS` unset or at a layout without
+    attention DP). A value outside the op's range raises."""
+    raw = os.environ.get(DP_TOPK_CLUSTER_ROWS_ENV, "").strip()
+    if not raw:
+        return _TOPK_CLUSTER_MAX_ROWS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not _TOPK_CLUSTER_MAX_ROWS < value <= _TOPK_CLUSTER_PAIR_MAX_ROWS:
+        raise ValueError(
+            f"{DP_TOPK_CLUSTER_ROWS_ENV}={raw!r}: expected an integer in "
+            f"{_TOPK_CLUSTER_MAX_ROWS + 1}..{_TOPK_CLUSTER_PAIR_MAX_ROWS}"
+        )
+    if core.dp_size == 1:
+        logger.warning(
+            f"{DP_TOPK_CLUSTER_ROWS_ENV} is set but ignored: it serves attention-DP ranks; this "
+            f"rank has attention DP {core.dp_size}"
+        )
+        return _TOPK_CLUSTER_MAX_ROWS
+    return value
+
+
+def _tep_fast_decode(core) -> bool:
+    """`TEP_FAST_DECODE_ENV` at this core's layout: whether it is a tep4 rank with the switch on
+    (default). Set to 1 at another layout: one warning, False."""
+    on = _switch(TEP_FAST_DECODE_ENV, default=True)
+    tep4 = (
+        not core.one_rank
+        and core.dp_size == 1
+        and core.attn_tp_size == _TEP_RANKS
+        and core.mapping.world_size == _TEP_RANKS
+        and core.local_experts * _TEP_RANKS == core.num_experts
+    )
+    if on and not tep4 and os.environ.get(TEP_FAST_DECODE_ENV, "").strip():
+        logger.warning(
+            f"{TEP_FAST_DECODE_ENV} is set but ignored: it serves a tep4 rank (attention TP "
+            f"{_TEP_RANKS} without attention DP, {_TEP_RANKS} expert windows); this rank has world "
+            f"size {core.mapping.world_size}, attention TP {core.attn_tp_size}, attention DP "
+            f"{core.dp_size}, {core.local_experts} of {core.num_experts} experts"
+        )
+    return on and tep4
+
+
+#: Off by default (a Lamport transport: race-risk, opt-in). At a tep4 rank whose trunk MoE takes
+#: the route front (`TEP_FAST_DECODE_ENV`), each captured block of up to
+#: `tep_finalize_allreduce.MAX_ROWS` rows enters the runner without its finalize, and one launch
+#: (`ops/moe/tep_finalize_allreduce`) forms the finalize and the TP all-reduce over symmetric
+#: memory instead of the runner's finalize and `core.tp_sum`: the finalize's slot-order fp32
+#: expression, then the one-shot sum in fp32 in rank order, one bf16 rounding each; a -0.0 lane
+#: of a rank's partial travels as +0.0. Its slot is the block's layer index mod 3, baked into
+#: the captured graph. `1` releases the launch's dependents after its publish, `early` right
+#: after its PDL wait. The build checks every row count against the reference on every rank and
+#: raises on every rank if one fails. Read once, when the target is built; set where it cannot
+#: apply (another layout, no route front, a group across nodes) it warns and does nothing.
+TEP_FINAR_ENV = "TRTLLM_QWEN4_EXP_TEP_FINAR"
+
+
+def _tep_finar_mode() -> str:
+    """`TEP_FINAR_ENV`: "" (unset, empty, 0), "publish" (1) or "early"; ValueError otherwise."""
+    raw = os.environ.get(TEP_FINAR_ENV, "")
+    value = raw.strip().lower()
+    if value in ("", "0"):
+        return ""
+    if value in ("1", "early"):
+        return "publish" if value == "1" else "early"
+    raise ValueError(f"{TEP_FINAR_ENV}={raw!r}: expected 0, 1 or early")
+
+
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) the hyper-connection
+#: mixers of a decode or short prefill step take row-count plans of their two tcgen05 kernels
+#: that sum the same K slices in the same order as the 128-row plans, so every output is bitwise:
+#: - `qwen4_exp_hc_decode_tc_first` on a 64-row M tile at `_HC_TILE64_ROWS` rows (half the
+#:   normed bytes a CTA streams), and for a mixer with the injection the rows-on-N kernel (the
+#:   weight rows on a 64-row MMA M, the normed rows on the MMA N in 16-row steps) at
+#:   `_HC_ROWSN_ROWS` rows, where tcgen05 has no M tile between 64 and 128;
+#: - `qwen4_exp_hc_up_gate_mean` on one 64-row M tile at `_HC_TILE64_ROWS` rows, and on two at
+#:   `_HC_UP2_ROWS` rows where it does not release its dependents early (`DP_INPROJ_RELEASE_ENV`:
+#:   two tiles are slower there).
+#: GB300 micros, a site: the first kernel 5.1-5.6 -> 4.4-4.9 us at 8-64 rows, the rows-on-N
+#: kernel -0.55..-0.60 us at 65..80 rows and -0.14..-0.23 at 81..96, the up kernel on two tiles
+#: -0.45..-0.48 us at 105..128 rows; dep4 steps at 17..24 requests a rank -0.02..-0.06 ms.
+#: `0` keeps the 128-row plans. Read once, when the target is built.
+DP_HC_TILES_ENV = "TRTLLM_QWEN4_EXP_DP_HC_TILES"
+#: Rows at which both kernels take one 64-row tile: up to 4 rows the first kernel keeps its
+#: 10-way split.
+_HC_TILE64_ROWS = (5, _HC_TILE64_MAX_ROWS)  # capacity: fixed: dispatch thresholds
+#: Rows at which an up kernel that does not release early takes two 64-row tiles.
+_HC_UP2_ROWS = (65, 128)  # capacity: fixed: dispatch thresholds
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) with PDL, trunk site
+#: A of a decode step (the mixer in front of a GDN or attention block) releases its dependents
+#: before its own wait (`qwen4_exp_hc_up_gate_mean(release_early=True)`), and the block's bf16
+#: input projection runs on `mid_rows_mm`'s bf16 tcgen05 GEMM over the checkpoint's `[N, K]`
+#: weight (a view, no copy) at the plan `_INPROJ_RELEASE_PLANS` names for the weight geometry and row count. That
+#: GEMM is launched with PDL, streams its weight before its wait and reads `mixed` after it, so
+#: it is the launch that runs beside the released up kernel (the stock entry, `low_m_bf16_mm`,
+#: runs cuBLAS without PDL at these rows, and a release in front of it moves nothing). It
+#: engages at the row counts of the CUDA-graph batch sizes inside `_INPROJ_RELEASE_ROWS`, for
+#: which the GEMM is compiled at build. The build compares the GEMM with the stock entry on this
+#: rank's weights at every compiled row count and keeps the switch only when every element is
+#: equal (fp32 accumulation of K in order and one rounding on both sides at these shapes; GB300:
+#: 0 of 2.1e7..1.7e8 elements a row count differ at 28..224 rows on the checkpoint's weights).
+#: GB300 dep4 trunk-loop micro, with the GDN forms of `DP_GDN_LEAN_ENV`: -0.47..-0.49 ms a step at
+#: 7..56 requests a rank. `0` keeps the stock entry and the up kernel's end-of-kernel release.
+#: Read once, when the target is built.
+DP_INPROJ_RELEASE_ENV = "TRTLLM_QWEN4_EXP_DP_INPROJ_RELEASE"
+#: Rows a rank at which the switch above can engage (`mid_rows_mm`'s rows past the GEMV's).
+_INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
+#: Measured plans of the bf16 GEMM behind a releasing site A (GB300 dep4 trunk-loop micro at 28 /
+#: 48 / 96 / 120 / 224 rows, 13 plan sets): weight geometry `(N, K)` -> `((largest rows, MMA N
+#: rule, Plan(ks, kpb, stages, l2, epi)), ...)`. MMA N rule "op": `mid_rows_mm`'s (32 / 64 / 128 /
+#: 256); "fine": `max(32, rows rounded up to 16)`. Up to 64 rows 8 k-blocks a stage and 2
+#: k-tiles of L2 prefetch; 65..96 rows the fine N (80 / 96 instead of the op's 128, which pads
+#: 25-47% of every MMA and ring stage with zero rows) with an 8-deep ring; 97..128 rows the op's
+#: ring with 4 k-tiles of prefetch; above, the fine N with the deepest ring. The activation rows
+#: sit on the MMA N, so the fine N only changes how many zero rows ride along. No plan splits K.
+#: GB300 dep8 server step at 18 / 24 requests a rank (72 / 96 rows), fine N against N 128:
+#: -0.063 / -0.052 ms. A geometry not listed does not engage.
+_INPROJ_RELEASE_PLANS: dict = {
+    # GDN in_proj (q|k|v|z|a|b)
+    (16480, 2560): (
+        (64, "op", MidPlan(1, 8, 5, 2, 16)),
+        (96, "fine", MidPlan(1, 4, 8, 4, 16)),
+        (128, "op", MidPlan(1, 4, 6, 4, 16)),
+        (256, "fine", MidPlan(1, 4, 5, 1, 16)),
+    ),
+    # attention in-proj (q|gate|k|v|index)
+    (14080, 2560): (
+        (64, "op", MidPlan(1, 8, 5, 2, 16)),
+        (96, "fine", MidPlan(1, 4, 8, 4, 16)),
+        (128, "op", MidPlan(1, 4, 6, 4, 16)),
+        (256, "fine", MidPlan(1, 4, 5, 1, 16)),
+    ),
+}
+
+
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) whose verify steps
+#: run the CuTe replay over a bf16 recurrent pool (no FlashInfer ring) with 4 rows a request and
+#: work items from 16 requests (the layout the table was timed at), a verify step of
+#: `_GDN_REPLAY_MAP_REQUESTS` requests launches the replay on the mapping `_gdn_replay_map`
+#: names instead of the kernel's own (`default_config`): its own overflows one wave of resident
+#: CTAs (608 = 152 SMs x 4) at 7-8 requests (96 CTAs a request) and at 13-15 (48 a request).
+#: Every launch mapping of the kernel computes each state tile with the same statements, so the
+#: output, the history and the commits are bitwise. GB300 micro, ms a step saved over the
+#: kernel's own mapping: 0.020-0.028 at 5-6 requests, 0.064-0.071 at 7-10, 0.025-0.035 at
+#: 11-12, 0.065-0.072 at 13-15, 0.003-0.024 at 17-32, 0.017-0.028 at 33-48. `0` keeps the
+#: kernel's own mapping. Read once, at each cache-manager bind.
+DP_GDN_REPLAY_MAP_ENV = "TRTLLM_QWEN4_EXP_DP_GDN_REPLAY_MAP"
+#: Requests a rank the table names a mapping for (the largest timed: 48).
+_GDN_REPLAY_MAP_REQUESTS = (5, 48)  # capacity: fixed: dispatch thresholds
+#: 8 m-tiles a CTA on 8 warps, every state tile by bulk copy as soon as the slot is known.
+_GDN_REPLAY_MAP_A = dict(tpc=8, warps=8, pf=0, minb=4, early_acc=True)
+#: At 13..15 requests (48 CTAs a request): 4 warps, five CTAs resident an SM.
+_GDN_REPLAY_MAP_B = dict(tpc=8, warps=4, pf=1, minb=5)
+_GDN_REPLAY_MAP_B_REQUESTS = (13, 15)  # capacity: fixed: dispatch thresholds
+#: The partition threshold and rows a request the table was timed at; 16 requests (the first
+#: partitioned count) keep the kernel's own mapping, the best there.
+_GDN_REPLAY_MAP_PARTITION, _GDN_REPLAY_MAP_ROWS = 16, 4  # capacity: fixed: the measured layout
+
+
+def _gdn_replay_map(n: int) -> dict | None:
+    """`DP_GDN_REPLAY_MAP_ENV`'s launch mapping of a verify step of `n` requests, or None (the
+    kernel's own)."""
+    lo, hi = _GDN_REPLAY_MAP_REQUESTS
+    if not lo <= n <= hi or n == _GDN_REPLAY_MAP_PARTITION:
+        return None
+    lo_b, hi_b = _GDN_REPLAY_MAP_B_REQUESTS
+    return dict(_GDN_REPLAY_MAP_B if lo_b <= n <= hi_b else _GDN_REPLAY_MAP_A)
+
+
+def _gdn_replay_map_on(core, cm, device, ring: bool) -> bool:
+    """`DP_GDN_REPLAY_MAP_ENV` against a bound manager: an attention-DP rank on SM103, the CuTe
+    replay over a bf16 pool (not FlashInfer's ring), the measured partition threshold and rows
+    a request."""
+    return (
+        _switch(DP_GDN_REPLAY_MAP_ENV, default=True)
+        and _dp_decode_rank(core, device)
+        and not ring
+        and (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, core.max_verify_rows)
+        == (_GDN_REPLAY_MAP_PARTITION, _GDN_REPLAY_MAP_ROWS)
+    )
+
+
+#: Off by default (class S: another K split than the bf16 entry). At an attention-DP rank on
+#: SM103, the output projections of a decode step -- the GDN out projection and the attention
+#: o projection, `[rows, 6144] x [6144, 2560]` -- run `mid_rows_mm`'s bf16 tcgen05 GEMM over the
+#: checkpoint's weight (no copy) with PDL, at the MMA N and plan `_OUT_PROJ_TABLE` names for the
+#: row count, instead of the step's bf16 entry (`low_m_bf16_mm`: FlashInfer's split-K kernel up
+#: to 32 rows, cuBLASLt without PDL above). The GEMM streams its weight before its wait, so it
+#: overlaps the gated norm (which releases its dependents early) or the attention's last
+#: launch. Same bf16 operands and fp32 accumulation; the K split differs, so the output moves
+#: at bf16 rounding level (GB300 dep4: none of 18 greedy texts stayed identical). Values: `1` --
+#: the GDN out projection at every row count of the table, the attention o projection at
+#: `_OUT_PROJ_ATTN_ROWS` (where its producer does not release early and the micro measured a
+#: gain); `gdn` -- the GDN site only; `all` -- both sites at every row count of the table. Only
+#: the row counts of the CUDA-graph batch sizes engage (their kernels are compiled at build).
+#: GB300 dep4 at 12 requests a rank: -0.14 ms a step; the GDN site saves 36..111 us a
+#: step of 36 launches at 20..128 rows. Read once, when the target is built.
+DP_OUT_PROJ_BF16_ENV = "TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"
+#: `(first rows, last rows, MMA N, plan)`: the GEMM of a row count, measured on GB300 (the
+#: model's GDN chain of 36 layers captured with each candidate; ks 3..12 x 9 (kpb, stages, l2)
+#: at 28 / 48 / 96 / 120 / 224 rows and the best plans at 15 more counts). The MMA N rounded to
+#: 16 rows wins over the op's 32 / 64 / 128 / 256 at every count. Past 144 rows cuBLASLt is
+#: faster; those rows keep the bf16 entry.
+_OUT_PROJ_TABLE = (
+    (17, 28, 32, MidPlan(12, 2, 8, 2)),
+    (29, 32, 32, MidPlan(6, 4, 10, 1)),
+    (33, 36, 48, MidPlan(6, 4, 10, 1)),
+    (37, 40, 48, MidPlan(6, 4, 8, 2)),
+    (41, 48, 48, MidPlan(6, 4, 10, 1)),
+    (49, 64, 64, MidPlan(6, 4, 8, 2)),
+    (65, 80, 80, MidPlan(6, 4, 4, 2)),
+    (81, 96, 96, MidPlan(6, 4, 8, 2)),
+    (97, 112, 112, MidPlan(6, 4, 8, 2)),
+    (113, 128, 128, MidPlan(6, 4, 6, 2)),
+    (129, 144, 144, MidPlan(6, 4, 6, 2)),
+)
+#: The weight geometry `(N, K)` the table was measured for: the trunk's output projections.
+_OUT_PROJ_GEOM = (2560, 6144)
+#: Rows at which the attention o projection takes the GEMM under the value `1` (GB300 micro,
+#: 12 launches a step: 0.004..0.017 ms saved at 32..96 rows, -0.003..-0.005 at 20..28 against
+#: FlashInfer's split-K, -0.003..-0.008 from 120 rows).
+_OUT_PROJ_ATTN_ROWS = (29, 96)  # capacity: fixed: dispatch thresholds
+
+
+def _out_proj_mode() -> str:
+    """`DP_OUT_PROJ_BF16_ENV`: "" (unset, empty, an off spelling), "1", "gdn" or "all"."""
+    raw = os.environ.get(DP_OUT_PROJ_BF16_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return ""
+    if value in _SWITCH_ON:
+        return "1"
+    if value in ("gdn", "all"):
+        return value
+    raise ValueError(f"{DP_OUT_PROJ_BF16_ENV}={raw!r}: expected 0, 1, gdn or all")
+
+
+def _out_proj_shape(rows: int) -> tuple | None:
+    """`(MMA N, plan)` of `_OUT_PROJ_TABLE` at `rows`, None outside it."""
+    for lo, hi, mpad, plan in _OUT_PROJ_TABLE:
+        if lo <= rows <= hi:
+            return mpad, plan
+    return None
+
+
+def _out_proj_build(core, device) -> dict | None:
+    """`DP_OUT_PROJ_BF16_ENV`, read once at build: `{"gdn_out" | "attn_o": {rows: (MMA N,
+    plan)}}` at an attention-DP rank on SM103 whose output projections are contiguous bf16
+    `_OUT_PROJ_GEOM` weights with no other decode copy, every entry's GEMM compiled here; None
+    where it is off. Set where it cannot apply: one warning, None."""
+    mode = _out_proj_mode()
+    if not mode:
+        return None
+    names = [f"l{i}_out_w" for i in core.gdn_layers] + [f"l{i}_o_w" for i in core.attn_layers]
+    bad = [
+        n
+        for n in names
+        if n not in core.w
+        or n in core._mid
+        or core.w[n].dtype != torch.bfloat16
+        or tuple(core.w[n].shape) != _OUT_PROJ_GEOM
+        or not core.w[n].is_contiguous()
+        or core.w[n].data_ptr() % 16
+    ]
+    if not _dp_decode_rank(core, device) or bad:
+        logger.warning(
+            f"{DP_OUT_PROJ_BF16_ENV} is set but ignored: it serves a dep4 / dep8 rank on SM103 "
+            f"whose output projections are bf16 {_OUT_PROJ_GEOM[0]} x {_OUT_PROJ_GEOM[1]} "
+            f"weights without another decode copy ({len(bad)} are not)"
+        )
+        return None
+    gdn = {}
+    for rows in _graph_rows(core, _OUT_PROJ_TABLE[0][0], _OUT_PROJ_TABLE[-1][1]):
+        shape = _out_proj_shape(rows)
+        if shape is not None:
+            gdn[rows] = shape
+    lo, hi = _OUT_PROJ_ATTN_ROWS
+    attn = (
+        {}
+        if mode == "gdn"
+        else dict(gdn)
+        if mode == "all"
+        else {r: e for r, e in gdn.items() if lo <= r <= hi}
+    )
+    w = core.w[names[0]]
+    for mpad, plan in sorted(set(gdn.values()), key=str):
+        # The first call compiles the kernel (`mid_mm_raw` caches it per shape and plan).
+        mid_mm_raw(torch.zeros(1, w.shape[1], dtype=w.dtype, device=device), w, plan, mpad=mpad)
+    logger.info(
+        f"output projections on the bf16 mid-rows GEMM ({DP_OUT_PROJ_BF16_ENV}={mode}): rank "
+        f"{core.dp_rank} of {core.dp_size}, GDN rows {sorted(gdn)}, attention rows {sorted(attn)}"
+    )
+    return {"gdn_out": gdn, "attn_o": attn}
+
+
+def _out_proj(core, x, weight_t, site: str, dense):
+    """An output projection of a decode step: `DP_OUT_PROJ_BF16_ENV`'s GEMM at a row count its
+    table serves for `site` (`weight_t` the `.t()` view of the checkpoint's `[N, K]` weight,
+    `x` contiguous and 16-byte aligned), else `dense()` (the step's `_dense_mm`)."""
+    table = core._out_proj
+    ent = None if table is None else table[site].get(x.shape[0])
+    if ent is None or not x.is_contiguous() or x.data_ptr() % 16:
+        return dense()
+    return mid_mm_raw(x, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
+
+
+#: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
+#: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
+#: dep2 was never run with them; it keeps the stock forms.
+_DP_DECODE_SIZES = (4, 8)  # capacity: fixed: the measured layouts, not a buffer size
+
+
+def _dp_decode_rank(core, device) -> bool:
+    """Whether this core is an attention-DP rank (no attention TP) of a measured group size
+    (`_DP_DECODE_SIZES`: dep4, dep8) on an SM103 GPU: where the attention-DP decode forms
+    (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`, ...) are measured."""
+    return (
+        not core.one_rank
+        and core.dp_size in _DP_DECODE_SIZES
+        and core.attn_tp_size == 1
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    )
+
+
+def _graph_rows(core, lo: int, hi: int) -> list[int]:
+    """This rank's decode row counts (`max_verify_rows` x a CUDA-graph batch size) in lo..hi."""
+    p = core.max_verify_rows
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    return sorted({p * int(b) for b in sizes if lo <= p * int(b) <= hi})
+
+
+def _hc_tiles_build(core, device) -> bool:
+    """`DP_HC_TILES_ENV`, read once at build (`post_load_weights`): True at an attention-DP rank
+    on SM103 with the switch on (default), after compiling every plan `_hc_first` and `_hc_mixer`
+    can then launch; False elsewhere, and where a plan does not compile (one warning: the rank
+    keeps the 128-row plans, which it compiled before; no other rank needs to agree)."""
+    if not (_switch(DP_HC_TILES_ENV, default=True) and _dp_decode_rank(core, device)):
+        return False
+    try:
+        hc_tc_first_precompile(core.stream, core.hc_lowrank, core.hc_count, device, tile64=True)
+        bns = sorted({-(-r // 16) * 16 for r in range(_HC_ROWSN_ROWS[0], _HC_ROWSN_ROWS[1] + 1)})
+        hc_tc_first_precompile_rowsn(core.stream, core.hc_lowrank, core.hc_count, device, bns)
+        variants = [(False, 64), (True, 64), (True, 128)]
+        hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, variants)
+    except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+        logger.warning(
+            f"{DP_HC_TILES_ENV}: a plan did not compile at rank {core.dp_rank} "
+            f"({type(e).__name__}: {e}); the hc mixers keep the 128-row plans"
+        )
+        return False
+    logger.info(
+        f"hc mixer plans: rank {core.dp_rank} of {core.dp_size}, 64-row tiles at "
+        f"{_HC_TILE64_ROWS[0]}..{_HC_TILE64_ROWS[1]} rows, rows on N at {_HC_ROWSN_ROWS[0]}.."
+        f"{_HC_ROWSN_ROWS[1]}, two up tiles at {_HC_UP2_ROWS[0]}..{_HC_UP2_ROWS[1]}"
+    )
+    return True
+
+
+class _InProj(NamedTuple):
+    """`DP_INPROJ_RELEASE_ENV`: one trunk layer's input projection at one row count, as
+    `DecodeTarget.forward` hands it to the layer's block (`q_in`)."""
+
+    layer: int
+    #: The checkpoint's bf16 `[N, K]` weight (contiguous).
+    w: torch.Tensor
+    #: The MMA N and the plan the GEMM runs at.
+    mpad: int
+    plan: MidPlan
+
+
+def _inproj_plan(n: int, k: int, rows: int) -> tuple | None:
+    """`_INPROJ_RELEASE_PLANS`: `(MMA N, plan)` of geometry `(n, k)` at `rows` rows, or None."""
+    for bound, rule, plan in _INPROJ_RELEASE_PLANS.get((n, k), ()):
+        if rows <= bound:
+            if rule == "fine":
+                return max(32, -(-rows // 16) * 16), plan
+            return next(b for b in (32, 64, 128, 256) if rows <= b), plan
+    return None
+
+
+def _inproj_mm(x: torch.Tensor, ent: _InProj) -> torch.Tensor:
+    """`DP_INPROJ_RELEASE_ENV`: `x [rows, K]` bf16 @ `ent.w`^T on `mid_mm_raw` (bf16 operands,
+    PDL, the entry's MMA N and plan). Returns a fresh bf16 `[rows, N]`."""
+    return mid_mm_raw(x, ent.w, ent.plan, pdl=True, mpad=ent.mpad)
+
+
+def _inproj_name(core, i: int) -> str:
+    return f"l{i}_attn_in_w" if core.is_attn[i] else f"l{i}_in_proj_w"
+
+
+def _inproj_release_build(core, device) -> dict | None:
+    """`DP_INPROJ_RELEASE_ENV`, read once at build after the decode target: `{layer: {rows:
+    _InProj}}` at an attention-DP rank on SM103 with PDL and the switch on (default), for every
+    trunk layer whose input projection is a bf16 `[N, K]` weight with a plan at the CUDA-graph
+    row counts and no other decode copy (`_mid`, packed FP8 / NVFP4: tp1 only today). Every
+    entry's GEMM is compiled here and compared with the stock entry on this rank's weight over
+    one random activation a row count; a difference anywhere, or a GEMM that does not compile or
+    run, leaves the switch off at this rank (one warning; the release is rank-local, so no other
+    rank needs to agree). None where it is off or cannot take effect."""
+    if not (
+        _switch(DP_INPROJ_RELEASE_ENV, default=True)
+        and _dp_decode_rank(core, device)
+        and _DECODE_PROJ_PDL
+    ):
+        return None
+    rows_list = _graph_rows(core, *_INPROJ_RELEASE_ROWS)
+    table: dict = {}
+    gen = torch.Generator(device=device).manual_seed(20261125)
+    checked = {}
+    for i in range(core.num_layers):
+        name = _inproj_name(core, i)
+        w = core.w[name] if name in core.w else None
+        if (
+            w is None
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or w.data_ptr() % 16
+            or name in core._mid
+            or name in core._gemv8
+            or name in core._gemv_nv
+        ):
+            continue
+        geom = (int(w.shape[0]), int(w.shape[1]))
+        ents = {}
+        for rows in rows_list:
+            plan = _inproj_plan(*geom, rows)
+            if plan is not None:
+                ents[rows] = _InProj(i, w, plan[0], plan[1])
+        if not ents:
+            continue
+        if geom not in checked:
+            # The stock entry the block runs without the switch (`_dense_mm`'s bf16 branch).
+            stock = core.decode_mm if core.is_attn[i] else core.decode_in_mm
+            try:
+                x = torch.randn(max(ents), geom[1], generator=gen, device=device)
+                x = x.to(torch.bfloat16)
+                bad = 0
+                for rows, ent in ents.items():
+                    got = _inproj_mm(x[:rows], ent)
+                    ref = stock(x[:rows], w.t())
+                    bad += int((got.view(torch.int16) != ref.view(torch.int16)).sum())
+                checked[geom] = f"differs from the stock entry in {bad} elements" if bad else ""
+            except Exception as e:  # noqa: BLE001 -- declined like a GEMM that differs
+                checked[geom] = f"raised {type(e).__name__}: {e}"
+        if checked[geom]:
+            logger.warning(
+                f"{DP_INPROJ_RELEASE_ENV}: the bf16 mid-rows GEMM of a {geom[0]} x {geom[1]} "
+                f"input projection {checked[geom]} at rank {core.dp_rank}; every site and input "
+                "projection keeps the stock forms"
+            )
+            return None
+        table[i] = ents
+    if not table:
+        return None
+    try:
+        torch.cuda.synchronize(device)
+        hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, [(True, 128)])
+    except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+        logger.warning(
+            f"{DP_INPROJ_RELEASE_ENV}: the releasing up kernel did not compile at rank "
+            f"{core.dp_rank} ({type(e).__name__}: {e}); every site and input projection keeps "
+            "the stock forms"
+        )
+        return None
+    logger.info(
+        f"input projections behind a releasing hc site: rank {core.dp_rank} of {core.dp_size}, "
+        f"{len(table)} layers, rows {sorted({r for t in table.values() for r in t})}"
+    )
+    return table
+
+
+def _inproj_release_at(core, i: int, rows: int) -> _InProj | None:
+    """`DP_INPROJ_RELEASE_ENV`: trunk layer `i`'s input projection at `rows` rows, or None where
+    its site A and projection stay the stock forms. Host side, a per-capture constant."""
+    table = core._inproj_release
+    return None if table is None else table.get(i, {}).get(rows)
 
 
 def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: int) -> bool:
@@ -1288,6 +2100,20 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The draft layer's FP8 experts: this rank's window over the whole TP group.
         self.mtp_local_experts = d.mtp_local_experts
         self.mtp_expert_offset = d.mtp_expert_offset
+        # A tep4 rank's decode forms (`TEP_FAST_DECODE_ENV`), settled with the layout.
+        self.tep_fast = _tep_fast_decode(self)
+        # The attention-DP decode forms, built after load (`post_load_weights`) on a GPU:
+        # `DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`.
+        self.hc_tiles = False
+        self._inproj_release = None
+        # `DP_GDN_REPLAY_MAP_ENV`, settled at each cache-manager bind.
+        self.gdn_replay_map = False
+        # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
+        self._out_proj = None
+        # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
+        self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
+        # The most generation rows the cluster top-k serves (`DP_TOPK_CLUSTER_ROWS_ENV`).
+        self.dp_topk_cluster_rows = _dp_topk_cluster_rows(self)
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -1310,8 +2136,18 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.allreduce_strategy = int(model_config.allreduce_strategy)
         self.tp_sum = None
         self.expert_sum = None
+        # The attention-DP Lamport workspace (`DP_MOE_COMM_ENV`), built once a load, and with
+        # `lamport_step` the registry of its launch indices, which the shell's forward brackets.
+        self._lamport_trip = None
+        self._lamport_steps: LamportSteps | None = None
+        # The router front (`DP_ROUTER_FRONT_ENV`), built after the route front.
+        self._router_front: "_DpRouterFront | None" = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
+        # The decode MoE's route front (`DP_ROUTE_FRONT_ENV`), built with the targets.
+        self._route_front: _RouteFront | None = None
+        # The tep4 MoE finalize + all-reduce launch (`TEP_FINAR_ENV`), built once after it.
+        self._tep_finar: _TepFinar | None = None
         # Everything derived from the KV cache manager (`_bind_cache_manager`).
         self._bound: _Bound | None = None
         self._binds = 0
@@ -1454,6 +2290,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # At one rank the hyper-connection sites' fast forms by row count (the decode GEMV and
         # tcgen05 rows pairs, the prefill rstd sites); the other layouts do not take them.
         self.hc_fast_sites = one_rank
+        # The decode sites' rows pairs alone: at one rank, and at a tep4 rank under
+        # `TEP_FAST_DECODE_ENV` (replicated sites over the all-reduced rows).
+        self.hc_decode_pairs = one_rank or self.tep_fast
         self.decode_in_mm = (
             _one_rank_projection
             if one_rank
@@ -1461,6 +2300,22 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
+        if device.type == "cuda":
+            self.hc_tiles = _hc_tiles_build(self, device)
+            self._inproj_release = _inproj_release_build(self, device)
+            self._out_proj = _out_proj_build(self, device)
+        # Built after the decode target, whose layer views it checks; a collective-free build.
+        self._route_front = (
+            _route_front_build(self, self._decode._layers, device)
+            if device.type == "cuda"
+            else None
+        )
+        # Collective (the group agrees); once a load.
+        if self._router_front is None and device.type == "cuda":
+            self._router_front = _dp_router_front_build(self, self._decode._layers, device)
+        # Collective; once a load (the post-load walk reaches this hook again).
+        if self._tep_finar is None and device.type == "cuda":
+            self._tep_finar = _tep_finar_build(self, device)
 
     def _build_draft_one_rank(self, device) -> None:
         """At one rank the draft layer's operands for `DecodeTarget._mtp_layer`: the fused
@@ -1579,15 +2434,115 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Under MPI the plain symbols; with MPI disabled the `_pg` ones over the TP process
         # group, as `allreduce_group_args` routes them.
         process_group = self.mapping.tp_group_pg.boxed() if mpi_disabled() else None
+        lamport = self._dp_lamport(group) if _dp_moe_comm() != "nccl" else None
+        group_size = len(group)
 
         def round_trip(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
             rows = x.shape[0]
             padded = x if not pad_rows else nn.functional.pad(x, [0, 0, 0, pad_rows])
+            if lamport is not None and lamport.takes(padded.shape[0], padded):
+                # Every rank takes the same branch: the padded row count and the dtype are the
+                # group's. The window's output is bf16 at the hidden width on every rank.
+                front = getattr(self, "_router_front", None)
+                release = front is not None and padded.shape[0] * group_size in front.release_rows
+                partial = run(dep_lamport_round_trip(padded, lamport, False, release))
+                mine = dep_lamport_round_trip(partial, lamport, True)
+                return mine if not pad_rows else mine[:rows]
             gathered = allgather(padded, None, group, process_group)
             mine = reducescatter(run(gathered), None, group, process_group)
             return mine if not pad_rows else mine[:rows]
 
         return round_trip
+
+    def _dp_lamport(self, group):
+        """The Lamport round trip of `DP_MOE_COMM_ENV` (`ops/moe/dep_lamport_round_trip`), built
+        once a load over the DP group: a collective, every rank of the group builds it at
+        construction. At dep4 over torch symmetric memory on the 4-rank torch group, at dep8 over
+        `PeerBuffers` of the TP group (MNNVL across the two nodes); with `lamport_step` in the
+        host-index form, whose registry (`_lamport_steps`) the shell's forward brackets. ValueError
+        away from a dep4 or dep8 worker on SM103; RuntimeError on every rank where the group has no
+        peer memory."""
+        if self._lamport_trip is not None:
+            return self._lamport_trip
+        world = self.dp_size
+        layout = _LAMPORT_LAYOUTS.get(world)
+        if (
+            layout is None
+            or self.mapping.world_size != world
+            or list(group) != list(range(world))
+            or torch.cuda.get_device_capability() != archs.SM_103
+        ):
+            raise ValueError(
+                f"{DP_MOE_COMM_ENV}={_dp_moe_comm()}: the Lamport round trip is certified on a "
+                f"dep4 or dep8 worker on SM103 (this rank: world size {self.mapping.world_size}, "
+                f"attention DP size {self.dp_size}, device "
+                f"sm_{''.join(map(str, torch.cuda.get_device_capability()))})"
+            )
+        steps = LamportSteps() if _dp_moe_comm() == "lamport_step" else None
+        rows = int(self.max_num_tokens)
+        if world == 4:
+            built = self._dp_lamport_symmetric(rows, steps)
+        else:
+            built = self._dp_lamport_peers(rows, steps)
+        self._lamport_trip, self._lamport_steps = built, steps
+        logger.info(
+            f"MoE Lamport round trip: {layout}, up to {built.max_rows} rows a rank, "
+            f"{'host-index' if steps is not None else 'device-counter'} slots"
+        )
+        return built
+
+    def _dp_lamport_symmetric(self, rows: int, steps):
+        """dep4: the workspace over torch symmetric memory on the 4-rank torch group."""
+        import torch.distributed as dist
+
+        from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
+
+        # MPI workers have no torch process group: the collective bootstrap the stock MoE uses.
+        ensure_cutedsl_torch_distributed(4)
+        if not dist.is_initialized() or dist.get_world_size() != 4:
+            raise RuntimeError(f"{DP_MOE_COMM_ENV}={_dp_moe_comm()} found no 4-rank torch group")
+        if dist.get_rank() != self.dp_rank:
+            raise RuntimeError(
+                f"{DP_MOE_COMM_ENV}={_dp_moe_comm()}: the torch WORLD rank order differs from the "
+                "DP rank order"
+            )
+        return dep_lamport_build(self.hidden, rows, self.dp_rank, 4, steps=steps)
+
+    def _dp_lamport_peers(self, rows: int, steps):
+        """dep8: the workspace over `PeerBuffers` of the TP group (= the DP group): MNNVL memory
+        across the nodes of one NVLink domain, IPC within a node. Every rank agrees on the
+        outcome before any rank returns: a refusal or a failed build raises on every rank."""
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+        from tensorrt_llm._torch.distributed.peer_buffers import PeerBuffers
+
+        world, rank = self.dp_size, self.dp_rank
+        nbytes = dep_lamport_workspace_bytes(self.hidden, rows, world)
+        peers = PeerBuffers.create(self.mapping, nbytes)
+        if peers is None:
+            raise RuntimeError(
+                f"{DP_MOE_COMM_ENV}={_dp_moe_comm()} at dep8: the TP group has no peer memory "
+                "(IPC within a node, MNNVL across the nodes of one NVLink domain); unset it to "
+                "keep NCCL"
+            )
+        built, error = None, ""
+        try:
+            buffers = dep_lamport_buffers_from_pointers(
+                peers.peer_ptrs, self.hidden, rows, world, torch.cuda.current_device()
+            )
+            built = dep_lamport_build_on(
+                self.hidden, rows, rank, world, buffers, steps=steps, keepalive=peers
+            )
+            torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001 -- every rank raises together below
+            error = f"{type(e).__name__}: {e}"
+        # Every rank holds its armed buffer and both launches before any of them exchanges a row.
+        errors = [e for e in Distributed.get(self.mapping).tp_allgather(error) if e]
+        if errors:
+            raise RuntimeError(
+                f"{DP_MOE_COMM_ENV}={_dp_moe_comm()} at dep8: the Lamport workspace failed on "
+                f"{len(errors)} rank(s): {errors[0]}"
+            )
+        return built
 
     def _dp_pad_rows(self, md, num_tokens: int) -> int:
         """Rows this rank pads its MoE input with before the attention-DP round trip: up to
@@ -1716,10 +2671,20 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"a {state_dtype} recurrent-state cache; this layout serves "
             f"{' or '.join(str(d) for d in served)} (kv_cache_config.mamba_ssm_cache_dtype)"
         )
+        self.gdn_replay_map = self.mtp_enabled and _gdn_replay_map_on(
+            self,
+            cm,
+            rank_pools.ssm[self.gdn_layers[0]].device,
+            bool(getattr(cm, "use_gdn_flashinfer_ring_replay", False)),
+        )
         if self.mtp_enabled and state_dtype == torch.bfloat16:
             # Every CuTe replay kernel a verify step of up to `max_num_requests` requests
             # launches (`_gdn_verify`), compiled now: the captured decode graphs do not reach
             # every launch mapping, and a compile in a serving step stalls it 5-10 s.
+            maps = {}
+            if self.gdn_replay_map:
+                maps = {n: _gdn_replay_map(n) for n in range(1, md.max_num_requests + 1)}
+                maps = {n: c for n, c in maps.items() if c is not None}
             gdn_replay_precompile(
                 self.max_verify_rows,
                 self.num_k_heads,
@@ -1729,6 +2694,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 partition_from=CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
                 work_item_width=mm.replay_work_items.shape[1],
                 separate_replay_slots=_has_replay_slots(cm),
+                configs=maps,
             )
         # No sliding window: the targets pass `max_seq_len` as the window.
         windows = cm.max_attention_window_vec
@@ -1751,6 +2717,15 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"{rank_pools.ple_state[0].shape[0]} PLE slots (bind {self._binds})",
             flush=True,
         )
+        # The tail of an in-forward snapshot split runs FlashInfer's in-place path. The manager
+        # caps its tails at `inforward_snapshot_max_tail`; one that does not cannot be served.
+        max_tail = getattr(cm, "inforward_snapshot_max_tail", 0)
+        if getattr(cm, "inforward_snapshot_rows", 0) > 0 and max_tail > _GDN_INPLACE_MAX_TOKENS:
+            raise NotImplementedError(
+                f"the KV cache manager {type(cm).__name__} plans in-forward Mamba snapshots with "
+                f"a tail of up to {max_tail} tokens: this target splits tails of at most "
+                f"{_GDN_INPLACE_MAX_TOKENS} tokens (`inforward_snapshot_max_tail`)"
+            )
         bound = _Bound(cm, rank_pools)
         if self.spec_rollback is not None:
             self.spec_rollback.set_index_planes(
@@ -1989,6 +2964,29 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             return output
         final, hc = torch.split(output, [self.hidden, self.stream], -1)
         return final, hc
+
+
+#: Verify rows an attention-DP rank gathers for its heads in one `embed_rows` launch (a copy:
+#: bitwise `nn.functional.embedding`): PyTorch's small-index gather runs 4-9 us a call at 4-16
+#: rows, and switches to its vectorized kernel itself from 32 rows.
+_VERIFY_ROWS_GATHER_MAX = 31  # capacity: fixed: a dispatch threshold
+
+
+def _head_rows(core, final: torch.Tensor, gather_ids: torch.Tensor) -> torch.Tensor:
+    """The rows of `final` the verify head reads (`gather_ids`): under attention DP up to
+    `_VERIFY_ROWS_GATHER_MAX` of them on `embed_rows`, else `nn.functional.embedding`."""
+    if (
+        gather_ids.dim() == 1
+        and gather_ids.shape[0] <= _VERIFY_ROWS_GATHER_MAX
+        and gather_ids.is_contiguous()
+        and gather_ids.dtype in (torch.int32, torch.int64)
+        and final.dim() == 2
+        and final.stride(1) == 1
+        and final.is_cuda
+        and core.dp_size > 1
+    ):
+        return embed_rows(gather_ids, final, 1, False)
+    return nn.functional.embedding(gather_ids, final)
 
 
 # --------------------------------------------------------------- weight views ---
@@ -2452,8 +3450,12 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
         )
         return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
     old_x, old_B, old_dt, old_dA = replay.old[i]
+    extra = {}
     if cute:
         replay_op = gdn_cached_replay_cute
+        if core.gdn_replay_map:
+            # `DP_GDN_REPLAY_MAP_ENV`: the measured launch mapping, None for the kernel's own.
+            extra["config"] = _gdn_replay_map(n)
     else:
         replay_op = fused_recurrent_gated_delta_rule_cached_replay_update
         a, b = a.contiguous(), b.contiguous()
@@ -2489,6 +3491,7 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
         use_all_layer_commit=all_layer,
         output=None,
         replay_indices=replay_indices,
+        **extra,
     )
     return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 
@@ -2519,7 +3522,10 @@ def _draft_embedding(input_ids: torch.Tensor, embed_tokens: torch.Tensor) -> tor
     (the in-tree `Embedding` masks such ids for the same reason). Those rows feed nothing the
     step keeps: attention is causal, the worker continues from each request's last accepted
     row, and the next step's first draft call rewrites their cache positions. So a negative
-    id reads row 0 instead of past the table; every valid id embeds as before."""
+    id reads row 0 instead of past the table; every valid id embeds as before. The clamp and
+    the gather are one launch where `embed_rows` takes the ids (bitwise the composed path)."""
+    if input_ids.dim() == 1 and input_ids.is_contiguous():
+        return embed_rows(input_ids, embed_tokens, 1, True)
     return nn.functional.embedding(input_ids.clamp_min(0), embed_tokens)
 
 
@@ -2716,10 +3722,15 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
         routed = core.expert_sum(run, x, pad_rows)
     if routed_only:
         return routed
+    return fused_sigmoid_gate_mul_add(routed, *_mtp_shared_expert(core, M, x))
+
+
+def _mtp_shared_expert(core, M: _MtpWeights, x) -> tuple:
+    """The draft layer's replicated bf16 shared expert in the trunk's form over `x`: one GEMM
+    forms gate|up and the per-token gate logit. Returns `(gate_logits, shared)`."""
     gug = cublas_mm(x, M.sh_gug)
     shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), M.sh_dn)
-    gate_logits = gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
-    return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+    return gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1], shared
 
 
 def _mtp_routed_nvfp4(core, M: _MtpWeights, x) -> torch.Tensor:
@@ -2799,12 +3810,26 @@ def _mtp_tail(core, M: _MtpWeights, x, attn, inject, pad_rows: int) -> torch.Ten
     over the TP group and injected, the MoE-side hyper-connection, the MoE and its injection.
     `attn` is the `[T, q_width]` gated attention output; `pad_rows` is the MoE round trip's
     padding under attention DP (`_draft_pad_rows`). The MoE-side site is the trunk's
-    (`qwen4_exp_hc_inject_norm`, `_hc_mixer`)."""
+    (`qwen4_exp_hc_inject_norm`, `_hc_mixer`). The MoE's combination `routed + sigmoid(gate
+    logit) * shared` and its injection are one launch (`mtp_moe_combine_inject`, as the FP8
+    target runs them), bitwise the two launches it replaces."""
     x, normed = qwen4_exp_hc_inject_norm(
         x, core.tp_sum(cublas_mm(attn, M.o)), inject, M.mhc_norm, core.eps, core.hc_count
     )
     mixed, inject = _hc_mixer(core, normed, M.mhc_first, M.mhc_up, True)
-    return qwen4_exp_post_inject(x, _mtp_moe_block(core, M, mixed, pad_rows), inject)
+    routed = _mtp_moe_block(core, M, mixed, pad_rows, routed_only=True)
+    gate_logits, shared = _mtp_shared_expert(core, M, mixed)
+    if _combine_inject_fits(x, routed, shared, inject):
+        return mtp_moe_combine_inject(x, routed, gate_logits, shared, inject)
+    return qwen4_exp_post_inject(x, fused_sigmoid_gate_mul_add(routed, gate_logits, shared), inject)
+
+
+def _combine_inject_fits(x, routed, shared, inject) -> bool:
+    """Whether `mtp_moe_combine_inject` takes these operands: 2-D bf16, unit column stride."""
+    return all(
+        t.dim() == 2 and t.dtype == torch.bfloat16 and t.stride(1) == 1
+        for t in (x, routed, shared, inject)
+    )
 
 
 def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
@@ -2858,13 +3883,105 @@ def _draft_pad_rows(core, all_rank_num_tokens, rows: int) -> int:
     return core._dp_pad_rows(_DraftRowCounts(list(all_rank_num_tokens)), rows)
 
 
+class _DraftContinue(NamedTuple):
+    """A draft-extend step's continuing rows: `rows` `[gen_seqs]` int64, the QSA row metadata
+    at them, and under attention DP the group's kept-row counts (None under attention TP)."""
+
+    rows: torch.Tensor
+    visible: torch.Tensor
+    seq_lens: torch.Tensor
+    logical: torch.Tensor
+    req_idx: torch.Tensor
+    counts: list | None
+
+
+def _draft_continue(
+    core, md, spec_metadata, all_rank_num_tokens, rows: int, gen_seqs: int, p: int, share: bool
+) -> _DraftContinue | None:
+    """Each request's continuing row of a draft-extend step (`p` rows a request), or None when
+    every row goes on.
+
+    The spec worker continues from row `r * p + num_accepted[r] - 1` of each request; the other
+    rows matter only through the K/V and index keys they write, which every row still writes.
+    Not under IndexShare (its capture keeps every row's selection), nor without the worker's
+    accepted counts. Under attention DP the draft MoE's round trip then holds every rank's
+    request count, so the decision is the group's: taken only when every rank is
+    generation-only with `p` rows a request (`spec_metadata`'s group counts, the same host lists
+    on every rank), never from this rank's batch alone."""
+    accepted = getattr(md, "qsa_mtp_num_accepted", None)
+    if core.one_rank or p <= 1 or share or accepted is None:
+        return None
+    counts = None
+    if core.dp_size > 1:
+        seqs = getattr(spec_metadata, "all_rank_num_seqs", None)
+        gens = getattr(spec_metadata, "all_rank_num_gens", None)
+        if seqs is None or gens is None or all_rank_num_tokens is None:
+            return None
+        counts = [int(c) for c in seqs]
+        if [int(c) for c in gens] != counts or [int(t) for t in all_rank_num_tokens] != [
+            p * c for c in counts
+        ]:
+            return None
+        assert counts[core.dp_rank] == gen_seqs and rows == p * gen_seqs, (
+            f"rank {core.dp_rank} drafts {gen_seqs} requests in {rows} rows, but the group's "
+            f"counts say {counts[core.dp_rank]} requests of {p} rows"
+        )
+    elif rows != p * gen_seqs:
+        return None
+    meta = (
+        md.qsa_visible_blocks[:rows],
+        md.qsa_sequence_lengths[:rows],
+        md.qsa_logical_positions[:rows],
+        md.qsa_req_idx_per_token[:rows],
+    )
+    if accepted.is_contiguous() and all(t.is_contiguous() for t in meta):
+        # The rows and the metadata at them in one launch.
+        cont, meta = draft_continue_select(accepted, gen_seqs, p, meta)
+    else:
+        last = torch.clamp(accepted[:gen_seqs].to(torch.int64) - 1, min=0, max=p - 1)
+        cont = torch.arange(gen_seqs, dtype=torch.int64, device=last.device) * p + last
+        meta = tuple(torch.index_select(t, 0, cont) for t in meta)
+    return _DraftContinue(cont, *meta, counts)
+
+
+def _draft_rows(cont: torch.Tensor, operands: dict) -> dict:
+    """`operands` at rows `cont`: the 2-D ones with unit column stride in one launch
+    (`draft_rows_gather`), any other one with `index_select`. A `[T, h, d]` index query is
+    gathered flat and comes back `[rows, h, d]`."""
+    out, flat = {}, {}
+    for name, t in operands.items():
+        f = t.reshape(t.shape[0], -1) if name == "q_index" else t
+        if f.dim() == 2 and f.stride(1) == 1:
+            flat[name] = f
+        else:
+            out[name] = torch.index_select(t, 0, cont)
+    if flat:
+        out.update(zip(flat, draft_rows_gather(cont, tuple(flat.values()))))
+    if "q_index" in flat:
+        q = operands["q_index"]
+        out["q_index"] = out["q_index"].view(cont.shape[0], *q.shape[1:])
+    return out
+
+
 def _hc_first(core, normed, first, with_inject):
     """A hyper-connection mixer's first half: the first projection over
     `[down; block_inject; 0]` (fp32 logits), then the SiLU and injection activations.
     Returns `(low, inject)`; `inject` is None without `with_inject`. Up to
     `_HC_TC_FIRST_MAX_ROWS` rows (a per-capture constant) it is one tcgen05 launch; larger
-    steps run cuBLAS's fp32 logits and the activation kernel."""
-    if normed.shape[0] <= _HC_TC_FIRST_MAX_ROWS:
+    steps run cuBLAS's fp32 logits and the activation kernel. With `core.hc_tiles`
+    (`DP_HC_TILES_ENV`) the launch takes the 64-row tile or the rows-on-N kernel at their rows
+    (bitwise)."""
+    rows = normed.shape[0]
+    if rows <= _HC_TC_FIRST_MAX_ROWS:
+        if core.hc_tiles:
+            if with_inject and _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1]:
+                return qwen4_exp_hc_decode_tc_first(
+                    normed, first, core.hc_lowrank, core.hc_count, True, rows_on_n=True
+                )
+            if _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]:
+                return qwen4_exp_hc_decode_tc_first(
+                    normed, first, core.hc_lowrank, core.hc_count, with_inject, tm=64
+                )
         return qwen4_exp_hc_decode_tc_first(
             normed, first, core.hc_lowrank, core.hc_count, with_inject
         )
@@ -2877,12 +3994,26 @@ def _hc_first(core, normed, first, with_inject):
     )
 
 
-def _hc_mixer(core, normed, first, up, with_inject):
+def _hc_mixer(core, normed, first, up, with_inject, release: bool = False):
     """One hyper-connection mixer from the site's normed stream: `_hc_first`, then the up
     projection with the sigmoid gate and the stream mean in its epilogue. Returns
-    `(mixed, inject)`; `inject` is None without `with_inject` (the stack-final mixer)."""
+    `(mixed, inject)`; `inject` is None without `with_inject` (the stack-final mixer).
+    `release` (`DP_INPROJ_RELEASE_ENV`, trunk site A only): the up kernel releases its
+    dependents before its own wait; the caller answers for the launch after it (one that reads
+    `mixed` after its own wait). With `core.hc_tiles` the up kernel runs on 64-row tiles at
+    `_HC_TILE64_ROWS` rows, and at `_HC_UP2_ROWS` rows unless it releases (bitwise)."""
     low, inject = _hc_first(core, normed, first, with_inject)
-    return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
+    rows = normed.shape[0]
+    tm = 128
+    if core.hc_tiles and (
+        _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]
+        or (not release and _HC_UP2_ROWS[0] <= rows <= _HC_UP2_ROWS[1])
+    ):
+        tm = 64
+    if tm == 128 and not release:
+        return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
+    mixed = qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count, release_early=release, tm=tm)
+    return mixed, inject
 
 
 def _hc_moe_mixer(core, normed, L: _LayerWeights):
@@ -2943,7 +4074,9 @@ def _decode_router_mid(core, L: _LayerWeights, captured: bool):
     can) and takes `_decode_router`; an eager one can meet another rank's prefill step and takes
     the prefill router, `cublas_mm`."""
     if core.dp_size > 1:
-        return _decode_router if captured else cublas_mm
+        if not captured:
+            return cublas_mm
+        return getattr(core, "_router_front", None) or _decode_router
     fallback = core.decode_mm if core.one_rank else _decode_router
     if L.router_m is None:
         return fallback
@@ -2960,6 +4093,563 @@ def _decode_router(x, router):
     if x.shape[0] <= _ROUTER_LOW_M_MAX_ROWS:
         return low_m_bf16_mm(x, router, _DECODE_PROJ_PDL)
     return cublas_mm(x, router)
+
+
+class _RouteFront:
+    """What `DP_ROUTE_FRONT_ENV` built (`_route_front_build`): per gathered row count its pinned
+    tactic and, a layer, the int32 table buffer and its six views, made at build so a capture
+    neither allocates nor fills one; `layers` maps a layer's FC1 weight to its index."""
+
+    def __init__(self, runner) -> None:
+        self.runner = runner
+        self.tactics: dict = {}
+        # Per row count whose pinned tactic the runner does not list (dep8): the listed tactic
+        # the build check holds its window output to.
+        self.refs: dict = {}
+        self.views: dict = {}
+        self.flats: dict = {}
+        self.layers: dict = {}
+
+
+def _route_front_tactic(runner, core, rows: int) -> tuple | None:
+    """The pinned tactic of `rows` gathered rows: `_ROUTE_FRONT_TACTICS`'s where the runner lists
+    it for this window, else `_ROUTE_FRONT_TACTICS_BASE`'s, else None."""
+    valid = [
+        list(t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    ]
+    for table in (_ROUTE_FRONT_TACTICS, _ROUTE_FRONT_TACTICS_BASE):
+        tactic = next(t for below, t in table if rows < below)
+        if list(tactic) in valid:
+            return tactic
+    return None
+
+
+def _route_front_w64_tactic(runner, core, rows: int) -> tuple:
+    """dep8's `(tactic, ref)` for `rows` gathered rows over its 64-expert window:
+    `_ROUTE_FRONT_TACTICS_W64`'s tactic, and None where the runner lists it, else a tactic it lists
+    (of the same tile where it lists one) that the build holds the pinned one's window output to;
+    `(None, None)` where the runner lists nothing."""
+    valid = sorted(
+        tuple(int(v) for v in t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    )
+    tactic = next((t for below, t in _ROUTE_FRONT_TACTICS_W64 if rows < below), None)
+    if tactic is None or not valid:
+        return None, None
+    if tactic in valid:
+        return tactic, None
+    same_tile = [t for t in valid if t[0] == tactic[0]]
+    return tactic, (same_tile or valid)[0]
+
+
+def _tep_route_front_tactic(runner, core, rows: int) -> tuple | None:
+    """A tep4 rank's pinned tactic for `rows` rows: `DECODE_TACTICS`' pin for the row count's
+    bucket (measured on the whole layer, where `fp4_block_scale_moe_renorm_routed` runs it; its
+    window calls take the AutoTuner's) where the runner lists it for the window, else None."""
+    tactic = _MOE_DECODE_TACTICS.get(last_positive_power_of_2(rows))
+    valid = [
+        list(t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    ]
+    return tactic if tactic is not None and list(tactic) in valid else None
+
+
+def _route_front_run(
+    core, st: _RouteFront, x, L: _LayerWeights, layer: int, logits, fp4=None, finalize=True
+):
+    """The route front and the pre-routed runner over rows `x` (a built row count) and their
+    router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered from
+    0 on `fp4` (the MoE site's NVFP4 codes, the same bits as the front's) or the front's own
+    codes; `out` is its finalized output, or with `finalize` False its FC2 rows in the tables'
+    permuted order (the slot -> row table is `st.views[rows][layer][0]`, the weights `wts`)."""
+    rows = x.shape[0]
+    tactic = st.tactics[rows]
+    tile = int(tactic[0])
+    xq, xsf, ids, wts = moe_route_front(
+        logits, x, L.moe_gscale, st.flats[rows][layer], tile, core.expert_offset, core.local_experts
+    )
+    xq_in, xsf_in = (xq, xsf) if fp4 is None else fp4
+    out = st.runner.run_moe_prerouted(
+        None,
+        None,
+        xq_in,
+        # The runner reads the linear block scales flat.
+        torch.reshape(xsf_in, [-1]).view(torch.float8_e4m3fn),
+        L.fc1_w,
+        L.fc1_s,
+        None,
+        None,
+        None,
+        None,
+        L.fc2_w,
+        L.fc2_s,
+        None,
+        L.out1_scale,
+        L.out1_gate_scale,
+        L.out2_scale,
+        core.local_experts,
+        core.topk,
+        None,
+        None,
+        core.expert_inter,
+        0,
+        core.local_experts,
+        None,
+        ROUTING_RENORMALIZE,
+        finalize,
+        list(tactic),
+        wts,
+        ids,
+        None,
+        *st.views[rows][layer],
+        tile,
+    )[0]
+    return out, xq, xsf, ids, wts
+
+
+def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows: int, gen):
+    """One layer at one row count, eagerly, against today's chain at the same tactic (router
+    logits -> `fp4_quantize` -> the runner's own routing over this rank's window), or at the
+    listed reference tactic where the pinned one is not listed (`st.refs`), and the tables
+    against their meaning: "" when the window output, the NVFP4 codes and scales, the experts and
+    the weights are bitwise equal and the tables hold, else what differs."""
+    x = torch.randn([rows, core.hidden], generator=gen, device=L.router.device).to(torch.bfloat16)
+    logits = cublas_mm(x, L.router)
+    xq0, xsf0 = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False)
+    ref = st.runner.run_moe(
+        logits,
+        None,
+        xq0,
+        torch.reshape(xsf0, [-1]).view(torch.float8_e4m3fn),
+        L.fc1_w,
+        L.fc1_s,
+        None,
+        None,
+        None,
+        None,
+        L.fc2_w,
+        L.fc2_s,
+        None,
+        L.out1_scale,
+        L.out1_gate_scale,
+        L.out2_scale,
+        core.num_experts,
+        core.topk,
+        None,
+        None,
+        core.expert_inter,
+        core.expert_offset,
+        core.local_experts,
+        None,
+        ROUTING_RENORMALIZE,
+        True,
+        list(st.refs.get(rows) or st.tactics[rows]),
+        None,
+        None,
+        None,
+    )[0]
+    ids0, wts0 = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=torch.bfloat16)
+    out, xq, xsf, ids, wts = _route_front_run(core, st, x, L, layer, logits)
+    bad = []
+    for name, got, want in (
+        ("window output", out, ref),
+        ("NVFP4 codes", xq, xq0),
+        ("NVFP4 block scales", xsf, xsf0),
+        ("selected experts", ids.to(torch.int64), ids0.to(torch.int64)),
+        ("routing weights", wts, wts0),
+    ):
+        if got.numel() != want.numel() or not torch.equal(
+            got.reshape(-1).view(torch.uint8), want.reshape(-1).view(torch.uint8)
+        ):
+            bad.append(name)
+    tables = _route_front_check_tables(
+        st.views[rows][layer], ids, core.expert_offset, core.local_experts, int(st.tactics[rows][0])
+    )
+    if tables:
+        bad.append(f"tables ({tables})")
+    return ", ".join(bad)
+
+
+def _route_front_build(core, layers, device) -> _RouteFront | None:
+    """`DP_ROUTE_FRONT_ENV` at an attention-DP rank, `TEP_FAST_DECODE_ENV` at a tep4 rank
+    (`core.tep_fast`), read once at build (`post_load_weights`, `layers` the decode target's):
+    None where it is off or cannot take effect (another layout, not the trtllm-gen trunk MoE over
+    CUDA weights, another routing geometry, no CUDA-graph batch size in the row range) or where
+    the op is not certified (`moe_route_front.ARCHS`, SM103, and its windows: dep4's 128 experts
+    over the gathered rows, `_ROUTE_FRONT_TACTICS`; dep8's 64, `_route_front_w64_tactic`; tep4's
+    own rows up to `_TEP_ROUTE_FRONT_MAX_ROWS`, `_tep_route_front_tactic`). For every row count a
+    graph batch size gives it compiles the route front at the pinned tactic's tile, makes each
+    layer's table buffer (pre-filled with valid row indices: the kernel writes only the live
+    entries), and checks every layer once at a row count that rotates over the built ones
+    (`_route_front_check`). A row count pinned to a tactic the runner does not list whose check
+    fails keeps the runner's routing (one warning); any other failed check leaves the whole
+    switch off, with one warning."""
+    dp = core.dp_size > 1
+    if dp and not _switch(DP_ROUTE_FRONT_ENV, default=True):
+        return None
+    if not (
+        (dp or core.tep_fast)
+        and not core.one_rank
+        and core.trunk_moe_backend == "TRTLLM"
+        and device.type == "cuda"
+        and (core.num_experts, core.topk) == (_ROUTE_FRONT_EXPERTS, _ROUTE_FRONT_TOP_K)
+        and core.local_experts
+        == (_ROUTE_FRONT_WINDOWS.get(core.dp_size) if dp else _ROUTE_FRONT_WINDOW)
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    ):
+        return None
+    # Under attention DP the group's gathered rows, at a tep4 rank its own.
+    per_batch = core.dp_size * core.max_verify_rows
+    lo, hi = (
+        (_ROUTE_FRONT_MIN_ROWS, _ROUTE_FRONT_MAX_ROWS) if dp else (1, _TEP_ROUTE_FRONT_MAX_ROWS)
+    )
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    rows_list = sorted({per_batch * int(b) for b in sizes if lo <= per_batch * int(b) <= hi})
+    if not rows_list:
+        return None
+
+    def pin(runner, rows: int) -> tuple:
+        """`(tactic, listed reference or None)` of `rows`."""
+        if dp and core.local_experts == _ROUTE_FRONT_WINDOWS[8]:
+            return _route_front_w64_tactic(runner, core, rows)
+        return (_route_front_tactic if dp else _tep_route_front_tactic)(runner, core, rows), None
+
+    st = _RouteFront(_moe_runner())
+    with torch.cuda.device(device):
+        for rows in rows_list:
+            tactic, ref = pin(st.runner, rows)
+            if tactic is None or not _route_front_compile(
+                rows, core.hidden, core.hidden, core.local_experts, int(tactic[0])
+            ):
+                continue
+            n = sum(table_sizes(rows, core.topk, core.local_experts, int(tactic[0])))
+            fill = (torch.arange(n, device=device) % rows).to(torch.int32)
+            st.tactics[rows] = tactic
+            if ref is not None:
+                st.refs[rows] = ref
+            st.flats[rows] = [fill.clone() for _ in range(core.num_layers)]
+            st.views[rows] = [
+                table_views(flat, rows, core.topk, core.local_experts, int(tactic[0]))
+                for flat in st.flats[rows]
+            ]
+        for i, L in enumerate(layers):
+            st.layers[L.fc1_w.data_ptr()] = i
+        built = sorted(st.tactics)
+        gen = torch.Generator(device=device).manual_seed(20261119)
+        for j in range(max(len(layers), len(built)) if built else 0):
+            rows, i = built[j % len(built)], j % len(layers)
+            if rows not in st.tactics:
+                continue
+            bad = _route_front_check(core, st, layers[i], i, rows, gen)
+            if bad and rows in st.refs:
+                logger.warning(
+                    f"{DP_ROUTE_FRONT_ENV}: layer {i} at {rows} gathered rows on the tactic "
+                    f"{list(st.tactics[rows])}, which the runner does not list, differs from its "
+                    f"listed {list(st.refs[rows])} ({bad}); that row count keeps the runner's "
+                    "routing"
+                )
+                for table in (st.tactics, st.refs, st.flats, st.views):
+                    table.pop(rows, None)
+            elif bad:
+                logger.warning(
+                    f"{DP_ROUTE_FRONT_ENV if dp else TEP_FAST_DECODE_ENV}: layer {i} at {rows} "
+                    f"rows differs from the runner's own routing ({bad}); every MoE block keeps it"
+                )
+                return None
+        built = sorted(st.tactics)
+        torch.cuda.synchronize(device)
+    if not built:
+        return None
+    logger.info(
+        f"MoE route front: rank {core.mapping.tp_rank} of {core.mapping.tp_size}, "
+        f"{'gathered ' if dp else ''}rows {built}, tactics {[st.tactics[r] for r in built]}"
+    )
+    return st
+
+
+def _route_front_experts(
+    core, st: _RouteFront, x, L: _LayerWeights, fp4=None, router_mm=None
+) -> torch.Tensor | None:
+    """`_routed_experts` of a captured generation-only step over the route front, or None where
+    no route front was built for the row count (the caller's path). `fp4` is the MoE site's
+    NVFP4 activation at a tep4 rank (the runner reads it), None under attention DP; `router_mm`
+    the step's decode router (`_decode_router` by default, or the router front)."""
+    rows = x.shape[0]
+    layer = st.layers.get(L.fc1_w.data_ptr())
+    if rows not in st.tactics or layer is None or x.stride(1) != 1 or x.stride(0) != core.hidden:
+        return None
+    logits = (router_mm or _decode_router)(x, L.router)
+    return _route_front_run(core, st, x, L, layer, logits, fp4)[0]
+
+
+class _DpRouterFront:
+    """What `DP_ROUTER_FRONT_ENV` built (`_dp_router_front_build`), and the decode router of a
+    captured step (`_decode_router_mid`): `front(x, router)` runs `mid_rows_mm` over the layer's
+    bf16 router (`mids`, by the router's pointer) at a gathered row count in `rows`, else
+    `_decode_router`. The row count alone decides, so every rank of the group runs one kernel.
+    `release_rows`: the gathered row counts whose Lamport gather releases its dependents."""
+
+    def __init__(self, rows: frozenset, release_rows: frozenset, mids: dict) -> None:
+        self.rows = rows
+        self.release_rows = release_rows
+        self.mids = mids
+
+    def __call__(self, x: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] in self.rows:
+            return mid_rows_mm_op(x, self.mids[router.data_ptr()])
+        return _decode_router(x, router)
+
+
+def _dp_router_front_check(mw, rows: int, gen, device) -> int:
+    """Logits of the bf16 router kernel at `rows` random rows off the fp32 product by more than
+    one bf16 ulp (plus the K sum's rounding): their count."""
+    x = torch.randn([rows, mw.k], generator=gen, device=device).to(torch.bfloat16)
+    got = mid_rows_mm_op(x, mw).float()
+    w = mw.w.float()
+    ref = x.float() @ w.t()
+    ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(1e-30))) - 7)
+    tol = ulp + 2e-5 * (x.float().abs() @ w.abs().t())
+    return int(((got - ref).abs() > tol).sum())
+
+
+def _dp_router_front_build(core, layers, device) -> "_DpRouterFront | None":
+    """`DP_ROUTER_FRONT_ENV`, read once at build (`post_load_weights`, after the route front).
+    None with the switch unset, or with one warning where it cannot take effect: not a dep4 /
+    dep8 rank on SM103, no Lamport transport, no graph row count in either range. Otherwise the
+    releasing gather and the bf16 router of every graph row count in range are compiled now (no
+    serving step or capture meets a compile) and each router row count is checked against the
+    fp32 product of layer 0's router. Collective: the group engages together or not at all."""
+    if not _switch(DP_ROUTER_FRONT_ENV):
+        return None
+    why = ""
+    trip = core._lamport_trip
+    if core.dp_size not in _DP_ROUTER_FRONT_RELEASE_ROWS or trip is None:
+        why = (
+            f"it serves a dep4 or dep8 rank on the Lamport transport ({DP_MOE_COMM_ENV}); this "
+            f"rank: attention DP size {core.dp_size}, transport "
+            f"{'lamport' if trip is not None else 'nccl'}"
+        )
+    elif torch.cuda.get_device_capability(device) != archs.SM_103:
+        why = "it serves SM103 only"
+    if why:
+        logger.warning(f"{DP_ROUTER_FRONT_ENV} is set but ignored: {why}")
+        return None
+    per_batch = core.dp_size * core.max_verify_rows
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    graph_rows = {per_batch * int(b) for b in sizes}
+    lo, hi = _DP_ROUTER_FRONT_RELEASE_ROWS[core.dp_size]
+    release = frozenset(r for r in graph_rows if lo <= r <= hi)
+    lo, hi = _DP_ROUTER_FRONT_ROWS
+    rows = frozenset(r for r in graph_rows if lo <= r <= min(hi, _MID_ROWS_MAX))
+    mids, error = {}, ""
+    try:
+        with torch.cuda.device(device):
+            if release:
+                trip.releasing_gather_fn()
+            for L in layers:
+                mids[L.router.data_ptr()] = MidWeight(L.router.t())
+            if rows:
+                mw = mids[layers[0].router.data_ptr()]
+                mid_rows_precompile(mw, min(rows), max(rows))
+                gen = torch.Generator(device=device).manual_seed(20261125)
+                for r in sorted(rows):
+                    off = _dp_router_front_check(mw, r, gen, device)
+                    if off:
+                        error = (
+                            f"the bf16 router at {r} rows is off the fp32 product on {off} logits"
+                        )
+                        break
+            torch.cuda.synchronize(device)
+    except Exception as e:  # noqa: BLE001 -- every rank decides together below
+        error = f"{type(e).__name__}: {e}"
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    errors = [e for e in Distributed.get(core.mapping).tp_allgather(error) if e]
+    if errors or not (rows or release):
+        logger.warning(
+            f"{DP_ROUTER_FRONT_ENV} is set but not engaged at rank {core.dp_rank}: "
+            f"{errors[0] if errors else 'no CUDA-graph row count in either range'}"
+        )
+        return None
+    logger.info(
+        f"DP router front: rank {core.dp_rank} of {core.dp_size}, bf16 router at gathered rows "
+        f"{sorted(rows)}, releasing gather at {sorted(release)}"
+    )
+    return _DpRouterFront(rows, release, mids)
+
+
+class _TepFinar:
+    """What `TEP_FINAR_ENV` built (`_tep_finar_build`): the rank's workspace and launch (`op`),
+    the row counts it serves, the trunk MoE launches a step, and the layer of the last launch
+    (host side, to hold the slot sequence)."""
+
+    def __init__(self, op, rows: tuple, layers: int) -> None:
+        self.op = op
+        self.rows = rows
+        self.layers = layers
+        self.prev: int | None = None
+
+
+def _tep_finar_selfcheck(core, op, device, rows: int, slot: int) -> tuple:
+    """One eager launch at `rows` rows on synthetic window outputs (slots of other ranks'
+    windows, a row with no local slot, -0.0 lanes, values over 2^-12..2^8) against the entry's
+    reference over every rank's operands. `(ok, lanes that differ from the runner's finalize +
+    core.tp_sum)`: the second is reported, not required (the engine's all-reduce strategy may sum
+    in another order)."""
+    import torch.distributed as dist
+
+    world, rank = _TEP_FINAR.WORLD, core.mapping.tp_rank
+    g = torch.Generator(device="cpu").manual_seed(9100 + 97 * rows + rank)
+    owner = (torch.arange(rows).unsqueeze(1) * 3 + torch.arange(core.topk).unsqueeze(0)) % world
+    owner[0] = (rank + 1) % world
+    mine = owner == rank
+    count = int(mine.sum())
+    perm = torch.full([rows, core.topk], -1, dtype=torch.int32)
+    perm[mine] = torch.randperm(count + 3, generator=g)[:count].to(torch.int32)
+    scale = torch.exp2(torch.randint(-12, 9, [count + 3, 1], generator=g).float())
+    fc2 = (torch.randn([count + 3, core.hidden], generator=g) * scale).to(torch.bfloat16)
+    fc2[:, ::37] = -0.0
+    wts = (torch.rand([rows, core.topk], generator=g) * 0.5 + 0.01).to(torch.bfloat16)
+    fc2, wts, perm = fc2.to(device), wts.to(device), perm.to(device)
+    got = op(fc2, wts, perm, rows, slot)
+    mine_ops = (fc2, wts, perm)
+    everyone = [None] * world
+    dist.all_gather_object(everyone, tuple(t.cpu() for t in mine_ops))
+    want = tep_finalize_allreduce.reference([tuple(t.to(device) for t in ops) for ops in everyone])
+    stock = core.tp_sum(_tep_finar_local(fc2, wts, perm))
+    torch.cuda.synchronize(device)
+    ok = tuple(got.shape) == (rows, core.hidden) and torch.equal(got, want)
+    return ok, int((got != stock).sum())
+
+
+def _tep_finar_local(fc2, wts, perm) -> torch.Tensor:
+    """The runner's finalize of one rank's window, emulated exactly (fp32, slot order)."""
+    acc = torch.zeros((perm.shape[0], fc2.shape[1]), dtype=torch.float32, device=fc2.device)
+    for k in range(perm.shape[1]):
+        idx = perm[:, k].long()
+        rows = fc2[idx.clamp_min(0)].float()
+        acc = torch.where((idx >= 0)[:, None], acc + wts[:, k : k + 1].float() * rows, acc)
+    return acc.to(torch.bfloat16)
+
+
+def _tep_finar_rows(core, device) -> tuple:
+    """The row counts the fused launch may serve: those up to `tep_finalize_allreduce.MAX_ROWS`
+    that the route front serves on EVERY rank of the group. Each rank builds and checks its route
+    front over its own window, so one rank can lack a row count, or the whole front, that the
+    others have; a block that took the fused launch on some ranks and `core.tp_sum` on another
+    would leave both waiting. One `core.tp_sum` of 0 / 1 flags (exact: small integers) agrees on
+    the intersection. Collective: every rank of the group calls it."""
+    st = core._route_front
+    mine = ()
+    if st is not None and len(st.layers) % _TEP_FINAR.SLOTS == 0:
+        mine = tuple(r for r in sorted(st.tactics) if r <= _TEP_FINAR.MAX_ROWS)
+    flags = torch.zeros([_TEP_FINAR.MAX_ROWS, core.hidden], dtype=torch.bfloat16, device=device)
+    for r in mine:
+        flags[0, r - 1] = 1.0
+    total = core.tp_sum(flags)[0, : _TEP_FINAR.MAX_ROWS].float().cpu()
+    return tuple(
+        r for r in range(1, _TEP_FINAR.MAX_ROWS + 1) if int(total[r - 1]) == _TEP_FINAR.WORLD
+    )
+
+
+def _tep_finar_build(core, device) -> "_TepFinar | None":
+    """`TEP_FINAR_ENV` at build, after the route front: None where it is off or cannot apply
+    (one warning, on every rank alike); else the workspace over the 4-rank torch group
+    (bootstrapped under MPI as the attention-DP Lamport transport is), every row count the
+    ranks agree on (`_tep_finar_rows`) checked eagerly on every rank, and the ranks' verdicts
+    reduced: a failure on any rank raises on every rank, since a rank cannot keep the stock sum
+    alone."""
+    mode = _tep_finar_mode()
+    if not mode:
+        return None
+    # Host values every rank of the group shares: the ranks decline together.
+    why = None
+    if not core.tep_fast:
+        why = f"it needs a tep4 rank with {TEP_FAST_DECODE_ENV} on"
+    elif core.mapping.is_multi_node():
+        why = "the TP group spans nodes"
+    elif (core.hidden, core.topk) != (_TEP_FINAR.HIDDEN, _TEP_FINAR.TOP_K):
+        why = f"hidden {core.hidden}, top-{core.topk}"
+    if why is None:
+        rows = _tep_finar_rows(core, device)
+        if not rows:
+            why = (
+                f"the tep4 route front (SM103, CUDA graphs of 1-4 requests, MoE layers a "
+                f"multiple of {_TEP_FINAR.SLOTS}) serves no row count up to "
+                f"{_TEP_FINAR.MAX_ROWS} on every rank"
+            )
+    if why is not None:
+        logger.warning(f"{TEP_FINAR_ENV} is set but ignored: {why}")
+        return None
+    st = core._route_front
+    import torch.distributed as dist
+
+    from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
+
+    rank = core.mapping.tp_rank
+    ensure_cutedsl_torch_distributed(_TEP_FINAR.WORLD)
+    if not dist.is_initialized() or dist.get_world_size() != _TEP_FINAR.WORLD:
+        raise RuntimeError(f"{TEP_FINAR_ENV} found no {_TEP_FINAR.WORLD}-rank torch group")
+    if dist.get_rank() != rank:
+        raise RuntimeError(f"{TEP_FINAR_ENV}: the torch WORLD rank order differs from the TP one")
+    with torch.cuda.device(device):
+        op = tep_finar_build(rank, get_env_enable_pdl(), early=mode == "early")
+        verdicts = [
+            _tep_finar_selfcheck(core, op, device, r, i % _TEP_FINAR.SLOTS)
+            for i, r in enumerate(rows)
+        ]
+        ok = torch.tensor([int(all(v[0] for v in verdicts))], dtype=torch.int32, device=device)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+    if not int(ok.item()):
+        raise RuntimeError(
+            f"{TEP_FINAR_ENV}: the fused finalize all-reduce failed its build check on a rank "
+            f"(this rank, rows {list(rows)}: {[v[0] for v in verdicts]}); unset the switch"
+        )
+    logger.info(
+        f"MoE finalize all-reduce ({TEP_FINAR_ENV}={mode}): rank {rank} of {_TEP_FINAR.WORLD}, "
+        f"rows {list(rows)}, {op.workspace_bytes / (1 << 20):.2f} MiB, lanes that differ from "
+        f"the runner's finalize + tp_sum at the build check {[v[1] for v in verdicts]}"
+    )
+    return _TepFinar(op, rows, len(st.layers))
+
+
+def _tep_finar_routed(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm):
+    """A tep4 captured block's routed experts summed over the group in one launch (the route
+    front, the runner without its finalize, `tep_finalize_allreduce`), or None where the block
+    keeps the route front's finalized path and `core.tp_sum` (another row count, an eager step).
+    Host values only, the same on every rank (`fin.rows` the row counts every rank's route
+    front serves)."""
+    st = core._route_front
+    rows = x.shape[0]
+    layer = st.layers.get(L.fc1_w.data_ptr())
+    if not (
+        rows in fin.rows
+        and rows in st.tactics
+        and layer is not None
+        and fp4 is not None
+        and router_mm is _decode_router
+        and torch.cuda.is_current_stream_capturing()
+        and x.stride(1) == 1
+        and x.stride(0) == core.hidden
+    ):
+        return None
+    if fin.prev is not None and layer != (fin.prev + 1) % fin.layers:
+        raise RuntimeError(
+            f"{TEP_FINAR_ENV}: MoE layer {layer} follows layer {fin.prev}; three consecutive "
+            "launches must take three slots"
+        )
+    fin.prev = layer
+    logits = _decode_router(x, L.router)
+    fc2, _, _, _, wts = _route_front_run(core, st, x, L, layer, logits, fp4, finalize=False)
+    perm = st.views[rows][layer][0].view(rows, core.topk)
+    return tep_finalize_allreduce(fc2, wts, perm, rows, layer % _TEP_FINAR.SLOTS, fin.op)
 
 
 def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) -> torch.Tensor:
@@ -2980,9 +4670,23 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
 
     At one rank with the CuteDSL-layout copy (`moe_prefill_copy`) a launch of
     `_CUTE_DSL_MOE_MIN_ROWS` to `_CUTE_DSL_MOE_MAX_ROWS` rows runs the CuteDSL MoE over it
-    instead, in one call. On the CuteDSL backend (one rank) every launch is
-    `_cute_dsl_routed`, in one call."""
+    instead, in one call. Without it, a context launch (the prefill router) of more than
+    `_MOE_MAX_ROWS` and at most `_MOE_ONE_LAUNCH_MAX_ROWS` rows is one runner call over the
+    chunks' router logits: the same bits as the chunks. On the CuteDSL backend (one rank) every
+    launch is `_cute_dsl_routed`, in one call."""
     rows = x.shape[0]
+    route_front = getattr(core, "_route_front", None)
+    if (
+        route_front is not None
+        # Under attention DP the gathered rows come unquantized; a tep4 rank's come with the
+        # site's codes.
+        and (fp4 is None) == (core.dp_size > 1)
+        and (router_mm is _decode_router or isinstance(router_mm, _DpRouterFront))
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        routed = _route_front_experts(core, route_front, x, L, fp4, router_mm)
+        if routed is not None:
+            return routed
     if core.trunk_moe_backend == "CUTEDSL":
         xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False) if fp4 is None else fp4
         routed_out = torch.empty([rows, core.hidden], dtype=x.dtype, device=x.device)
@@ -3003,6 +4707,37 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
             core.num_experts,
             core.topk,
             memset_stream=core._moe_memset_stream,
+        )
+    if (
+        core.one_rank
+        and router_mm is cublas_mm
+        and fp4 is not None
+        and _MOE_MAX_ROWS < rows <= _MOE_ONE_LAUNCH_MAX_ROWS
+    ):
+        # The router GEMM keeps its chunk-sized calls: cuBLAS picks its kernel by the row count,
+        # and another kernel could move a logit's last bit and flip a near-tie of the top-k.
+        logits = torch.cat(
+            [
+                router_mm(x[lo : lo + _MOE_MAX_ROWS], L.router)
+                for lo in range(0, rows, _MOE_MAX_ROWS)
+            ]
+        )
+        return fp4_block_scale_moe_renorm_routed(
+            logits,
+            fp4[0],
+            torch.reshape(fp4[1], [-1]).view(torch.float8_e4m3fn),
+            L.fc1_w,
+            L.fc1_s,
+            L.fc2_w,
+            L.fc2_s,
+            L.out1_scale,
+            L.out1_gate_scale,
+            L.out2_scale,
+            core.num_experts,
+            core.topk,
+            core.expert_inter,
+            core.expert_offset,
+            core.local_experts,
         )
     sf_cols = x.shape[1] // _SF_VEC
     parts = []
@@ -3145,9 +4880,13 @@ def _moe_block(
     side.wait_stream(main)
     with torch.cuda.stream(side):
         shared, gate_logits = _shared_expert(core, x, L, decode_gemm)
-    routed = core.expert_sum(
-        lambda rows: _routed_experts(core, rows, L, fp4, router_mm), x, pad_rows
-    )
+    routed = None
+    if getattr(core, "_tep_finar", None) is not None:
+        routed = _tep_finar_routed(core, core._tep_finar, x, L, fp4, router_mm)
+    if routed is None:
+        routed = core.expert_sum(
+            lambda rows: _routed_experts(core, rows, L, fp4, router_mm), x, pad_rows
+        )
     main.wait_stream(side)
     return routed, gate_logits, shared
 
@@ -3302,12 +5041,39 @@ def _live_score_columns(core, md, batch: int) -> int:
 
 
 def _selection(
-    core, scores, visible_blocks, logical, seq_lens_q, topk_indices, row_starts, out, live_cols=None
+    core,
+    scores,
+    visible_blocks,
+    logical,
+    seq_lens_q,
+    topk_indices,
+    row_starts,
+    out,
+    live_cols=None,
+    context=False,
 ):
     """The selected token indices of `scores`' rows into `out` `[rows, token_topk +
-    compress_ratio - 1]`: the canonical block top-k and its expansion in one launch, or, for
-    a score table that kernel does not serve, the selection and the expansion apart (the
-    rewrite bounded by `live_cols`, `_select`)."""
+    compress_ratio - 1]`: the canonical block top-k and its expansion in one launch (a cluster
+    of CTAs a row up to `qsa_topk_expand_cluster`'s rows, an attention-DP rank's
+    `DP_TOPK_CLUSTER_ROWS_ENV` for generation rows, else one CTA a row; a context chunk's rows,
+    `context`, on the one-CTA op's context launch), or, for a score table neither serves, the
+    selection and the expansion apart (the rewrite bounded by `live_cols`, `_select`). They all
+    give the same selection."""
+    cluster_rows = _TOPK_CLUSTER_MAX_ROWS
+    if not context:
+        cluster_rows = getattr(core, "dp_topk_cluster_rows", _TOPK_CLUSTER_MAX_ROWS)
+    if _topk_expand_cluster_supports(scores, max_rows=cluster_rows):
+        qsa_topk_expand_cluster(
+            scores,
+            visible_blocks,
+            logical,
+            seq_lens_q,
+            topk_indices,
+            core.compress_ratio,
+            core.token_topk,
+            out=out,
+        )
+        return
     if _topk_expand_supports(scores):
         qsa_topk_expand_decode(
             scores,
@@ -3318,6 +5084,7 @@ def _selection(
             core.compress_ratio,
             core.token_topk,
             out=out,
+            context=context,
         )
         return
     _select(core, scores, row_starts, visible_blocks, topk_indices, live_cols)
@@ -3387,6 +5154,7 @@ def _score_and_select(
                 row_starts[a:b],
                 selected[a:b],
                 live_cols,
+                context=context_rows,
             )
 
 
@@ -3553,15 +5321,34 @@ def _fp8_context_pages(md, tpb: int) -> int:
     return int(((lens + (tpb - 1)) // tpb).sum())
 
 
+def _fp8_context_groups(core, md, tpb: int, fp8_pages: int) -> list | None:
+    """A step's context rows in groups of consecutive requests whose pages each fit the row-tile
+    scratch (`_FP8_ROWTILE_MAX_SCRATCH`), `(first row, end row, pages)` a group, or None where
+    one launch fits. Without it a step over more history than the scratch holds (three long
+    requests in one batch) falls back to the per-row kernel for every row."""
+    page_bytes = 2 * core.heads_kv * tpb * core.head_dim * 2  # K and V, bf16
+    max_pages = max(1, _FP8_ROWTILE_MAX_SCRATCH // page_bytes)
+    if fp8_pages <= max_pages or md.num_contexts < 2:
+        return None
+    num_contexts = md.num_contexts
+    pages = ((md.kv_lens_runtime[:num_contexts] + (tpb - 1)) // tpb).tolist()
+    rows = md.seq_lens[:num_contexts].tolist()
+    return [
+        (first_row, end_row, sum(pages[first:end]))
+        for first, end, first_row, end_row in _nvfp4_context_groups(pages, rows, max_pages)
+    ]
+
+
 def _sparse_gqa_rowtile(
-    core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages
+    core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages, out=None
 ):
     """The row-tile pass over a context launch, or None where it does not serve it. A bf16
     pool is read in place. Over an fp8 pool, request slot `s`'s first `ceil((p_s + 1) / tpb)`
     pages (`p_s` the highest position the launch's rows hold there) are widened, exactly, into
     a bf16 scratch pool addressed through a table of `block_table`'s shape; `fp8_pages` is
     their host count (`_fp8_context_pages`), read back from the device when not given. A
-    scratch past `_FP8_ROWTILE_MAX_SCRATCH` bytes declines (None)."""
+    scratch past `_FP8_ROWTILE_MAX_SCRATCH` bytes declines (None). `out` (`[rows, Hq, D]`,
+    contiguous) is where the pass writes, or None for a fresh tensor."""
     k_cache, v_cache, table = kv.k, kv.v, block_table
     if kv.k.dtype == torch.float8_e4m3fn:
         # Each slot's highest position among the launch's rows, -1 for a slot it does not
@@ -3603,6 +5390,7 @@ def _sparse_gqa_rowtile(
         softmax_scale=core.softmax_scale,
         query_positions=query_positions,
         compress_ratio=core.compress_ratio,
+        out=out,
     )
 
 
@@ -3618,17 +5406,23 @@ def _sparse_gqa(
     fp8_pages=None,
     output_gate=None,
     rows_per_request=1,
+    rowtile_out=None,
+    rowtile_min_rows=None,
 ):
     """Sparse GQA over the layer's paged pool. `query_positions` is a context row's bound on
     its scan (the prefill pair with `compress_ratio`), or None for decode rows. A context
-    launch of `_ROWTILE_MIN_ROWS` rows or more over a bf16 or fp8 pool takes the row-tile
-    pass (`fp8_pages`: see `_sparse_gqa_rowtile`). Over an NVFP4 pool context rows take the
-    prefill kernel and decode rows the split-K decode kernel."""
+    launch of `rowtile_min_rows` (default `_ROWTILE_MIN_ROWS`) rows or more over a bf16 or fp8
+    pool takes the row-tile pass (`fp8_pages`: see `_sparse_gqa_rowtile`), which writes
+    `rowtile_out` (`[rows, Hq, D]`, contiguous) when given and returns it. Over an NVFP4 pool
+    context rows take the prefill kernel and decode rows the split-K decode kernel."""
+    if rowtile_min_rows is None:
+        rowtile_min_rows = _ROWTILE_MIN_ROWS
     if kv.k_scale is None:
-        if query_positions is not None and q.shape[0] >= _ROWTILE_MIN_ROWS:
+        if query_positions is not None and q.shape[0] >= rowtile_min_rows:
             out = _sparse_gqa_rowtile(
-                core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages
-            )
+                core, kv, q, block_table, selected, request_indices, tpb, query_positions,
+                fp8_pages, rowtile_out,
+            )  # fmt: skip
             if out is not None:
                 return out
         return qsa_paged_sparse_gqa(
@@ -3691,6 +5485,90 @@ def _sparse_gqa(
         core.softmax_scale,
         query_positions=query_positions,
         compress_ratio=core.compress_ratio,
+    )
+
+
+def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tpb, p: int):
+    """`qsa_paged_index_scores` (visible blocks only) of a sparse generation step's rows, `p`
+    consecutive rows a request: from `_INDEX_GROUP_MIN_ROWS` rows one key gather a request, and
+    from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups on the CuTe kernel where it serves them."""
+    rows = q.shape[0]
+    rpr = p if p > 1 and rows >= _INDEX_GROUP_MIN_ROWS else 1
+    if (
+        rpr > 1
+        and rows >= _INDEX_SCORES_CUTE_MIN_GROUPS * rpr
+        and logical.dtype == torch.int64
+        and req_idx.dtype == torch.int32
+        and _index_groups_cute_serves(q, index_cache, rpr)
+    ):
+        return index_scores_groups_cute(
+            q, index_cache, block_table, logical, req_idx, tpb, core.compress_ratio,
+            _INDEX_SCORES_PDL, rpr,
+        )  # fmt: skip
+    return qsa_paged_index_scores(
+        q=q,
+        index_cache=index_cache,
+        block_table=block_table,
+        query_positions=logical,
+        request_indices=req_idx,
+        tokens_per_block=tpb,
+        compress_ratio=core.compress_ratio,
+        only_visible_blocks=True,
+        context_rows=False,
+        use_pdl=_INDEX_SCORES_PDL,
+        rows_per_request=rpr,
+        wide_split=True,
+    )
+
+
+def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p: int):
+    """The gated sparse GQA `bf16(attn) * sigmoid(gate)` (`[rows, heads_q, head_dim]`) of a
+    generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: the
+    request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows (an
+    attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`), else the per-row split-K one up to its rows
+    (`_splitk_serves`). None where neither serves the call (an NVFP4 pool, a head geometry or
+    row count they were not measured at): the caller then runs `_sparse_gqa` and the gate
+    apart."""
+    if kv.k_scale is not None:
+        return None
+    min_requests = getattr(core, "dp_gqa_min_requests", _GROUPED_DECODE_MIN_REQUESTS)
+    if (
+        p > 1
+        and q.shape[0] >= min_requests * p
+        and qsa_sparse_gqa_grouped_cute.serves(q, kv.k, selected, p, min_groups=min_requests)
+    ):
+        return qsa_sparse_gqa_grouped_cute(
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate,
+            min_groups=min_requests,
+        )  # fmt: skip
+    if _splitk_serves(core, q, kv.k, selected):
+        # A tep4 shard the op's table leaves out names its reach, so the first call compiles
+        # every plan up to it (`_TEP_SPLITK_MAX_ROWS`) and no later row count compiles one.
+        cap = None
+        if core.tep_fast:
+            cap = _TEP_SPLITK_MAX_ROWS.get((q.shape[1], kv.k.shape[1], kv.k.dtype))
+        return qsa_sparse_gqa_splitk_cute(
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, gate,
+            max_rows=cap,
+        )  # fmt: skip
+    return None
+
+
+def _splitk_serves(core, q, k_cache, selected) -> bool:
+    """Whether `qsa_sparse_gqa_splitk_cute` takes this decode call: where the op's own table
+    serves it (`serves`, the FP8 target's routing), and at a tep4 rank under
+    `TEP_FAST_DECODE_ENV` also the geometries of `_TEP_SPLITK_MAX_ROWS` up to their rows."""
+    if qsa_sparse_gqa_splitk_cute.serves(q, k_cache, selected):
+        return True
+    if not core.tep_fast or q.dim() != 3 or k_cache.dim() != 4:
+        return False
+    rows, heads_q, head_dim = q.shape
+    cap = _TEP_SPLITK_MAX_ROWS.get((heads_q, k_cache.shape[1], k_cache.dtype), 0)
+    return (
+        0 < rows <= cap
+        and q.dtype == torch.bfloat16
+        and head_dim == k_cache.shape[3] == _SPLITK_HEAD_DIM
+        and selected.shape[1] > _SPLITK_TILE
     )
 
 
@@ -3798,6 +5676,110 @@ class _KvRangeProbe:
 # ------------------------------------------------------------------ prefill ---
 
 
+# TRTLLM_QWEN4_EXP_INFORWARD_VALIDATE=1: every in-forward snapshot step also runs the two
+# context iterations it replaces (the chunk up to P, then the tail) on copies of the pool
+# rows, and prints how far the split's states and outputs are from theirs. Debug only.
+# The split the executor's warmup runs for a dummy request (`_warm_inforward_split`) reports
+# as `[inforward-validate] [warmup] ...`, so a line without `[warmup]` is a served request's.
+_INFORWARD_VALIDATE = _switch("TRTLLM_QWEN4_EXP_INFORWARD_VALIDATE")
+_inforward_validate_reports = 0
+_inforward_validate_warmup = False
+
+
+def _inforward_report(what: str, got: torch.Tensor, ref: torch.Tensor) -> None:
+    global _inforward_validate_reports
+    if _inforward_validate_reports >= 400:
+        return
+    _inforward_validate_reports += 1
+    g, r = got.float(), ref.float()
+    diff = float((g - r).abs().max()) if g.numel() else 0.0
+    scale = float(r.abs().max()) if r.numel() else 0.0
+    tag = "[warmup] " if _inforward_validate_warmup else ""
+    print(
+        f"[inforward-validate] {tag}{what}: bitwise={bool(torch.equal(got, ref))} "
+        f"max_abs_diff={diff:.3e} ref_max_abs={scale:.3e} shape={tuple(got.shape)}",
+        flush=True,
+    )
+
+
+def _inforward_reference_layout(split, num_tokens: int):
+    """The two iterations' row sets of a split step: the rows before every tail (`main`,
+    with their `cu`), and for each split request its index among the step's requests."""
+    device = split.cu.device
+    keep = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    keep[split.tail_tok] = False
+    main = torch.nonzero(keep).reshape(-1)
+    # Request ends in packed rows: the end of each request's last gather row.
+    num_rows = split.gather.shape[0]
+    is_main = torch.zeros(num_rows, dtype=torch.bool, device=device)
+    is_main[split.main_rows] = True
+    last = torch.ones(num_rows, dtype=torch.bool, device=device)
+    last[:-1] = is_main[1:]
+    ends = split.cu[1:][last]
+    tails = torch.zeros_like(ends)
+    request_of_split = torch.searchsorted(split.main_rows, split.split_rows)
+    tail_len = split.cu_tail[1:] - split.cu_tail[:-1]
+    tails[request_of_split] = tail_len
+    lens = torch.diff(ends, prepend=ends.new_zeros(1)) - tails
+    cu_main = torch.cat([lens.new_zeros(1), torch.cumsum(lens, 0)])
+    return main, cu_main, request_of_split
+
+
+class _InforwardSplit(NamedTuple):
+    """A context-only step's in-forward snapshot split (`GDNMambaMetadata.inforward_split`,
+    planned by the cache manager): `k` requests run through their prompt end in this chunk
+    instead of taking one more context iteration for the tail past their snapshot point P.
+    The recurrent layers leave the state at P in the request's slot and stage the state at
+    the prompt end in the manager's staging row (`finish_inforward_snapshots`).
+
+    `split` holds the long index tensors; the rest are this target's views of them: slot
+    vectors in the pool's index dtype, the carry flags of the sequences cut at P (a tail is a
+    sequence of its own that the first pass starts from zeros), and for the PLE layer the
+    rows before each P its conv state (`ple_conv_win`) and id context (`ple_ngram_win`) at P
+    are rebuilt from."""
+
+    split: NamedTuple
+    gather: torch.Tensor
+    carried: torch.Tensor
+    live: torch.Tensor
+    ple_conv_win: torch.Tensor
+    ple_ngram_win: torch.Tensor
+    # The staging rows in the pool's index dtype.
+    stage_idx: torch.Tensor
+
+
+def _inforward_split(md, mm, si_all, hi_all, pools) -> _InforwardSplit | None:
+    """This step's in-forward snapshot split, or None on a step without one."""
+    split = getattr(mm, "inforward_split", None)
+    if split is None:
+        return None
+    if _INFORWARD_VALIDATE:
+        global _inforward_validate_warmup
+        _inforward_validate_warmup = bool(getattr(mm, "_warmup_inforward_split", False))
+    assert md.num_seqs == md.num_contexts, (
+        "an in-forward snapshot split on a step with generation rows"
+    )
+    carried = torch.zeros(split.gather.shape[0], dtype=hi_all.dtype, device=hi_all.device)
+    carried.index_copy_(0, split.main_rows, hi_all[: md.num_contexts])
+    # The first packed row of each planned request's tail: its snapshot point P.
+    points = split.cu.index_select(0, split.split_rows + 1)
+
+    def window(width: int) -> torch.Tensor:
+        back = torch.arange(width, 0, -1, dtype=points.dtype, device=points.device)
+        return torch.reshape(points[:, None] - back[None, :], [-1])
+
+    ple_conv, ple_ngram = pools.ple_state
+    return _InforwardSplit(
+        split=split,
+        gather=split.gather.to(si_all.dtype),
+        carried=carried,
+        live=split.live.to(si_all.dtype),
+        ple_conv_win=window(ple_conv.shape[-1]),
+        ple_ngram_win=window(ple_ngram.shape[-1]),
+        stage_idx=split.stage_rows.to(si_all.dtype),
+    )
+
+
 class _PrefillStep(NamedTuple):
     """One step's host-side state, built by `PrefillTarget.prepare` and read by the forward's
     breaks. `num_tokens` is the batch's row count `n` and `physical_tokens` the `T` the
@@ -3822,8 +5804,12 @@ class _PrefillStep(NamedTuple):
     # Over an fp8 pool, the context requests' pages the row-tile pass widens
     # (`_fp8_context_pages`); None otherwise.
     fp8_pages: int | None = None
+    # Over an fp8 pool, `_fp8_context_groups` when those pages pass one scratch; None otherwise.
+    fp8_groups: list | None = None
     # `_live_score_columns`: a bound on every row's selection window.
     live_cols: int | None = None
+    # A context-only step with in-forward snapshots: `_InforwardSplit`.
+    inforward: _InforwardSplit | None = None
 
 
 class PrefillTarget:
@@ -3914,10 +5900,20 @@ class PrefillTarget:
         _, k_dst, v_dst = _attn_in_heads(core, proj)
         if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
             self._kv_probe = None
-        # The packed `[q | k | v]` as one compact copy: the dense op reads it flat, and the
-        # sparse GQA reads its query heads from it.
-        qkv = proj_qkv[:num_tokens]
-        qkv.copy_(proj[:, : core.qkv_width])
+        # The packed `[q | k | v]`. The dense op reads it flat, as one compact copy. A sparse
+        # context-only step over an unscaled pool reads its query heads through the fused
+        # projection's rows instead: the row-tile pass and the per-row kernel take q's strides.
+        if (
+            sparse
+            and not step.stage
+            and step.attn["num_ctx_tokens"] == num_tokens
+            and core._bound.pools.kv[i].k_scale is None
+            and proj.stride(0) % 8 == 0
+        ):
+            qkv = proj[:, : core.qkv_width]
+        else:
+            qkv = proj_qkv[:num_tokens]
+            qkv.copy_(proj[:, : core.qkv_width])
         if step.stage:
             core.spec_rollback.stage_index(core._bound.pools.position_cache)
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
@@ -3975,7 +5971,27 @@ class PrefillTarget:
                     step.attn["predicted_tokens_per_seq"],
                 )
                 parts = []
-            for lo, hi, context_rows in parts:
+            if parts and step.fp8_groups is not None:
+                # The context rows a scratch-sized group of requests at a time.
+                assert parts[0] == (0, num_ctx, True), (parts[0], num_ctx)
+                assert step.fp8_groups[-1][1] == num_ctx, (step.fp8_groups[-1], num_ctx)
+                # The step passed `_ROWTILE_MIN_ROWS`; each group then launches on its own and
+                # takes the row-tile pass from `_FP8_GROUP_ROWTILE_MIN_ROWS` rows.
+                parts = [
+                    (lo, hi, True, pages, _FP8_GROUP_ROWTILE_MIN_ROWS)
+                    for lo, hi, pages in step.fp8_groups
+                ] + [(lo, hi, context_rows, None, None) for lo, hi, context_rows in parts[1:]]
+            else:
+                parts = [
+                    (lo, hi, context_rows, step.fp8_pages, None) for lo, hi, context_rows in parts
+                ]
+            for lo, hi, context_rows, pages, rowtile_min_rows in parts:
+                # A context launch's row-tile pass writes its rows of `attn_out` itself.
+                direct = None
+                if context_rows and attn_out.is_contiguous():
+                    direct = attn_out[lo:hi].view(hi - lo, core.heads_q, core.head_dim)
+                    if direct.data_ptr() % 16:
+                        direct = None
                 out = _sparse_gqa(
                     core,
                     kv,
@@ -3985,9 +6001,12 @@ class PrefillTarget:
                     req_idx[lo:hi],
                     tokens_per_block,
                     logical[lo:hi] if context_rows else None,
-                    step.fp8_pages,
+                    pages,
+                    rowtile_out=direct,
+                    rowtile_min_rows=rowtile_min_rows,
                 )
-                attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
+                if direct is None or out.data_ptr() != direct.data_ptr():
+                    attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
             thop_attention(
                 q=qkv,
@@ -4139,6 +6158,8 @@ class PrefillTarget:
                 core.head_k_dim,
                 out[0, num_prefill_tokens:num_tokens].view(num_decode_tokens, core.value_dim),
             )
+        elif step.inforward is not None:
+            self._gdn_inforward(mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all, out, num_tokens)
         else:
             q, k, v, g, beta = self._gdn_prefill_prep(
                 mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all
@@ -4164,6 +6185,138 @@ class PrefillTarget:
                 linear_gate=True,
             )
         out[:, num_tokens:].zero_()
+
+    def _gdn_inforward(self, mq, a, b, L, i, qsl, si, hi, out, num_tokens) -> None:
+        """The context-only recurrence of a step with in-forward snapshots (`_InforwardSplit`).
+
+        The conv pass runs over whole chunks, so it leaves each planned slot the window that
+        ends at the prompt end: that goes to the staging row and the window that ends at P,
+        the raw inputs before P, into the slot. The recurrence is cut at P
+        (`flashinfer_chunk_gdn_inforward_split`)."""
+        core = self.core
+        inf = self._step.inforward
+        split = inf.split
+        pools = core._bound.pools
+        conv_states = pools.conv[i]
+        stage_ssm, stage_conv = core._bound.cm.inforward_snapshot_stage_views(i)
+        ref = (
+            self._gdn_inforward_reference(mq, a, b, L, i, qsl, si, hi, num_tokens)
+            if _INFORWARD_VALIDATE
+            else None
+        )
+        window = mq.index_select(0, split.conv_win)
+        q, k, v, g, beta = self._gdn_prefill_prep(mq, a, b, L, i, qsl, si, hi)
+        slots = split.tail_slots
+        stage_conv.index_copy_(0, split.stage_rows, conv_states.index_select(0, slots))
+        conv_states.index_copy_(
+            0,
+            slots,
+            torch.transpose(torch.reshape(window, [split.k, conv_states.shape[-1], -1]), 1, 2).to(
+                conv_states.dtype
+            ),
+        )
+        flashinfer_chunk_gdn_inforward_split(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            pools.ssm[i],
+            cu_seqlens=split.cu,
+            gather=inf.gather,
+            has_initial_state=inf.carried,
+            main_rows=split.main_rows,
+            live=inf.live,
+            tail_tok=split.tail_tok,
+            cu_tail=split.cu_tail,
+            tail_slots=split.tail_slots,
+            stage=stage_ssm,
+            stage_rows=split.stage_rows,
+            stage_idx=inf.stage_idx,
+            tail_lo=split.tail_lo,
+            tail_hi=split.tail_hi,
+            output=out[:, :num_tokens],
+        )
+        if ref is not None:
+            ssm_p, conv_p, ssm_end, conv_end, out_ref, live, of_split = ref
+            _inforward_report(
+                f"gdn L{i} ssm@P (all requests)", pools.ssm[i].index_select(0, live), ssm_p
+            )
+            _inforward_report(
+                f"gdn L{i} conv@P (all requests)", conv_states.index_select(0, live), conv_p
+            )
+            rows = split.stage_rows
+            _inforward_report(
+                f"gdn L{i} ssm@end (split)",
+                stage_ssm.index_select(0, rows),
+                ssm_end.index_select(0, of_split),
+            )
+            _inforward_report(
+                f"gdn L{i} conv@end (split)",
+                stage_conv.index_select(0, rows),
+                conv_end.index_select(0, of_split),
+            )
+            _inforward_report(f"gdn L{i} output", out[0, :num_tokens], out_ref)
+
+    def _gdn_inforward_reference(self, mq, a, b, L, i, qsl, si, hi, num_tokens):
+        """`_INFORWARD_VALIDATE`: the chunk up to P and then the tail, as two context
+        iterations run them, over copies of the step's pool rows (slot `r` = request `r`).
+        Returns the states at P, the states at the prompt end and the output rows."""
+        core = self.core
+        split = self._step.inforward.split
+        pools = core._bound.pools
+        live = split.live
+        main, cu_main, of_split = _inforward_reference_layout(split, num_tokens)
+        ssm = pools.ssm[i].index_select(0, live).contiguous()
+        conv = pools.conv[i].index_select(0, live).contiguous()
+        idx = torch.arange(live.shape[0], dtype=si.dtype, device=si.device)
+        out_ref = torch.zeros(
+            num_tokens, core.num_v_heads, core.head_v_dim, dtype=mq.dtype, device=mq.device
+        )
+
+        def run(rows, cu, slots, carried):
+            qv = gdn_prefill_conv_post(
+                x=mq.index_select(0, rows).contiguous(),
+                weight=L.conv_w,
+                conv_states=conv,
+                query_start_loc=cu.to(qsl.dtype),
+                cache_indices=slots,
+                has_initial_state=carried,
+                a=a.index_select(0, rows).contiguous(),
+                b=b.index_select(0, rows).contiguous(),
+                A_log=L.a_log,
+                dt_bias=L.dt_bias,
+                num_k_heads=core.num_k_heads,
+                head_k_dim=core.head_k_dim,
+                num_v_heads=core.num_v_heads,
+                head_v_dim=core.head_v_dim,
+                pad_slot_id=_PAD_SLOT_ID,
+                l2_norm_eps=_L2_NORM_EPS,
+                softplus_threshold=_SOFTPLUS_THRESHOLD,
+                linear_gate=True,
+            )
+            o, _ = flashinfer_chunk_gated_delta_rule(
+                *qv,
+                scale=None,
+                initial_state=ssm,
+                initial_state_indices=slots,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=cu,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=None,
+                state_workspace=None,
+                has_initial_state=carried,
+                linear_gate=True,
+            )
+            out_ref.index_copy_(0, rows, o[0].to(out_ref.dtype))
+
+        run(main, cu_main, idx, hi)
+        ssm_p, conv_p = ssm.clone(), conv.clone()
+        tail_slots = of_split.to(si.dtype)
+        run(split.tail_tok, split.cu_tail, tail_slots, torch.ones_like(hi[: split.k]))
+        return ssm_p, conv_p, ssm, conv, out_ref, live, of_split
 
     def _gdn_prefill_prep(self, mq, a, b, L, i, qsl, si, hi):
         """The context rows' recurrence inputs in one pass over `mq`, the token-major q|k|v
@@ -4230,8 +6383,15 @@ class PrefillTarget:
         num_tokens = step.num_tokens
         next_norm = self._layers[core.ple_layer].ahc_norm
         conv_input = None
+        inf = step.inforward
+        ple_ref = None
+        if inf is not None and _INFORWARD_VALIDATE:
+            ple_ref = self._ple_inforward_reference(
+                hc, conv_states, ngram_pool, si_all, carry_all, qsl
+            )
         if step.stage:
             core.spec_rollback.stage_ple_verify(ngram_pool, conv_states, step.input_ids)
+        if step.stage or inf is not None:
             conv_input = torch.empty_like(hc[:num_tokens])
         ngram = ple_ngram_embed(
             step.input_ids,
@@ -4274,8 +6434,118 @@ class PrefillTarget:
         )
         if step.stage:
             core.spec_rollback.stage_ple_conv_input(conv_input)
+        if inf is not None:
+            # In-forward snapshots: both pools hold each planned slot's state at the prompt
+            # end. Stage it and rebuild the state at P from the rows before P: the conv
+            # input tail and the last ids.
+            split = inf.split
+            slots = split.tail_slots
+            stage_conv, stage_ngram = core._bound.cm.inforward_ple_stage_views(core.ple_layer)
+            stage_conv.index_copy_(0, split.stage_rows, conv_states.index_select(0, slots))
+            stage_ngram.index_copy_(0, split.stage_rows, ngram_pool.index_select(0, slots))
+            conv_states.index_copy_(
+                0,
+                slots,
+                torch.transpose(
+                    torch.reshape(
+                        conv_input.index_select(0, inf.ple_conv_win),
+                        [split.k, conv_states.shape[-1], -1],
+                    ),
+                    1,
+                    2,
+                ).to(conv_states.dtype),
+            )
+            ngram_pool.index_copy_(
+                0,
+                slots,
+                torch.reshape(step.input_ids.index_select(0, inf.ple_ngram_win), [split.k, -1]).to(
+                    ngram_pool.dtype
+                ),
+            )
+            if ple_ref is not None:
+                conv_p, ngram_p, conv_end, ngram_end, hc_ref, normed_ref, live, of_split = ple_ref
+                rows = split.stage_rows
+                _inforward_report(
+                    "ple conv@P (all requests)", conv_states.index_select(0, live), conv_p
+                )
+                _inforward_report(
+                    "ple ngram@P (all requests)", ngram_pool.index_select(0, live), ngram_p
+                )
+                _inforward_report(
+                    "ple conv@end (split)",
+                    stage_conv.index_select(0, rows),
+                    conv_end.index_select(0, of_split),
+                )
+                _inforward_report(
+                    "ple ngram@end (split)",
+                    stage_ngram.index_select(0, rows),
+                    ngram_end.index_select(0, of_split),
+                )
+                _inforward_report("ple hc_out", hc_out[:num_tokens], hc_ref)
+                _inforward_report("ple normed", normed_out[:num_tokens], normed_ref)
         hc_out[num_tokens:].zero_()
         normed_out[num_tokens:].zero_()
+
+    def _ple_inforward_reference(self, hc, conv_states, ngram_pool, si_all, carry_all, qsl):
+        """`_INFORWARD_VALIDATE`: the PLE block over the chunk up to P and then over the tail,
+        as two context iterations run it, on copies of the step's pool rows."""
+        core = self.core
+        S = self._stack
+        step = self._step
+        split = step.inforward.split
+        num_tokens = step.num_tokens
+        live = split.live
+        main, cu_main, of_split = _inforward_reference_layout(split, num_tokens)
+        conv = conv_states.index_select(0, live).contiguous()
+        ngram = ngram_pool.index_select(0, live).contiguous()
+        idx = torch.arange(live.shape[0], dtype=si_all.dtype, device=si_all.device)
+        next_norm = self._layers[core.ple_layer].ahc_norm
+        hc_ref = torch.zeros_like(hc[:num_tokens])
+        normed_ref = torch.zeros_like(hc[:num_tokens])
+
+        def run(rows, cu, slots, carried):
+            n = rows.shape[0]
+            ids = step.input_ids.index_select(0, rows).contiguous()
+            cu = cu.to(qsl.dtype)
+            ng = ple_ngram_embed(
+                ids, ngram, slots, carried, cu, core.w["ple_table"], S.ple_tscale, S.ple_mult,
+                S.ple_vocab, S.ple_offs, core.eos_token_id, n,
+                row_window=_ple_window(core),
+            )  # fmt: skip
+            if _ple_needs_sum(core):
+                ng = core.tp_sum(ng)
+            o, nm = ple_gate_conv_inject_norm(
+                hc.index_select(0, rows).contiguous(),
+                cublas_mm(ng, S.ple_key),
+                cublas_mm(ng, S.ple_val),
+                S.ple_nk_w,
+                S.ple_nq_w,
+                S.ple_nc_w,
+                S.ple_conv_w,
+                conv,
+                slots,
+                cu,
+                next_norm,
+                core.eps,
+                core.hc_count,
+                _PLE_CLAMP_MIN,
+                core.ple_dilation,
+                _PAD_SLOT_ID,
+                n,
+                carried,
+            )
+            hc_ref.index_copy_(0, rows, o)
+            normed_ref.index_copy_(0, rows, nm)
+
+        run(main, cu_main, idx, carry_all)
+        conv_p, ngram_p = conv.clone(), ngram.clone()
+        run(
+            split.tail_tok,
+            split.cu_tail,
+            of_split.to(si_all.dtype),
+            torch.ones_like(carry_all[: split.k]),
+        )
+        return conv_p, ngram_p, conv, ngram, hc_ref, normed_ref, live, of_split
 
     def _splice(self, h) -> None:
         """Break: write the step's vision rows over their placeholder rows of the token
@@ -4425,12 +6695,14 @@ class PrefillTarget:
                 tokens_per_block=md.tokens_per_block,
             )
         fp8_pages = None
+        fp8_groups = None
         if (
             sparse
             and core.quant_mode == QM_FP8_KV_CACHE
             and num_prefill_tokens >= _ROWTILE_MIN_ROWS
         ):
             fp8_pages = _fp8_context_pages(md, md.tokens_per_block)
+            fp8_groups = _fp8_context_groups(core, md, md.tokens_per_block, fp8_pages)
         nvfp4_context = None
         if (
             sparse
@@ -4452,8 +6724,10 @@ class PrefillTarget:
             vision=vision,
             stage=is_verify,
             fp8_pages=fp8_pages,
+            fp8_groups=fp8_groups,
             nvfp4_context=nvfp4_context,
             live_cols=_live_score_columns(core, md, batch),
+            inforward=_inforward_split(md, mm, si_all, hi_all, pools),
         )
 
     def forward(
@@ -5130,9 +7404,10 @@ class DecodeTarget:
             fused_sigmoid_mul_inplace(out, gate)
         return _dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m)
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
+    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage, q_in=None):
         """One gated GQA layer plus its QSA index branch for a generation-only batch, at this
-        rank's heads.
+        rank's heads. `q_in` (`DP_INPROJ_RELEASE_ENV`): the `_InProj` the input projection runs
+        on behind a releasing site A.
 
         The four input projections are one GEMM against the fused operand; the norm + rope of
         both planes runs on it; one compact copy of its leading `[q | k | v]` feeds the dense
@@ -5163,9 +7438,12 @@ class DecodeTarget:
             sparse,
         ) = qsa
         num_tokens = x.shape[0]
-        proj = _dense_mm(
-            x, L.attn_in, L.attn_in8, core.decode_mm, "in", L.attn_in_g, mid=L.attn_in_m
-        )
+        if q_in is not None:
+            proj = _inproj_mm(x, q_in)
+        else:
+            proj = _dense_mm(
+                x, L.attn_in, L.attn_in8, core.decode_mm, "in", L.attn_in_g, mid=L.attn_in_m
+            )
         qkv_view, gate, _ = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -5228,20 +7506,21 @@ class DecodeTarget:
             if not self._kv_probe.observe(i, k_rows, v_rows):
                 self._kv_probe = None
 
+        gated = False
         if sparse:
             kv = pools.kv[i]
+            p = step["predicted_tokens_per_seq"]
             if not prologue:
                 _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            scores = qsa_paged_index_scores(
-                q=_index_query(core, index_scratch),
-                index_cache=core._bound.pools.index_cache[i],
-                block_table=block_table,
-                query_positions=logical,
-                request_indices=req_idx,
-                tokens_per_block=tokens_per_block,
-                compress_ratio=core.compress_ratio,
-                only_visible_blocks=True,
-                context_rows=False,
+            scores = _decode_index_scores(
+                core,
+                _index_query(core, index_scratch),
+                core._bound.pools.index_cache[i],
+                block_table,
+                logical,
+                req_idx,
+                tokens_per_block,
+                p,
             )
             selected = torch.empty(
                 [num_tokens, core.token_topk + core.compress_ratio - 1],
@@ -5258,16 +7537,15 @@ class DecodeTarget:
                 topk_row_starts,
                 selected,
             )
-            attn = _sparse_gqa(
-                core,
-                kv,
-                _packed_q(core, qkv),
-                block_table,
-                selected,
-                req_idx,
-                tokens_per_block,
-                None,
+            q = _packed_q(core, qkv)
+            attn = _sparse_gqa_decode(
+                core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p
             )
+            gated = attn is not None
+            if not gated:
+                attn = _sparse_gqa(
+                    core, kv, q, block_table, selected, req_idx, tokens_per_block, None
+                )
             out = torch.reshape(attn, [num_tokens, core.q_width])
         else:
             out = thop_attention(
@@ -5283,27 +7561,55 @@ class DecodeTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        fused_sigmoid_mul_inplace(out, gate)
-        return core.tp_sum(_dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m))
+        if not gated:
+            fused_sigmoid_mul_inplace(out, gate)
+        return core.tp_sum(
+            _out_proj(
+                core,
+                out,
+                L.o,
+                "attn_o",
+                lambda: _dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m),
+            )
+        )
 
-    def _hc_site(self, hc, block_out, inject, norm, first, up, with_inject, normed=None, moe=None):
+    def _hc_site(
+        self,
+        hc,
+        block_out,
+        inject,
+        norm,
+        first,
+        up,
+        with_inject,
+        normed=None,
+        moe=None,
+        release=False,
+    ):
         """One hyper-connection site: the previous block's injection (none at the stack's first
         site and after the PLE add), this site's grouped norm and its mixer. Returns `(hc, mixed,
-        inject)`. At one rank (`hc_fast_sites`) the row count, a per-capture constant, picks the
-        form: one row runs the CuTe GEMV pair, up to `_HC_DECODE_ROWS_MAX` rows the tcgen05 rows
-        pair, larger batches `qwen4_exp_hc_inject_norm` and `_hc_mixer`, which every batch takes
-        at the other layouts. `normed`, when given, is this site's grouped
+        inject)`. At one rank, and at a tep4 rank (`hc_decode_pairs`), the row count, a
+        per-capture constant, picks the form: one row runs the CuTe GEMV pair, up to
+        `_HC_DECODE_ROWS_MAX` rows the tcgen05 rows pair, larger batches
+        `qwen4_exp_hc_inject_norm` and `_hc_mixer`, which every batch takes at the other layouts.
+        A tep4 rank's site never gets the top-k pair (its MoE does not fold), so the first kernel
+        forms only `routed + sigmoid(gate) * shared`. `normed`, when given, is this site's grouped
         norm of `hc` already computed (the PLE tail's, no injection pending), which only the
         inject-norm route reads (the first kernels of the other two compute it themselves).
 
         After a MoE block `block_out` is its routed output and `moe` the `(gate_logits, shared,
         topk_weights, topk_rows)` `_moe` left uncombined: the site's first kernel forms the
         block output itself; with the top-k pair `block_out` is the runner's permuted FC2 rows
-        and that kernel also forms their finalize."""
+        and that kernel also forms their finalize.
+
+        `release` (`DP_INPROJ_RELEASE_ENV`, an attention-DP rank's trunk site A): the mixer's up
+        kernel releases its dependents before its wait; only the inject-norm route takes it, the
+        one an attention-DP rank runs."""
         core = self.core
         gate_logits, shared, topk_w, topk_rows = moe if moe is not None else (None,) * 4
         n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
-        fast = core.hc_fast_sites
+        fast = core.hc_decode_pairs
+        assert not (release and fast), "the early release serves the inject-norm route only"
         if fast and _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
             hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
                 hc,
@@ -5352,7 +7658,7 @@ class DecodeTarget:
                 topk_w,
                 topk_rows,
             )
-        mixed, inject = _hc_mixer(core, normed, first, up, with_inject)
+        mixed, inject = _hc_mixer(core, normed, first, up, with_inject, release)
         return hc, mixed, inject
 
     def _mtp_layer(
@@ -5675,7 +7981,7 @@ class DecodeTarget:
             )
             return hc, mixed, inject, None
         n_cols = core.hc_lowrank + core.hc_count
-        fast = core.hc_fast_sites
+        fast = core.hc_decode_pairs
         if fast and _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
             hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
                 hc, block_out, inject, L.mhc_norm, L.mhc_first, core.hc_count, n_cols, core.eps
@@ -5743,7 +8049,7 @@ class DecodeTarget:
         main.wait_stream(side)
         return rows, (gate_logits, shared, topk_w, topk_rows)
 
-    def _gdn_block(self, x, i, L, si_all, verify, gen_p, captured=False) -> torch.Tensor:
+    def _gdn_block(self, x, i, L, si_all, verify, gen_p, captured=False, q_in=None) -> torch.Tensor:
         """One Gated-DeltaNet layer over a generation-only batch, one token per sequence, at
         this rank's heads: one GEMM for all four input projections (q|k|v, z, a and b are
         column views of its output), the conv step over the q|k|v columns in place, then the
@@ -5760,7 +8066,10 @@ class DecodeTarget:
         as their epilogue -- a single-token step's and, up to `_VERIFY_CONV_FUSED_MAX_ROWS`
         rows, a verify step's with its window snapshots and the pool advance -- reading the
         pool, taps and slots before their PDL wait, bitwise the projection + conv they
-        replace."""
+        replace.
+
+        `q_in` (`DP_INPROJ_RELEASE_ENV`): the `_InProj` the input projection runs on behind a
+        releasing site A (attention DP; the layer has no other decode copy)."""
         core = self.core
         pools = core._bound.pools
         num_tokens = x.shape[0]
@@ -5770,6 +8079,8 @@ class DecodeTarget:
             if L.in_proj_nv is not None and num_tokens <= _INPROJ_NVFP4_MAX_ROWS and _gemv_ready(x)
             else None
         )
+        if q_in is not None:
+            assert nv is None and L.in_proj_g is None, f"layer {i}: another in_proj copy"
         nv_conv = nv is not None and captured and not is_verify
         fp8_conv = (
             not nv_conv
@@ -5817,6 +8128,8 @@ class DecodeTarget:
             )
         elif nv is not None:
             proj = nvfp4_split_gemv_op(x, nv)
+        elif q_in is not None:
+            proj = _inproj_mm(x, q_in)
         else:
             # FlashInfer's low-M kernels at the rows its table names (a verify step's few rows
             # a request), cuBLAS past them; the dense FP8 copies where `_dense_mm` takes them.
@@ -5890,7 +8203,15 @@ class DecodeTarget:
             core.num_k_heads,
             core.head_k_dim,
         )
-        return core.tp_sum(_dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m))
+        return core.tp_sum(
+            _out_proj(
+                core,
+                o,
+                L.out,
+                "gdn_out",
+                lambda: _dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m),
+            )
+        )
 
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
         """A verify step's gated RMS norm (sigmoid gate, plain non-gemma weight) and the
@@ -5905,7 +8226,15 @@ class DecodeTarget:
             gate_activation="sigmoid",
         )
         o = torch.reshape(o, [num_tokens, core.value_dim])
-        return core.tp_sum(_dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m))
+        return core.tp_sum(
+            _out_proj(
+                core,
+                o,
+                L.out,
+                "gdn_out",
+                lambda: _dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m),
+            )
+        )
 
     def _ple_block(self, hc, input_ids, ple_state, next_norm, stage) -> tuple:
         """The n-gram side path on its decoder layer, added into the stream and normalized
@@ -5982,10 +8311,15 @@ class DecodeTarget:
         # captured verify step).
         coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
 
-        h = nn.functional.embedding(input_ids, core.w["embed"])
-        num_tokens = h.shape[0]
-        dt = h.dtype
-        dev = h.device
+        hc_count = core.hc_count
+        if input_ids.dim() == 1 and input_ids.is_contiguous():
+            # The embedding and its copy into every hyper-connection stream in one launch.
+            hc = embed_rows(input_ids, core.w["embed"], hc_count, False)
+        else:
+            hc = torch.cat([nn.functional.embedding(input_ids, core.w["embed"])] * hc_count, -1)
+        num_tokens = hc.shape[0]
+        dt = hc.dtype
+        dev = hc.device
         batch = md.num_seqs
         # Decode CUDA graphs pad with real dummy requests, so they are in the metadata.
         assert num_tokens == md.num_tokens, (
@@ -6091,8 +8425,6 @@ class DecodeTarget:
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
 
-        hc_count = core.hc_count
-        hc = torch.cat([h] * hc_count, -1)
         layers, S = self._layers, self._stack
         # Each block's output and injection go into the next site's first kernel (`_hc_site`),
         # after an MoE block with its combine (and at one rank its finalize, `fold`); before
@@ -6107,15 +8439,29 @@ class DecodeTarget:
                     hc = qwen4_exp_post_inject(hc, block_out, inject)
                     block_out = inject = moe = None
                 hc, normed = self._ple_block(hc, input_ids, ple_state, L.ahc_norm, is_verify)
+            # `DP_INPROJ_RELEASE_ENV`: where the block's input projection runs on the PDL bf16
+            # GEMM (`q_in`, None with the switch off), site A releases its dependents early.
+            q_in = _inproj_release_at(core, i, num_tokens)
             hc, mixed, inject = self._hc_site(
-                hc, block_out, inject, L.ahc_norm, L.ahc_first, L.ahc_up, True, normed, moe
+                hc,
+                block_out,
+                inject,
+                L.ahc_norm,
+                L.ahc_first,
+                L.ahc_up,
+                True,
+                normed,
+                moe,
+                release=q_in is not None,
             )
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify
+                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify, q_in
                 )
             else:
-                block_out = self._gdn_block(mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph)
+                block_out = self._gdn_block(
+                    mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph, q_in
+                )
             hc, mixed, inject, fp4 = self._hc_moe_site(hc, block_out, inject, L)
             block_out, moe = self._moe(
                 mixed,
@@ -6249,6 +8595,16 @@ class DecodeTarget:
                 pos3,
                 coords,
             )
+        # A draft-extend step goes on past the K/V and index-key writes on each request's
+        # continuing row only (`_draft_continue`); the MoE round trip then pads by the group's
+        # kept-row counts.
+        cont = _draft_continue(
+            core, md, kwargs.get("spec_metadata"), all_rank_num_tokens, rows, gen_seqs, p, share
+        )
+        n = rows
+        if cont is not None:
+            n = gen_seqs
+            pad_rows = _draft_pad_rows(core, cont.counts, n)
         x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states)
         qkv, gate, k_dst, v_dst = _mtp_qkv(core, M, mixed, pos3)
         q_index = None
@@ -6260,14 +8616,27 @@ class DecodeTarget:
                 draft,
                 (req_idx, logical, block_table, tokens_per_block, pos, coords),
             )
+        # The step's operands at the rows that go on (all of them without `cont`).
+        kept = {"x": x, "inject": inject}
+        if sparse:
+            kept.update(qkv=qkv, gate=gate)
+            if q_index is not None:
+                kept["q_index"] = q_index
+        if cont is not None:
+            kept = _draft_rows(cont.rows, kept)
         if sparse:
             kv = draft.kv
             _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            topk_indices = md.qsa_topk_indices[:rows]
-            visible_blocks = md.qsa_visible_blocks[:rows]
-            seq_lens_q = md.qsa_sequence_lengths[:rows]
+            topk_indices = md.qsa_topk_indices[:n]
+            if cont is None:
+                visible_blocks = md.qsa_visible_blocks[:rows]
+                seq_lens_q = md.qsa_sequence_lengths[:rows]
+                q_logical, q_req_idx = logical, req_idx
+            else:
+                visible_blocks, seq_lens_q = cont.visible, cont.seq_lens
+                q_logical, q_req_idx = cont.logical, cont.req_idx
             selected = torch.empty(
-                [rows, core.token_topk + core.compress_ratio - 1],
+                [n, core.token_topk + core.compress_ratio - 1],
                 dtype=torch.int32,
                 device=qkv.device,
             )
@@ -6294,43 +8663,43 @@ class DecodeTarget:
                     )
                 )
             else:
-                scores = qsa_paged_index_scores(
-                    q=q_index,
-                    index_cache=draft.index_cache,
-                    block_table=block_table,
-                    query_positions=logical,
-                    request_indices=req_idx,
-                    tokens_per_block=tokens_per_block,
-                    compress_ratio=core.compress_ratio,
-                    only_visible_blocks=True,
-                    context_rows=False,
+                scores = _decode_index_scores(
+                    core,
+                    kept["q_index"],
+                    draft.index_cache,
+                    block_table,
+                    q_logical,
+                    q_req_idx,
+                    tokens_per_block,
+                    p if cont is None else 1,
                 )
                 _selection(
                     core,
                     scores,
                     visible_blocks,
-                    logical,
+                    q_logical,
                     seq_lens_q,
                     topk_indices,
-                    md.qsa_topk_row_starts[:rows],
+                    md.qsa_topk_row_starts[:n],
                     selected,
                 )
                 if share:
                     self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
-            attn = torch.reshape(
-                _sparse_gqa(
-                    core,
-                    kv,
-                    _packed_q(core, qkv),
-                    block_table,
-                    selected,
-                    req_idx,
-                    tokens_per_block,
-                    None,
-                ),
-                [rows, core.q_width],
-            )
+            q = _packed_q(core, kept["qkv"])
+            g = kept["gate"]
+            attn = _sparse_gqa_decode(
+                core, kv, q, block_table, selected, q_req_idx, tokens_per_block, g,
+                p if cont is None else 1,
+            )  # fmt: skip
+            gated = attn is not None
+            if not gated:
+                attn = _sparse_gqa(
+                    core, kv, q, block_table, selected, q_req_idx, tokens_per_block, None
+                )
+            attn = torch.reshape(attn, [n, core.q_width])
         else:
+            g = gate
+            gated = False
             attn = thop_attention(
                 q=qkv,
                 output=torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
@@ -6344,8 +8713,17 @@ class DecodeTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        fused_sigmoid_mul_inplace(attn, gate)
-        return _mtp_tail(core, M, x, attn, inject, pad_rows)
+        if not gated:
+            fused_sigmoid_mul_inplace(attn, g)
+        if cont is not None and not sparse:
+            attn = torch.index_select(attn, 0, cont.rows)
+        out = _mtp_tail(core, M, kept["x"], attn, kept["inject"], pad_rows)
+        if cont is None:
+            return out
+        # The worker reads only the continuing rows; the others are left unwritten.
+        full = out.new_empty([rows, out.shape[1]])
+        full.index_copy_(0, cont.rows, out)
+        return full
 
 
 # ------------------------------------------------------------ the MTP module ---
@@ -6366,15 +8744,40 @@ class MTPLayer:
     def __init__(self, core: Qwen4ExpDefaultModelingV2, logits_processor) -> None:
         self.core = core
         self.logits_processor = logits_processor
+        # The spec worker when it samples with the TP key exchange (`_sharded_head`).
+        self.worker = None
+        # The engine step's `spec_metadata`, set by the shell before the worker runs.
+        self.spec_metadata = None
 
     def __call__(self, *args, **kwargs) -> torch.Tensor:
         return self.forward(*args, **kwargs)
+
+    def _sharded_head(self, lm_head, rows: int) -> bool:
+        """Whether the draft logits may stay this rank's vocabulary shard under attention TP:
+        the worker then takes the greedy draft tokens through the TP key exchange (row maxima
+        and one exchange, the gathered head's argmax with ties to the lowest id) instead of
+        the all-gather. Not under advanced draft sampling or guided decoding, which read the
+        gathered logits. Host values every rank shares, as the FP8 target decides it."""
+        worker, md = self.worker, self.spec_metadata
+        if worker is None or md is None:
+            return False
+        exchange = worker.key_exchange
+        return bool(
+            exchange is not None
+            and not md.wants_advanced_draft_sampling
+            and worker.guided_decoder is None
+            and 1 <= rows <= exchange.MAX_ROWS
+            and lm_head.tp_mode == TensorParallelMode.COLUMN
+            and lm_head.gather_output
+            and lm_head.padding_size == 0
+        )
 
     def shared_head(self, hidden_states, lm_head, attn_metadata, return_context_logits):
         """The module's own head: its stack-final hyper-connection mixer (a gated mixer with
         its own parameters, not a plain RMS norm) over the grouped norm, then the trunk's
         `lm_head` through the shell's logits processor (vocab-parallel and gathered under
-        attention TP). The norm and the mixer are the trunk's stack-final site's."""
+        attention TP; this rank's bf16 vocabulary shard where `_sharded_head` allows). The norm
+        and the mixer are the trunk's stack-final site's."""
         core = self.core
         M = core._mtp
         _, normed = qwen4_exp_hc_inject_norm(
@@ -6383,6 +8786,8 @@ class MTPLayer:
         final, _ = _hc_mixer(core, normed, M.fhc_first, M.fhc_up, False)
         draft_head = getattr(core, "draft_head", None)
         if draft_head is None:
+            if self._sharded_head(lm_head, final.shape[0]):
+                return lm_head(final, gather_output=False)
             return self.logits_processor.forward(
                 final, lm_head, attn_metadata, return_context_logits
             )
@@ -6839,10 +9244,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
 ):
     """Qwen3.8-Flash-Next-NVFP4 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep8 across nodes."""
 
-    # At tp1 one-engine speculative decoding takes the engine's fast paths (greedy and
-    # temperature-only sampling CUDA graph variants, the overlap loop on the execution stream,
-    # hoisted position ids, the MTP-Eagle draft loop's step-0 epilogue, the recorded steady
-    # decode-step prepare), validated there; off at every other layout.
+    # With a `speculative_config`, one-engine speculative decoding takes the engine's fast paths
+    # (greedy and temperature-only sampling CUDA graph variants, the overlap loop on the
+    # execution stream, hoisted position ids, the MTP-Eagle draft loop's step-0 epilogue, the
+    # recorded steady decode-step prepare) at every layout, as the FP8 target does.
     spec_decode_fast_paths: bool = False
     runtime_hooks: RuntimeHooks | None = None
     # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
@@ -6851,6 +9256,16 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     #: PLE seeds a fresh request's n-gram history and conv state in its prefill only, so the
     #: engine must not run a one-token prompt as a decode row.
     resets_recurrent_state_in_context = True
+
+    # A context chunk that reaches the prompt end takes the Mamba snapshot before it inside
+    # the same forward: the GDN layers and the PLE layer split their state at the snapshot
+    # point (`PrefillTarget._gdn_inforward`, `_ple_block`). A positive value turns the path
+    # on in the cache manager; 1 leaves the fewest chunk tokens before the snapshot point at
+    # the manager's own floor (the GDN conv window and the PLE windows).
+    inforward_snapshot_min_main = 1
+    # The longest tail the split runs: FlashInfer's in-place path. A snapshot further from the
+    # prompt end (`additional_snapshot_offsets_from_end`) keeps the two-iteration path.
+    inforward_snapshot_max_tail = _GDN_INPLACE_MAX_TOKENS
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
@@ -6999,6 +9414,11 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the "
                 "attention-DP MoE round trip as ALLGATHER (the default)"
             )
+        if _dp_moe_comm() != "nccl" and layout not in _LAMPORT_LAYOUTS.values():
+            raise NoTarget(
+                f"{DP_MOE_COMM_ENV}={_dp_moe_comm()} at {layout}: the Lamport round trip serves "
+                f"{' and '.join(_LAMPORT_LAYOUTS.values())} workers only"
+            )
         if getattr(llm_args.multimodal_config, "vision_gpu_normalize", False):
             raise NoTarget(
                 "multimodal_config.vision_gpu_normalize: the input processor then ships uint8 "
@@ -7073,20 +9493,35 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # Must match what the resource manager decided: left at `get_spec_worker`'s
             # default, the draft step would be handed a manager that maps no draft layer.
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
-            if self.one_rank:
-                self.spec_decode_fast_paths = True
-                self.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
+            self.spec_decode_fast_paths = True
+            self.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
+            # Under attention TP the TP group's key exchange, as the FP8 target builds it: the
+            # worker then takes the target tokens of greedy and temperature-only batches, and
+            # the greedy draft tokens, from this rank's vocabulary shard (argmax or Gumbel-max
+            # in one exchange) instead of the all-gather. Collective over the TP group (every
+            # rank constructs the model in step); None at one rank, under attention DP, without
+            # peer memory or with `TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0`.
+            key_exchange = None
+            if not self.one_rank and vocab_parallel_argmax_enabled():
+                from tensorrt_llm._torch.distributed import ll_exchange
+
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping, model_config.max_num_tokens
+                )
             self.spec_worker = get_spec_worker(
                 self.spec_config,
                 model_config,
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange,
                 spec_decode_fast_paths=self.spec_decode_fast_paths,
             )
             assert self.spec_worker is not None, (
                 f"the engine resolved no spec worker for spec_dec_mode "
                 f"{self.spec_config.spec_dec_mode!r}"
             )
+            if getattr(self.spec_worker, "key_exchange", None) is not None:
+                self.draft_model.mtp_layers[0].worker = self.spec_worker
             self.spec_worker.set_draft_model(self.draft_model)
             # The PLE pools and the QSA side caches are written per verify row and nothing the
             # runtime owns rolls them back; the worker calls this after its draft loop, inside
@@ -7121,6 +9556,34 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
         _vision.validate_request(self.vision_tower, request)
 
     def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor | None = None,
+        position_ids: torch.IntTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        return_context_logits: bool = False,
+        spec_metadata=None,
+        lora_params: dict | None = None,
+        **kwargs,
+    ):
+        """One engine step (`_step`). With `DP_MOE_COMM_ENV=lamport_step` the whole step --
+        trunk, heads and every draft pass -- is one region of the Lamport launch indices."""
+        args = (
+            attn_metadata,
+            input_ids,
+            position_ids,
+            inputs_embeds,
+            return_context_logits,
+            spec_metadata,
+            lora_params,
+        )
+        steps = self.model._lamport_steps
+        if steps is None:
+            return self._step(*args, **kwargs)
+        with steps.region():
+            return self._step(*args, **kwargs)
+
+    def _step(
         self,
         attn_metadata: AttentionMetadata,
         input_ids: torch.IntTensor | None = None,
@@ -7183,19 +9646,32 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 self.spec_worker, spec_metadata
             )
             logits = self.logits_processor.forward(
-                nn.functional.embedding(spec_metadata.gather_ids, final),
+                _head_rows(self.model, final, spec_metadata.gather_ids),
                 self.lm_head,
                 attn_metadata,
                 True,
                 widen=not verify_argmax_only,
             )
+        elif getattr(self.spec_worker, "key_exchange", None) is not None:
+            # This rank's vocabulary shard for a greedy or temperature-only batch (the worker
+            # marks `spec_metadata.sharded_target_logits`), else the gathered fp32 logits.
+            logits = self.spec_worker.target_logits(
+                _head_rows(self.model, final, spec_metadata.gather_ids),
+                self.lm_head,
+                self.logits_processor,
+                attn_metadata,
+                spec_metadata,
+                self.draft_model,
+            )
         else:
             logits = self.logits_processor.forward(
-                nn.functional.embedding(spec_metadata.gather_ids, final),
+                _head_rows(self.model, final, spec_metadata.gather_ids),
                 self.lm_head,
                 attn_metadata,
                 True,
             )
+        # The draft head decides from the same batch whether its logits may stay sharded.
+        self.draft_model.mtp_layers[0].spec_metadata = spec_metadata
         # A prefill CUDA graph pads the step's rows; the worker reshapes generation rows per
         # request, so it takes the batch's own.
         if attn_metadata.padded_num_tokens is not None:

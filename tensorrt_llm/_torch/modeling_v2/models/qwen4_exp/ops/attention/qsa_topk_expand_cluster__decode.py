@@ -29,6 +29,10 @@ _PASSES = ((19, 12), (8, 11), (0, 8))
 _HIST = 1 << 12
 #: Most rows a launch serves (148 CTAs in clusters of 4); more take the family's one-CTA kernel.
 MAX_ROWS = 37
+#: Most rows a caller may ask `supports` to serve (`max_rows`): past `MAX_ROWS` a row takes a
+#: cluster of two CTAs, one wave up to 74 rows on 148 SMs and several past it. A CTA then holds
+#: half the window (below 2^16 keys at `MAX_WIDTH`, the width of its packed counts).
+PAIR_MAX_ROWS = 256
 #: Narrowest table this entry serves: narrower ones take the family's one-CTA kernel.
 MIN_WIDTH = 4096 + KPT
 #: Widest table (8192 + 128 pages): keeps a CTA's keys below 2^16, the width of its packed counts.
@@ -80,8 +84,11 @@ def _dsmem(ptr, rank):
 
 
 def cluster_size(rows: int) -> int:
-    """CTAs a row: 8 up to 12 rows (16 clusters of 8 overflow GB300's GPCs in one wave), else 4."""
-    return 8 if rows <= 12 else 4
+    """CTAs a row: 8 up to 12 rows (16 clusters of 8 overflow GB300's GPCs in one wave), 4 up to
+    `MAX_ROWS`, 2 past it (a caller's `max_rows`)."""
+    if rows <= 12:
+        return 8
+    return 4 if rows <= MAX_ROWS else 2
 
 
 def geometry(width: int, cluster: int) -> tuple[int, int]:
@@ -352,7 +359,10 @@ class _TopkExpandClusterKernel:
 
         # 3. Block order within the CTA (slot j of every thread, then slot j + 1): each
         # (thread, slot)'s counts above and in the class, packed (above + class << 16), and their
-        # exclusive prefix. Slots past `q4` hold no keys in any thread (uniform skip).
+        # exclusive prefix. Slots past `q4` hold no keys in any thread (uniform skip). Each half
+        # is below 2^16 (a CTA's keys), but the class half can pass 2^15 in a cluster of 2 (up
+        # to 33280 keys a CTA): the Int32 sums then wrap into the sign bit, so the class half is
+        # read back with a mask, never with the arithmetic shift alone.
         pre = cute.make_rmem_tensor(cute.make_layout((G,), stride=(1,)), cutlass.Int32)
         pre.fill(0)
         for j in cutlass.range_constexpr(G):
@@ -400,7 +410,7 @@ class _TopkExpandClusterKernel:
         for rr in cutlass.range_constexpr(C):
             r = C - 1 - rr
             tot = ex[r]
-            e_r = tot >> 16
+            e_r = (tot >> 16) & 0xFFFF
             take = cutlass.max(cutlass.min(need - later, e_r), cutlass.Int32(0))
             later = later + e_r
             if r < rank:
@@ -412,7 +422,7 @@ class _TopkExpandClusterKernel:
         for j in cutlass.range_constexpr(G):
             gl = g_lo + j * nt + tidx
             ab = pre[j] & 0xFFFF
-            cb = pre[j] >> 16
+            cb = (pre[j] >> 16) & 0xFFFF
             for c in cutlass.range_constexpr(KPT):
                 kv = keys[c, j]
                 if kv >= 0:
@@ -545,10 +555,13 @@ def launch(
     return sel
 
 
-def supports(scores) -> bool:
-    """Whether this entry serves a decode call over this score table (see `is_valid`)."""
+def supports(scores, max_rows: int = MAX_ROWS) -> bool:
+    """Whether this entry serves a decode call over this score table (see `is_valid`): up to
+    `MAX_ROWS` rows, or up to `max_rows` (at most `PAIR_MAX_ROWS`) for a caller that asks."""
+    if not 0 < int(max_rows) <= PAIR_MAX_ROWS:
+        raise ValueError(f"max_rows={max_rows}: expected 1..{PAIR_MAX_ROWS}")
     rows, width = scores.shape
-    return 0 < rows <= MAX_ROWS and width % KPT == 0 and MIN_WIDTH <= width <= MAX_WIDTH
+    return 0 < rows <= int(max_rows) and width % KPT == 0 and MIN_WIDTH <= width <= MAX_WIDTH
 
 
 #: Score-table widths: 262144 tokens with / without MTP's extra pages, and 131072 tokens.
@@ -633,17 +646,53 @@ class QsaTopkExpandClusterDecode(OpWrapper):
                 rows=4, requests=((131068, 4),), relu_sum=True, width=_HALF_WIDTH, graph=True
             ),
         ),
+        Cell(
+            why="48 rows in clusters of 2 (a caller's max_rows): dep4 / dep8 verify, 12 requests "
+            "x 4 rows spread to ~250k tokens, relu-sum, graph",
+            spec=dict(
+                rows=48,
+                requests=tuple((2000 + 21000 * r, 4) for r in range(12)),
+                relu_sum=True,
+                width=_TUNE_WIDTH,
+                graph=True,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
+        Cell(
+            why="208 rows in clusters of 2 over three waves (a caller's max_rows): dep4 verify "
+            "at 52 a rank, 52 x 4 rows, with ties at the threshold (log-normal)",
+            spec=dict(
+                rows=208,
+                requests=tuple((5000 + 4800 * r, 4) for r in range(52)),
+                lognormal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
+        Cell(
+            why="40 rows of equal scores at the table's deepest windows (65568..65529 blocks) in "
+            "clusters of 2: a CTA's tie class holds up to 32784 keys, past the packed counts' "
+            "2^15 (their sign bit)",
+            spec=dict(
+                rows=40,
+                pos=tuple(262271 - 4 * r for r in range(40)),
+                equal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
     )
 
     note = """
-    Source: this target's CuTe DSL kernel, `cute.compile`d (`--enable-tvm-ffi`) on first call
+    Source: this module's CuTe DSL kernel, `cute.compile`d (`--enable-tvm-ffi`) on first call
     per table width and row stride, k, compress ratio, token budget, index dtypes, PDL and
     cluster size.
 
     Preconditions: zero row starts; `scores` fp32 `[rows, W]`, unit column stride, 16-byte
     aligned rows, `W % 4 == 0`; `topk_indices` int32 `[rows, K]` contiguous; `row_ends` int32
     (each at most `W`), positions and lengths int32 or int64, each a contiguous `[rows]`; the
-    call within `supports` (1..37 rows, 4100 <= W <= 66560). Ties go to the higher block; a
+    call within `supports` (1..37 rows, or up to `max_rows` <= 256 when the caller asks: clusters
+    of 2 past 37 rows; 4100 <= W <= 66560). Ties go to the higher block; a
     negative zero ranks as zero. Limits: rows x row stride below 2^31, positions read as Int32.
 
     Not certified: NaN scores inside the window (they rank above every finite score).
