@@ -255,6 +255,12 @@ class _Checkpoint(dict):
     def full(self, key) -> torch.Tensor:
         return _full(key, self.cfg)
 
+    def mark_consumed_keys(self, keys) -> int:
+        """The engine dict's release: the keys are gone, so a later read of one fails."""
+        for key in keys:
+            dict.pop(self, key)
+        return len(keys)
+
 
 def _read_first(core, ckpt, param_key):
     """The tensor `load` copies into `param_key`'s first source, through the
@@ -702,6 +708,9 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        # Every key has left the dict: unread ones at the start, read ones after their last read.
+        assert not set(ckpt.keys()), sorted(ckpt.keys())[:4]
+        _assert_slot_scales_are_the_expert_products(core)
 
         seen = [k for k, _, _ in ckpt.reads]
         assert len(seen) == len(set(seen)), "a checkpoint key was read twice"
@@ -728,3 +737,17 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
             and not (".mlp.experts." in k and not lo <= int(k.split(".")[5]) < hi)
         }
         assert read_mtp == want, (sorted(want - read_mtp)[:4], sorted(read_mtp - want)[:4])
+
+
+def _assert_slot_scales_are_the_expert_products(core) -> None:
+    """Each trunk layer's per-slot output scales are bitwise what the forward used to derive
+    from the per-expert scalars: the same products of the same fp32 values, in the same
+    order."""
+    d, w = core.dims, core.w
+    for i in range(d.dense_layers, d.num_layers):
+        held = torch.tensor(d.slots[i].slot_experts)
+        isc1, e_isc2 = w[f"l{i}_mlp_isc1"], w[f"l{i}_e_isc2"][held]
+        gate1 = isc1[0] * w[f"l{i}_e_ws2_1"][held]
+        assert torch.equal(w[f"l{i}_out1_gate_scale"], gate1), i
+        assert torch.equal(w[f"l{i}_out1_scale"], gate1 / e_isc2), i
+        assert torch.equal(w[f"l{i}_out2_scale"], e_isc2 * w[f"l{i}_e_ws2_2"][held]), i

@@ -602,6 +602,14 @@ _STANDARD_MODE_CASES = [
                  MoeLoadBalancerConfig(num_slots=288, layer_updates_per_iter=2),
                  "online",
                  id="online"),
+    # The balancer is static only at zero updates; the resolver must agree for any other
+    # count, or it would build a static target for an online balancer.
+    pytest.param("DeepseekV3ForCausalLM",
+                 _EP4,
+                 MoeLoadBalancerConfig(num_slots=288,
+                                       layer_updates_per_iter=-1),
+                 "online",
+                 id="nonzero-updates-are-online"),
     pytest.param("DeepseekV3ForCausalLM",
                  _EP4,
                  None,
