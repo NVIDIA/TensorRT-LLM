@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 # the grid and the slots beyond exit before their mainloop).
 _SPLIT_PLAN_MAX_REQUESTS = 1024
 # CuteDSLNVMlaDecodeBlackwellRunner._MAX_SPLIT_KV: the largest grid any tactic uses.
-_SPLIT_PLAN_MAX_SPLIT = 32
+_SPLIT_PLAN_MAX_SPLIT = 64
 # mma_qk_tiler N of every tactic: the KV tile a split is made of.
 _SPLIT_PLAN_KV_TILE = 128
 # Shortest piece worth its partial-output write and reduction read.

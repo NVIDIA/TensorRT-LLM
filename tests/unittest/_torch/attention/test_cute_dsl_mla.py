@@ -84,6 +84,30 @@ def test_mla_decode_split_kv_is_a_bounded_power_of_two() -> None:
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="nvidia-cutlass-dsl is not installed")
+def test_mla_decode_uniform_split_cap_follows_kernel_dtype(monkeypatch) -> None:
+    """The fp8 kernel admits uniform splits up to ``_MAX_SPLIT_KV`` (its
+    measured SM100 win region extends to a full wave of clusters), while the
+    fp16/bf16 kernel keeps its pre-existing 32 cap, so ``default_tactic``
+    must clamp per kernel dtype."""
+    import cutlass
+
+    runner_cls = _mla_decode_runner_cls()
+    monkeypatch.setattr(runner_cls, "_get_max_active_blocks", classmethod(lambda cls: 296))
+    fp8 = runner_cls(in_dtype=cutlass.Float8E4M3FN, num_heads=128, seq_len_q=1, page_size=32)
+    bf16 = runner_cls(in_dtype=cutlass.BFloat16, num_heads=128, seq_len_q=1, page_size=32)
+    assert runner_cls._MAX_SPLIT_KV == 64
+    assert fp8._max_uniform_split_kv() == 64
+    assert bf16._max_uniform_split_kv() == 32
+    # One request, one query tile: the fp8 default fills a full wave, the
+    # bf16 default stays within its kernel's cap.
+    assert fp8.default_tactic(1)[2] == 64
+    assert bf16.default_tactic(1)[2] == 32
+    # More than one query-tile row: the default grid keeps the multi-row cap
+    # (a larger grid's empty plan slots cost more than they ever recover).
+    assert fp8.default_tactic(4)[2] == runner_cls._MULTI_ROW_MAX_SPLIT_KV
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="nvidia-cutlass-dsl is not installed")
 @pytest.mark.parametrize("num_heads", [8, 128])
 def test_mla_decode_split_kv_workspace_rows_cover_every_bucket(num_heads: int) -> None:
     """The CUDA-graph workspace is sized once, so its row bound must cover every

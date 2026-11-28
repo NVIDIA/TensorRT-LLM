@@ -40,7 +40,7 @@ def _plan_mod():
         # helix16 bs16: already over one wave, a second piece would cost a third wave.
         ([14208] * 16, 8, [1] * 16),
         # One long request alone (H128, single token): the whole grid.
-        ([65536], 1, [32]),
+        ([65536], 1, [64]),
         # 64K x 8 (64 rows): three pieces fill two waves better than one 512-tile pass.
         ([65536] * 8, 8, [3] * 8),
         # Short requests never get pieces below the minimum tile count.
