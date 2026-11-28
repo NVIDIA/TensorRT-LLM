@@ -3078,8 +3078,11 @@ def test_KvCacheConfig_copy_stream_busy_skip():
                                           ("page_staging_mib", 128)])
 @pytest.mark.parametrize("use_v2", [True, "auto"])
 def test_copy_path_options_need_the_resolved_v2_manager(field, value, use_v2):
-    """A KvCacheConfig that requests V2 (or "auto") passes these at parse time; once model
-    loading has picked V1 they would be ignored, so the creator rejects them."""
+    """Reject V2-only copy-path options once the creator resolves to V1.
+
+    A KvCacheConfig that requests V2 (or "auto") passes these at parse time; once model
+    loading has picked V1 they would be ignored, so the creator rejects them.
+    """
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
     from tensorrt_llm.mapping import Mapping
 
