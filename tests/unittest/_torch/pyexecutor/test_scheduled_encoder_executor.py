@@ -354,6 +354,7 @@ def test_a_failure_after_the_launch_ends_the_loop_and_wakes_waiters():
         with pytest.raises(RuntimeError, match="Event loop terminated") as raised:
             h.executor.await_responses(pending, timeout=WAIT)
         assert "the device was lost" in str(raised.value)
+        assert "the device was lost" in str(h.executor.execution_error)
 
 
 def test_perf_metrics_record_when_the_request_was_scheduled():
@@ -656,6 +657,7 @@ def test_a_survivable_forward_error_fails_only_its_batch(completion):
         assert error.error_msg == "bad batch"
         h.result(later)
         assert h.executor.can_enqueue_requests()
+        assert h.executor.execution_error is None
 
 
 def test_a_failed_forward_answers_a_request_with_children_once():
@@ -683,6 +685,7 @@ def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down(completion
             assert "illegal memory access" in response.error_msg
         assert h.executor.shutdown_event.wait(timeout=30)
         assert not h.executor.can_enqueue_requests()
+        assert "illegal memory access" in str(h.executor.execution_error)
         assert h.runner.batches == [[running]]
 
 
@@ -784,3 +787,62 @@ def test_a_crashed_loop_wakes_waiters_with_its_error():
             h.executor.await_responses(pending, timeout=WAIT)
         assert "Unsupported request queue item" in str(raised.value.__cause__)
         assert h.executor.await_responses(timeout=WAIT) == []
+
+
+@pytest.mark.parametrize("release_during_drain", [True, False], ids=["drains", "times-out"])
+def test_host_crash_finishes_response_publication_before_shutdown(
+    monkeypatch: pytest.MonkeyPatch, release_during_drain: bool
+) -> None:
+    with _harness() as h:
+        publish_started = threading.Event()
+        release_publish = threading.Event()
+        receive = h.executor._receive
+        publish = h.executor._publish
+
+        def hold_publication(responses, finished_ids) -> None:
+            if responses:
+                publish_started.set()
+                assert release_publish.wait(timeout=WAIT.total_seconds())
+            publish(responses, finished_ids)
+
+        def crash_after_launch() -> None:
+            if not h.runner.batches:
+                receive()
+                return
+
+            assert publish_started.wait(timeout=5)
+            if release_during_drain:
+                completion_thread = h.executor._completion_thread
+                assert completion_thread is not None
+                join = completion_thread.join
+
+                def release_then_join(timeout: float | None = None) -> None:
+                    release_publish.set()
+                    join(timeout=timeout)
+
+                monkeypatch.setattr(completion_thread, "join", release_then_join)
+            raise RuntimeError("injected encoder host crash")
+
+        monkeypatch.setattr(h.executor, "_receive", crash_after_launch)
+        monkeypatch.setattr(h.executor, "_publish", hold_publication)
+        if not release_during_drain:
+            monkeypatch.setattr(scheduled_encoder_executor, "_CRASH_DRAIN_TIMEOUT_S", 0.01)
+        pending = h.submit()
+        h.executor.start_worker()
+
+        try:
+            assert h.executor.shutdown_event.wait(timeout=10)
+            assert str(h.executor.execution_error) == "injected encoder host crash"
+            if release_during_drain:
+                result = h.result(pending)
+                assert result.output_token_ids == [[]]
+            else:
+                assert not release_publish.is_set()
+        finally:
+            release_publish.set()
+            completion_thread = h.executor._completion_thread
+            if completion_thread is not None:
+                completion_thread.join(timeout=5)
+                assert not completion_thread.is_alive()
+
+        assert h.executor.await_responses(timeout=NO_WAIT) == []

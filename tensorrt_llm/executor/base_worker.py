@@ -23,7 +23,7 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Lock
+from threading import Lock, RLock
 from typing import (TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple,
                     Union)
 
@@ -149,6 +149,7 @@ class BaseWorker(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
+        self._results_lock = RLock()
         # Requests already answered with an error by _maybe_wrap_response and
         # aborted; their remaining engine responses are dropped.
         self._refused_client_ids: Set[int] = set()
@@ -1407,9 +1408,12 @@ class BaseWorker(GenerationExecutor):
         from .._utils import KVCacheEventSerializer
         return json.dumps(KVCacheEventSerializer.serialize(events))
 
-    def _pop_result(self, client_id: int):
-        self._results.pop(client_id, None)
-        self._client_id_to_request_id.pop(client_id, None)
+    def _pop_result(self, client_id: int) -> Optional[GenerationResult]:
+        """Retire the result and return it, or None if another path already retired it."""
+        with self._results_lock:
+            result = self._results.pop(client_id, None)
+            self._client_id_to_request_id.pop(client_id, None)
+        return result
 
     def __enter__(self):
         return self
@@ -1551,10 +1555,10 @@ class AwaitResponseHelper:
         is no point polling a dead engine.
 
         Scope: single-process worker (the path that backs ``LLM.generate``
-        and the bench async client). The IPC / proxy path tracks pending
+        and the bench async client). The classic IPC proxy tracks pending
         results on a different side of the boundary and would need a
         separate poison-pill on ``self.worker.result_queue``; that is left
-        as a follow-up consistent with the PyExecutor-side fix.
+        as a follow-up. RPC and Ray use the response stream in ``RpcWorkerMixin``.
 
         Because of that scope, this method also owns the rank-crash kill's
         delivery gate. The gate may only be set when a client verifiably

@@ -1191,13 +1191,14 @@ class PyExecutor:
 
         self._response_channel = ResponseChannel()
         # If the event-loop thread (PyExecutor._event_loop_wrapper) raises
-        # an exception (e.g. KV cache OOM), it is stashed here and read by
-        # two local consumers so they can surface it instead of hanging:
+        # an exception (e.g. KV cache OOM), it is stashed here so the
+        # response paths can surface it instead of hanging:
         #   - _await_single_response re-raises it as a RuntimeError, and
         #   - BaseWorker.AwaitResponseHelper (the bridge between this
         #     engine and per-request GenerationResult queues) reads it to
         #     broadcast an ErrorResponse to every pending request, waking
         #     callers parked in queue.get() / aqueue.get().
+        #   - RPC workers read execution_error to fail requests on the stream.
         self._event_loop_error: Optional[BaseException] = None
         # Set once the stashed error has been surfaced to a client. Gates the
         # rank-crash hard kill: if the failure is already reportable, killing
@@ -3289,6 +3290,11 @@ class PyExecutor:
 
     def wait_shutdown(self):
         self.shutdown_event.wait()
+
+    @property
+    def execution_error(self) -> BaseException | None:
+        """Return the terminal error, which may be known before response publication ends."""
+        return self._event_loop_error if self._event_loop_error is not None else self._fatal_error
 
     def enqueue_request(
             self,
