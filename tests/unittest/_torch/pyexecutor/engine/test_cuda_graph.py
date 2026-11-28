@@ -9,11 +9,14 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import (
     cuda_graph_capture,
     cuda_graph_disabled,
+    decode_tokens_per_forward,
     filter_cuda_graph_batch_sizes,
     filter_cuda_graph_num_tokens,
     filter_cuda_graph_seq_lens,
+    plan_cuda_graphs,
     resolve_cuda_graph_batch_sizes,
 )
+from tensorrt_llm.llmapi.llm_args import BaseLlmArgs, CudaGraphConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -52,6 +55,24 @@ def test_filter_cuda_graph_batch_sizes_respects_batch_and_token_budgets(
         )
         == expected
     )
+
+
+def test_decode_tokens_stay_within_the_token_budget_at_the_default_sizes() -> None:
+    """The default request and token budgets with four draft tokens per request: the largest
+    decode forward holds max_num_tokens // 5 requests, not max_batch_size (10240 tokens)."""
+    max_batch_size = BaseLlmArgs.model_fields["max_batch_size"].default
+    max_num_tokens = BaseLlmArgs.model_fields["max_num_tokens"].default
+    plan = plan_cuda_graphs(
+        CudaGraphConfig(),
+        None,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        max_seq_len=4096,
+        decode_tokens_per_request=5,
+    )
+    tokens = decode_tokens_per_forward(plan.batch_sizes, max_batch_size, max_num_tokens, 5)
+    assert tokens == [size * 5 for size in plan.batch_sizes] + [max_num_tokens // 5 * 5]
+    assert decode_tokens_per_forward([], 64, 4096, 4) == [256]
 
 
 @pytest.mark.parametrize(

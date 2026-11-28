@@ -19,6 +19,7 @@ def iteration_stats_row(
     gpu_forward_time_ms: Optional[float] = None,
     mm_encoder_stats: Optional[dict] = None,
     is_queue_snapshot: bool = False,
+    moe_load_balancer_stats: Optional[dict] = None,
 ) -> dict:
     """``stats`` as a dict, tagged with its attention-DP rank (0 without attention DP), with its
     request and KV-cache iteration stats and the profiler's per-loop timings when present.
@@ -46,4 +47,6 @@ def iteration_stats_row(
         row["schedulerMode"] = scheduler_mode
     if is_queue_snapshot:
         row["isQueueSnapshot"] = True
+    if moe_load_balancer_stats is not None:
+        row["moeLoadBalancerStats"] = moe_load_balancer_stats
     return row

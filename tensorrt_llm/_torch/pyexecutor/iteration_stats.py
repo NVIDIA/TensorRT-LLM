@@ -38,6 +38,9 @@ class IterationStatsRecord(NamedTuple):
     # Cumulative per-step counters of the enabled FMHA libraries that keep them,
     # by row field (e.g. ``sharedPrefixAttnStats``).
     fmha_step_stats: dict[str, dict[str, int]] | None = None
+    # Adaptive-MoE load-balancer counters of the rank (windows, installs, installedLayers,
+    # copiedBytes, imbalance, enabled), when an adaptive load balancer runs.
+    moe_load_balancer_stats: dict[str, int | float] | None = None
 
     @classmethod
     def from_tuple(cls, stats: tuple) -> IterationStatsRecord:
@@ -88,6 +91,7 @@ class IterationStatsRecord(NamedTuple):
             ("schedulerMode", self.scheduler_mode),
             ("multimodalEncoderStats", self.mm_encoder_stats),
             ("executorLoop", self.executor_loop),
+            ("moeLoadBalancerStats", self.moe_load_balancer_stats),
         )
         for name, value in optional_fields:
             if value is not None:

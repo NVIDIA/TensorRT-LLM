@@ -1297,6 +1297,50 @@
     },
     {
       "allowed_values": [
+        "on",
+        "off"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.balance"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_cache_max_entries"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_designs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_fixed_designs"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_holdout_z"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_iters"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_reps"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.calibration_warmup"
+    },
+    {
+      "allowed_values": [
         "per_layer_resident",
         "shared_banks"
       ],
@@ -1311,6 +1355,7 @@
     },
     {
       "allowed_values": [
+        "adaptive",
         "standard",
         "per_layer_dynamic"
       ],
@@ -1322,6 +1367,21 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_config.load_balancer.num_slots"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.rows_per_expert"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "file",
+        "off"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.time_model"
     },
     {
       "capture_policy": "int",

@@ -144,6 +144,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             "reduce_topk_in_kernel": bool,
             "helper_expert_count": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
+            # > 0: the router maps this many experts' staged ids to slots and counts them (adaptive load balancer;
+            # communication/nvlink_domain/adaptive_route.py). 0 (the default) builds the kernel without it.
+            "adaptive_route_experts": OptionalRequirement(int),
             "combine_dedup": OptionalRequirement(bool),
             "weight_layout": OptionalRequirement(str),
             # Combine-dedup knobs read by TokenCommDedup; a given one keys the kernel name (tail combine: default off).
@@ -235,6 +238,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         self.combine_dedup = bool(impl_desc.get("combine_dedup", False))
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         self._dedup_knobs = {key: impl_desc[key] for key in self._dedup_knob_tags if key in impl_desc}
         if self._dedup_knobs and not self.combine_dedup:
             raise ValueError(f"{sorted(self._dedup_knobs)} apply to combine_dedup=True only.")
@@ -514,7 +518,13 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             self._topk_reduce = TopkReduceDedup(self.hidden_size, self.world_size, self.combine_format)
         else:
             self._topk_reduce = TopkReduce(
-                self.hidden_size, self.topk, self.combine_format, shared_term=self.reduce_shared_output
+                self.hidden_size,
+                self.topk,
+                self.combine_format,
+                # With the adaptive route the reduce reads the caller's expert ids and drops picks outside
+                # [0, adaptive_route_experts), as the router does; None: the default reduce reads no ids.
+                num_experts=self.adaptive_route_experts or None,
+                shared_term=self.reduce_shared_output,
             )
 
     def _validate_cta_partition(self) -> None:
@@ -1099,6 +1109,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 f"_{self._dedup_knob_tags[key]}{int(value)}" for key, value in sorted(self._dedup_knobs.items())
             )
             + self._shared_name_suffix()
+            # Off keeps the name: its seven trailing adaptive-route operands are None and the router compiles no route.
+            + (f"_aroute{self.adaptive_route_experts}_v1" if self.adaptive_route_experts else "")
             # The tmp buffer is a third pointer operand, an ABI change: it keys the compiled kernel and its AOT symbol.
             + ("_tmpbuf_v1" if self.separate_tmp_buffer else "")
             # The ring size is baked into the pool layouts and the slot arithmetic.
@@ -1216,6 +1228,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
         fake_arguments.update(self._shared_fake_arguments(fake_tensor, tokens))
+        if self.adaptive_route_experts:
+            fake_arguments.update(
+                {f"adaptive_route_{name}": Int64(0) for name in ("tables", "stats", "forwards", "stats_enabled", "live_word")},
+                adaptive_route_stats_tokens=Int32(0),
+                adaptive_route_stats_first=Int32(1),
+            )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
@@ -1302,9 +1320,37 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         shared_fc2_weight: Optional[cute.Tensor] = None,  # (1, shared_intermediate_downproj, shared_output)
         shared_fc2_weight_sf: Optional[cute.Tensor] = None,  # (1, packed)
         shared_output: Optional[cute.Tensor] = None,  # (max_tokens_per_rank, shared_output) BF16, local
+        # Adaptive route (iff adaptive_route_experts > 0; _MetadataPushRouter.launch_router): device addresses of the
+        # layer's packed route table row, statistics row, forward count, statistics-enabled flag and live-row word,
+        # then the forward's token rows to count and whether this is its first call. The route itself always runs
+        # in a kernel built with adaptive_route_experts > 0; the stats_* operands and the live-row word only
+        # control the statistics.
+        adaptive_route_tables: Optional[cutlass.Int64] = None,
+        adaptive_route_stats: Optional[cutlass.Int64] = None,
+        adaptive_route_forwards: Optional[cutlass.Int64] = None,
+        adaptive_route_stats_enabled: Optional[cutlass.Int64] = None,
+        adaptive_route_live_word: Optional[cutlass.Int64] = None,
+        adaptive_route_stats_tokens: Optional[Int32] = None,
+        adaptive_route_stats_first: Optional[Int32] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
         check_reduce_operand_alignment(output_activation=output_activation, shared_output=shared_output)
+        # The seven adaptive-route operands come exactly with a kernel built with the route, as the READY pair does:
+        # without it the router would drop them unread, with it a missing one would reach the router as None.
+        adaptive_route_mismatch: cutlass.Constexpr = any(
+            (operand is None) == (self.adaptive_route_experts > 0)
+            for operand in (
+                adaptive_route_tables,
+                adaptive_route_stats,
+                adaptive_route_forwards,
+                adaptive_route_stats_enabled,
+                adaptive_route_live_word,
+                adaptive_route_stats_tokens,
+                adaptive_route_stats_first,
+            )
+        )
+        if cutlass.const_expr(adaptive_route_mismatch):
+            raise ValueError("The seven adaptive_route_* operands are passed iff adaptive_route_experts > 0.")
 
         helper_ready_bundle = (
             hot_expert_weight_ready_flags,
@@ -1382,6 +1428,22 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             self._device_workspace,
             stream,
             tmp_buffer=tmp_buffer,
+            # Only an adaptive-route kernel passes the argument: every other router keeps its signature.
+            **(
+                dict(
+                    adaptive_route=(
+                        adaptive_route_tables,
+                        adaptive_route_stats,
+                        adaptive_route_forwards,
+                        adaptive_route_stats_enabled,
+                        adaptive_route_live_word,
+                        adaptive_route_stats_tokens,
+                        adaptive_route_stats_first,
+                    )
+                )
+                if self.adaptive_route_experts > 0
+                else {}
+            ),
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
@@ -1637,12 +1699,14 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 )
             else:
                 reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
+                reduce_indices = topk_indices if cutlass.const_expr(self.adaptive_route_experts > 0) else None
                 self._topk_reduce(
                     pre_reduced_activation,
                     pre_reduced_activation_sf,
                     output_activation,
                     reduce_scores,
                     stream,
+                    topk_indices=reduce_indices,
                     shared_term=reduce_shared,
                 )
 

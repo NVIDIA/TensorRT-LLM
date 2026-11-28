@@ -184,6 +184,7 @@ class _DummyModelEngine:
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.warmup_purpose = None
+        self.moe_load_balancer = None
         self.attn_runtime_features = attn_runtime_features
         self.metrics = {}
         self.max_seq_len = max_seq_len

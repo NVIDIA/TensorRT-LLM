@@ -263,8 +263,11 @@ class DecoderCudaGraphs:
         context_promotion_supported: bool,
         warmup_inputs: torch.Tensor | None = None,
         inputs: DecoderInputPreparer | None = None,
+        moe_load_balancer: Any = None,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
+        # Its before_capture hook runs between the warmup's two passes (warmup_and_capture).
+        self._moe_load_balancer = moe_load_balancer
         self._inputs = inputs
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
         self._config = config
@@ -420,6 +423,12 @@ class DecoderCudaGraphs:
                     self.run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
+                # A load balancer's work that needs every decode shape launched once and nothing
+                # captured yet (adaptive EPLB's time model calibration); collective on every rank,
+                # which all run the same warmup.
+                before_capture = getattr(self._moe_load_balancer, "before_capture", None)
+                if before_capture is not None:
+                    before_capture()
                 self.reset_padding_dummies()
                 # Captured graphs keep the MoE communication timeouts that were
                 # current at capture, and serving replays them, so capture with the
@@ -549,6 +558,8 @@ class DecoderCudaGraphs:
             return "TLLM_CUDA_GRAPH_GEMM_TUNING tunes the GEMMs in the warmup-only pass"
         if not self.supports_single_pass_capture:
             return f"{type(self).__name__} relies on the warmup-only pass"
+        if getattr(self._moe_load_balancer, "calibrates_before_capture", False):
+            return "the MoE load balancer calibrates between the two passes (before_capture)"
         if self._agreement.is_distributed_forward() and self._agreement.allgather() is None:
             return "the ranks cannot agree on it through this engine's communicator"
         return None

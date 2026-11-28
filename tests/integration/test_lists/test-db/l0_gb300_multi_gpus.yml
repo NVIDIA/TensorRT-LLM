@@ -102,6 +102,16 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  # MegaMoE on four ranks drops padding rows on the SM103 kernel too (SM100: l0_dgx_b200).
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_megamoe_cutedsl_drops_padding_rows
+  # Adaptive EPLB on four ranks: the dispatch router's route bit for bit against the staged route and a layer
+  # without the balancer, and a graph replayed after an install.
+  - unittest/_torch/moe/test_megamoe_adaptive_route_e2e.py
+  # A fused shared expert's live rows under the adaptive route on four ranks: padding rows zero, statistics of
+  # the live rows only.
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_an_adaptive_route_keeps_the_fused_shared_experts_live_rows
+  # Adaptive EPLB: expert copies between four local ranks over MNNVL memory (torchrun).
+  - unittest/_torch/moe/multi_gpu/test_adaptive_eplb_transport_peer.py
   # Pre-merge runs it on DGX B200 only.
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   - unittest/_torch/modeling/test_modeling_llama.py
@@ -163,6 +173,8 @@ l0_gb300_multi_gpus:
   # DeepSeek-V4-Pro NVFP4 export with the embedded DSpark drafter on MegaMoE
   # CuTe DSL, DEP4 on one node: GSM8K plus an acceptance-length gate.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl TIMEOUT (30)
+  # The same run with adaptive EPLB replicating hot experts while decoding.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl_adaptive_eplb TIMEOUT (30)
   # DSpark confidence scheduling (ragged verification) on DeepSeek-V4-Flash, DEP4: GSM8K.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashDSpark::test_gsm8k_dep4_confidence_scheduling TIMEOUT (60)
   # DeepSeek-V4 DP4 on 4x GB300 (288 GB/GPU); Pro needs 288 GB-class GPUs for 4 ranks.
@@ -171,6 +183,8 @@ l0_gb300_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4] TIMEOUT (240)
   # DeepSeek-V4.1 on SM103: dynamic expert parallelism at attention TP against the static expert split.
   - unittest/_torch/moe/test_moe_ep_dynamic.py
+  # Adaptive EPLB's decode time model, DeepSeek-V4-Pro NVFP4 DEP4: calibrated at the first start, cached for the second.
+  - unittest/_torch/moe/test_adaptive_eplb_calibrate_gpu.py TIMEOUT (60)
   # DeepSeek-V4.1 on SM103: MegaMoE serving path, online expert placement, attention-DP
   # graph passes and breakable prefill graphs against eager prefill.
   - unittest/_torch/moe/test_megamoe_e2e.py

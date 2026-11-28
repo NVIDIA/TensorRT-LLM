@@ -730,7 +730,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             is_last_call: Whether this is the last call for the same weights
             ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. NVLINKTwoSided supports this.
         """
-        if self._using_dynamic_load_balancer():
+        if self._load_balancer_records_statistics():
             if ignore_allreduce:
                 self.layer_load_balancer.update_local_statistic(
                     token_selected_experts,
@@ -742,6 +742,18 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     is_first_stage=is_first_call,
                     is_last_stage=is_last_call,
                     allreduce=self.allreduce)
+
+    def _load_balancer_wait_for_statistic_allreduce(self) -> None:
+        """Order the current stream after the statistic allreduce.
+
+        Issued right before a fused-communication MoE kernel launch: by the
+        backend's ``run_moe`` through ``MoERunContext.before_launch`` when it
+        declares ``takes_before_launch``, otherwise by the scheduler before
+        ``run_moe``. See
+        SingleLayerMoeLoadBalancer.wait_for_statistic_allreduce.
+        """
+        if self._using_dynamic_load_balancer():
+            self.layer_load_balancer.wait_for_statistic_allreduce()
 
     @contextlib.contextmanager
     def load_balancer_overlap(self,
@@ -786,20 +798,38 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         from .moe_warmup_placement import count_routing
         count_routing(token_selected_experts, counters, router_logits)
 
-    def _load_balancer_route(self, token_selected_experts: torch.Tensor,
-                             use_dp: bool) -> torch.Tensor:
-        """Route tokens and enqueue a per-layer dynamic replica plan when enabled."""
+    def _load_balancer_route(self,
+                             token_selected_experts: torch.Tensor,
+                             use_dp: bool,
+                             token_final_scales: Optional[torch.Tensor] = None,
+                             quantize: Optional[tuple] = None) -> torch.Tensor:
+        """Route tokens and enqueue a per-layer dynamic replica plan when enabled.
+
+        ``token_final_scales`` lets a balancer that stages routes for the
+        backend write the gate weights beside the slots; a balancer that does
+        not take them is called without them. ``quantize`` (a backend's
+        ``(x, global_scale, x_fp4, x_sf)``) is quantized in the route's launch
+        by such a balancer.
+        """
         if not self.layer_load_balancer:
             return token_selected_experts
 
+        kwargs = {}
+        if token_final_scales is not None and self.layer_load_balancer.stages_routes:
+            kwargs["token_final_scales"] = token_final_scales
+        if quantize is not None:
+            kwargs["quantize"] = quantize
         overlap_fn = self._load_balancer_overlap_fn
-        if overlap_fn is None:
-            return self.layer_load_balancer.route(token_selected_experts,
-                                                  use_dp)
-        self._load_balancer_overlap_fn = None
-        return self.layer_load_balancer.route(token_selected_experts,
-                                              use_dp,
-                                              overlap_fn=overlap_fn)
+        if overlap_fn is not None:
+            self._load_balancer_overlap_fn = None
+            kwargs["overlap_fn"] = overlap_fn
+        return self.layer_load_balancer.route(token_selected_experts, use_dp,
+                                              **kwargs)
+
+    def _load_balancer_records_statistics(self) -> bool:
+        """Whether the layer's load balancer records the routed experts."""
+        return bool(self.layer_load_balancer
+                    and self.layer_load_balancer.records_statistics())
 
     def _load_balancer_uses_replica_plan(self) -> bool:
         """Whether routing is produced by the per-layer dynamic device planner."""

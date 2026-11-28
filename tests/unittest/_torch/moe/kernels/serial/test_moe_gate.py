@@ -293,6 +293,39 @@ class TestMoeGate:
         # With equal scores, weights should be equal
         assert torch.allclose(out_weights, out_weights[0:1].expand(4, TOPK), rtol=1e-4)
 
+    @pytest.mark.parametrize("is_hash", [False, True])
+    def test_gate_forward_without_tokens_launches_nothing(self, is_hash):
+        """Regression: gate_forward launched an empty grid on an empty batch, leaving a launch
+        error pending for the next op that checks its launches."""
+
+        def pending_launch_error():
+            # An op that checks its launches (route staging of one row) reports and clears it.
+            ids = torch.zeros(1, TOPK, dtype=torch.int32, device="cuda")
+            weights = torch.zeros(1, TOPK, device="cuda")
+            try:
+                torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids.clone(), weights.clone())
+            except RuntimeError as error:
+                return repr(error)
+            return None
+
+        pending_launch_error()  # clear an error an earlier test may have left
+        empty_ids = torch.empty(0, dtype=torch.int32, device="cuda")
+        bias = torch.empty(0 if is_hash else N_EXPERTS, dtype=torch.float32, device="cuda")
+        tid2eid = torch.zeros(16, TOPK, dtype=torch.int32, device="cuda") if is_hash else empty_ids
+        torch.ops.trtllm.gate_forward(
+            torch.empty(0, N_EXPERTS, dtype=torch.float32, device="cuda"),
+            bias,
+            empty_ids,
+            tid2eid,
+            torch.empty(0, TOPK, dtype=torch.float32, device="cuda"),
+            torch.empty(0, TOPK, dtype=torch.int32, device="cuda"),
+            TOPK,
+            1.0,
+            is_hash,
+        )
+        torch.cuda.synchronize()
+        assert pending_launch_error() is None
+
     @pytest.mark.parametrize("batch_size", [32, 128, 256, 1024])
     def test_gate_forward_performance(self, batch_size):
         """Benchmark gate forward for different batch sizes."""

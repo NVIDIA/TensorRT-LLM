@@ -93,10 +93,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
         self._profiling_scratch_provider_ref = None
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
-            (
-                shared_workspace_bytes,
-                supports_direct_inputs,
-            ) = query_rubin_kernel_properties(
+            properties = query_rubin_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -121,8 +118,11 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            shared_workspace_bytes = properties.shared_workspace_bytes
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
+            if properties.masks_invalid_routes:
+                self._padding_drop_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -300,8 +300,8 @@ class RubinMegaMoE(MegaMoECuteDsl):
         try:
             if stage is None:
                 return super()._run_moe(**kwargs)
-            launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
-            self._active_launch_max_tokens = None
+            # The stage carries this launch's rows; what quantize_input staged is spent with it.
+            launch_max_T, _ = self._take_launch_preparation()
             if stage.launch_max_T != launch_max_T or stage.num_tokens != kwargs["num_tokens"]:
                 raise RuntimeError(
                     "GLM MegaMoE direct stage does not match the lockstep launch bucket"
@@ -312,6 +312,9 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 and _MEGAMOE_PRIME_LADDER
                 and AutoTuner.get().is_tuning_mode
             ):
+                # The ladder launches the fused kernel too (MoERunContext.before_launch).
+                if kwargs.get("before_launch") is not None:
+                    kwargs["before_launch"]()
                 self._prime_ladder(
                     live_T=launch_max_T,
                     weight_view=kwargs["weight_view"],
@@ -344,6 +347,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 output_dtype=kwargs["output_dtype"],
                 launch_max_T=launch_max_T,
                 staged_inputs=True,
+                before_launch=kwargs.get("before_launch"),
             )
         finally:
             self._launch_defer = False
@@ -398,6 +402,10 @@ class RubinMegaMoE(MegaMoECuteDsl):
             weights.fc1_norm_const,
             output,
         ]
+        # This backend takes MoERunContext.before_launch (the EPLB statistic-allreduce wait): the
+        # generation kernel waits for the other ranks inside the kernel, as the generic one does.
+        if kw.get("before_launch") is not None:
+            kw["before_launch"]()
         shared.set_active_megamoe_cute_weight_cache(self._cute_weight_cache)
         provider = self._symm_providers.get(bucket) if kw.get("staged_inputs") else None
         shared.set_active_megamoe_cute_buffer_cache(

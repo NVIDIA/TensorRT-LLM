@@ -2735,8 +2735,6 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_megamoe_default_tactics.py]": 119.1035462184874,
    "unittest/_torch/moe/test_megamoe_e2e.py": 144.71066176470586,
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_megamoe_e2e.py]": 144.71066176470586,
-   "unittest/_torch/moe/test_megamoe_stage_inputs.py": 20.060468546637743,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_megamoe_stage_inputs.py]": 20.060468546637743,
    "unittest/_torch/moe/test_megamoe_streaming_load.py": 20.231152034261243,
    "test_unittests.py::test_unittests_v2[unittest/_torch/moe/test_megamoe_streaming_load.py]": 20.231152034261243,
    "unittest/_torch/moe/test_moe_backend.py -k \"kimi_k3_shape\"": 23.933,

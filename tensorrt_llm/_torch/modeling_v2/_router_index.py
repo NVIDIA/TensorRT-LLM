@@ -309,7 +309,7 @@ def _refuse_unhonored_moe_tactic(
 def moe_eplb_mode(config: "ModelConfig") -> Optional[str]:
     """The EPLB mode the engine runs this deployment with, for a route to gate layouts on.
 
-    ``static``, ``online`` or ``per_layer_dynamic`` (see ``moe_load_balancer_mode``),
+    ``static``, ``online``, ``per_layer_dynamic`` or ``adaptive`` (see ``moe_load_balancer_mode``),
     or None when the engine creates no MoE load balancer. Which modes a target
     implements is not a route's check: the resolver compares this mode with the
     target's ``EPLB_MODES``.

@@ -32,9 +32,9 @@ import torch
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
-from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, TypeAdapter, field_validator,
-                      model_validator)
+from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveFloat,
+                      PositiveInt, PrivateAttr, StrictInt, TypeAdapter,
+                      field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -2414,8 +2414,128 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
                 f"({num_experts}) for per-layer dynamic EPLB.")
 
 
+class MoeAdaptiveLoadBalancerConfig(_MoeLoadBalancerConfigBase):
+    """Configure decode-time adaptive EPLB."""
+
+    mode: Literal["adaptive"] = Field(
+        default="adaptive",
+        description=
+        "EPLB mode. `adaptive` keeps one copy of every expert on its home slot and, while decoding, replicates hot experts into the remaining slots when the MoE backend's time model predicts that the replication repays its measured copy cost. Routing and statistics run inside CUDA graphs. Requires a MoE backend that supports adaptive EPLB (currently `MEGAMOE_CUTEDSL`).",
+        status="prototype")
+    num_slots: PositiveInt = Field(
+        description=
+        "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and at least the number of experts; the slots beyond one per expert hold replicas. A placement fills at most half of the replica slots (rounded up per rank); the other half stays empty so that every install has free slots to copy new replicas into.",
+        status="prototype")
+    balance: Literal["on", "off"] = Field(
+        default="on",
+        description=
+        "`on` balances the decode steps. `off` runs every balanced MoE layer as without a load balancer, on the home slots that hold one copy of each expert: no replica, route table lookup or statistics, the backend's kernel of the expert count per rank.",
+        status="prototype")
+    rows_per_expert: PositiveInt = Field(
+        default=512,
+        description=
+        "Routed rows a statistics window collects per expert before the policy decides. A window lasts as many forwards as the previous window's rows per forward need to reach it, so the per-expert load it measures has a relative standard error of about 1/sqrt(rows_per_expert) (4.4 % at the default) at any batch size or draft length. The default is derived from that error target, not tuned per model or platform.",
+        status="prototype")
+    time_model: Literal["auto", "file", "off"] = Field(
+        default="auto",
+        description=
+        "Where the MoE backend's decode time model comes from. `auto`: the calibration of this run (GPU, EP group, slots and decode kernels) cached under `calibration_cache_dir`, else one measured during the CUDA graph warmup, before capture, and cached. `file`: `time_model_file` only. `off`: none. Adaptive EPLB stays off with a warning when the time model is off, the file does not hold for the run, or no measured bucket passes its hold-out check; a bucket that fails it has no trusted model, so no layout decision is made while the batch runs in that bucket.",
+        status="prototype")
+    time_model_file: Optional[str] = Field(
+        default=None,
+        description=
+        "Calibration file of the MoE backend's decode time model for `time_model: file`, written by `examples/wide_ep/ep_load_balancer/measure_adaptive_eplb_time_model.py` on this platform: one measured scale and read cost per CUDA graph bucket. It must hold for the GPU, the EP group, the slots and every decode bucket of the deployment.",
+        status="prototype")
+    calibration_cache_dir: Optional[str] = Field(
+        default=None,
+        description=
+        "Directory of the calibrations `time_model: auto` measures, one file per run identity, which rank 0 reads and writes; beside each, `<file>.times.json` keeps every bucket's design times to audit or replay its fit. Defaults to `adaptive_eplb` under `TRTLLM_CACHE_DIR`, where the autotuner keeps its cache; without either, or when the directory is not writable, a calibration lives in memory for the run only.",
+        status="prototype")
+    calibration_cache_max_entries: NonNegativeInt = Field(
+        default=32,
+        description=
+        "Calibrations `calibration_cache_dir` keeps: after rank 0 writes one, it deletes the oldest by write time beyond this many, each with its `.times.json`; 0 keeps all. Only files that parse as calibrations count or are deleted, so a shared directory keeps everything else. An entry with its times is about 37 KB, so 32 keep about 1.2 MB: room for the identities of several deployments (GPU, EP size, slots, decode kernels) across a few builds and drivers, while a calibration evicted too early costs one more measurement in the warmup (about 40 s at EP32).",
+        status="prototype")
+    calibration_designs: PositiveInt = Field(
+        default=128,
+        ge=12,
+        description=
+        "Random slot-row designs timed per decode bucket by the `auto` calibration, every fourth held out. At least 12: the held-out scale is a line fitted on three or more designs, the fewest that leave it a residual.",
+        status="prototype")
+    calibration_fixed_designs: PositiveInt = Field(
+        default=8,
+        description=
+        "Designs of the home slots alone per decode bucket that time the route op's cost of a replica; times `calibration_reps` gives the paired differences it averages (24 by default), at least 2 for its standard error.",
+        status="prototype")
+    calibration_reps: PositiveInt = Field(
+        default=3,
+        description=
+        "Passes over every bucket's designs, in a new order each pass.",
+        status="prototype")
+    calibration_iters: PositiveInt = Field(
+        default=10,
+        description="Timed launches per design and pass.",
+        status="prototype")
+    calibration_warmup: NonNegativeInt = Field(
+        default=2,
+        description="Untimed launches before a design's timed launches.",
+        status="prototype")
+    calibration_holdout_z: PositiveFloat = Field(
+        default=3.0,
+        description=
+        "A bucket's calibration holds when the scale fitted on its held-out designs differs from the other designs' by at most this many standard errors (bootstrap over the designs); else that bucket has no trusted model and no layout decision is made while the batch runs in it, and with no bucket held adaptive EPLB stays off.",
+        status="prototype")
+
+    @model_validator(mode="after")
+    def _check_time_model_file(self) -> "MoeAdaptiveLoadBalancerConfig":
+        if (self.time_model == "file") != (self.time_model_file is not None):
+            raise ValueError(
+                "`time_model_file` is set exactly when `time_model` is `file`")
+        if self.calibration_fixed_designs * self.calibration_reps < 2:
+            raise ValueError(
+                "`calibration_fixed_designs` x `calibration_reps` must be at least 2: the route cost's standard error needs two timings"
+            )
+        return self
+
+    def validate_expert_capacity(self, num_experts: int) -> None:
+        """Validate that every EP rank homes as many experts and every expert has a slot."""
+        if self._ep_size is None:
+            raise ValueError("Call setup() before validating expert capacity.")
+        if num_experts <= 0 or num_experts % self._ep_size != 0:
+            raise ValueError(
+                f"`num_experts` ({num_experts}) must be a positive multiple of "
+                f"`ep_size` ({self._ep_size}) for adaptive EPLB.")
+        if self.num_slots < num_experts:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must be at least `num_experts` "
+                f"({num_experts}) for adaptive EPLB.")
+        least = self.least_slots(num_experts)
+        if self.num_slots < least:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must be at least {least} for adaptive EPLB "
+                f"with {num_experts} experts at `ep_size` {self._ep_size}: a layout leaves "
+                "half of each rank's spare slots free, and with no free slot on a rank no "
+                "install can copy a new replica there, so the layout freezes at its first one."
+            )
+
+    def least_slots(self, num_experts: int) -> int:
+        """The fewest slots with which every planned layout leaves each rank a free slot.
+
+        An install copies new replicas into free slots: the slots ``policy.active_slots`` leaves
+        unfilled, searched one rank's worth of slots at a time.
+        """
+        from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+            ExpertGeometry, active_slots)
+        slots = num_experts
+        while active_slots(ExpertGeometry(num_experts, slots,
+                                          self._ep_size)) >= slots:
+            slots += self._ep_size
+        return slots
+
+
 MoeLoadBalancerConfigType = Annotated[
-    Union[MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig],
+    Union[MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig,
+          MoeAdaptiveLoadBalancerConfig],
     PydanticField(discriminator="mode"),
 ]
 _MOE_LOAD_BALANCER_ADAPTER = TypeAdapter(MoeLoadBalancerConfigType)
@@ -2569,7 +2689,8 @@ class MoeConfig(StrictBaseModel):
 
     load_balancer: Optional[Union[MoeLoadBalancerConfigType, str]] = Field(
         default=None,
-        description="Configuration for standard or per-layer dynamic EPLB.")
+        description=
+        "Configuration for standard, per-layer dynamic or adaptive EPLB.")
 
     disable_finalize_fusion: bool = Field(
         default=False,
@@ -2620,7 +2741,12 @@ class MoeConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def resolve_load_balancer_compatibility(self) -> "MoeConfig":
-        """Resolve the backend required by per-layer dynamic EPLB."""
+        """Resolve the backend required by per-layer dynamic EPLB.
+
+        Also refuse a backend or tactic that cannot run adaptive EPLB.
+        """
+        if getattr(self.load_balancer, "mode", None) == "adaptive":
+            self._check_adaptive_backend()
         required_backend = auto_moe_backend_for_load_balancer(
             self.load_balancer)
         if required_backend == "AUTO":
@@ -2646,6 +2772,40 @@ class MoeConfig(StrictBaseModel):
             raise ValueError("per-layer dynamic EPLB requires "
                              f"backend={required_backend!r}")
         return self
+
+    def _check_adaptive_backend(self) -> None:
+        """Refuse a backend or tactic under which no MoE layer can balance.
+
+        ``AUTO`` stays: resolution picks an implementation that supports
+        adaptive EPLB for each layer that has one and runs the others (an MTP
+        layer in another format, say) as plain EP outside the balancer. A
+        backend or tactic that excludes every such implementation would leave
+        the balancer with no layer, so it is refused here, before the model
+        loads.
+        """
+        supported = "MEGAMOE_CUTEDSL"
+        fix = (f"Set moe_config.backend to {supported!r} or 'AUTO' (AUTO "
+               f"selects {supported} for every layer it can serve), or drop "
+               "moe_config.load_balancer to run without a load balancer.")
+        why = (f"adaptive EPLB runs only on the {supported} MoE backend "
+               "(NVFP4 experts, SM100 / SM103 / SM107): the balancer installs "
+               "replicas into that backend's expert slots and routes through "
+               "its route table")
+        if self.tactic is not None:
+            request = _moe_tactic_request(self.tactic, "moe_config.tactic")
+            if not any(impl_cls.capabilities.supports_adaptive_eplb
+                       for impl_cls in request.impls):
+                matched = [
+                    impl_cls.descriptor.impl_id for impl_cls in request.impls
+                ]
+                raise ValueError(
+                    f"moe_config.tactic={self.tactic!r} matches {matched}, none "
+                    f"of which supports adaptive EPLB; {why}. Use a tactic "
+                    f"that matches {supported} (e.g. 'cutedsl.mega_moe'), or drop "
+                    "moe_config.load_balancer.")
+        elif self.backend not in ("AUTO", supported):
+            raise ValueError(f"moe_config.backend={self.backend!r} cannot run "
+                             f"adaptive EPLB: {why}. {fix}")
 
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']

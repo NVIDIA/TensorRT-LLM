@@ -62,6 +62,10 @@ class _KernelMetadata:
     def get_workspace_sizes(self) -> tuple[int, int]:
         return 384, 1024 if self.implementation.get("combine_dedup") else 768
 
+    @classmethod
+    def impl_desc_require(cls) -> dict:
+        return {}
+
 
 class _GenphaseMetadata(_KernelMetadata):
     @classmethod
@@ -73,6 +77,14 @@ class _GenericMetadata(_KernelMetadata):
     @classmethod
     def problem_desc_require(cls) -> dict:
         return {}
+
+
+class _AdaptiveRouteMetadata(_GenericMetadata):
+    """A kernel whose dispatch router has the adaptive route, as the Blackwell kernel's does."""
+
+    @classmethod
+    def impl_desc_require(cls) -> dict:
+        return {"adaptive_route_experts": int}
 
 
 @pytest.fixture
@@ -123,7 +135,7 @@ def op(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     imports = {
         "cutlass.cute.nvgpu": {"OperandMajorMode": SimpleNamespace(K="K")},
         "tensorrt_llm._torch.moe.kernels.megamoe_kernels": {
-            "BlackwellInferenceMegaMoE": _GenericMetadata,
+            "BlackwellInferenceMegaMoE": _AdaptiveRouteMetadata,
             "RubinInferenceMegaMoE": _GenericMetadata,
             "RubinInferenceGenphaseMegaMoE": _GenphaseMetadata,
         },
@@ -201,7 +213,9 @@ def test_query_and_runner_build_the_same_dedup_kernel(
         key: value for key, value in problem.items() if key not in {"local_rank", "output_dtype"}
     }
     # The probe sizes the shared workspace from the dedup kernel itself.
-    assert op.query_megamoe_kernel_properties(**query, tactic=_DEDUP) == (1024, False)
+    properties = op.query_megamoe_kernel_properties(**query, tactic=_DEDUP)
+    assert properties.shared_workspace_bytes == 1024
+    assert not properties.supports_direct_inputs
     runner = op.Sm100MegaMoENvfp4Runner(**problem)
     kernel = runner._build_kernel_once(_DEDUP)
     assert isinstance(kernel, _GenericMetadata)
@@ -218,11 +232,31 @@ def test_query_and_runner_build_the_same_dedup_kernel(
     assert runner._tactic_cache_key(_DEDUP) != runner._tactic_cache_key(plain)
 
 
-@pytest.mark.parametrize("sm_version, capacity", [(107, 256), (100, 8192)])
-def test_dedup_never_reaches_a_kernel_without_the_option(
-    op: types.ModuleType, sm_version: int, capacity: int
+def test_runner_passes_an_adaptive_route_only_when_it_has_one(
+    op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    common = dict(
+    """A runner without an adaptive route builds its kernel from the same arguments as the
+    properties query: it passes no adaptive_route_experts at all."""
+    calls = []
+    original = op._construct_megamoe_kernel
+    monkeypatch.setattr(
+        op, "_construct_megamoe_kernel", lambda **kw: calls.append(kw["common"]) or original(**kw)
+    )
+    # The generic kernel of this bucket stands in for one with the adaptive route.
+    kernels = sys.modules["tensorrt_llm._torch.moe.kernels.megamoe_kernels"]
+    monkeypatch.setattr(kernels, "RubinInferenceMegaMoE", _AdaptiveRouteMetadata)
+    for experts in (0, 3):
+        op.Sm100MegaMoENvfp4Runner(**_problem(), adaptive_route_experts=experts)._build_kernel_once(
+            _DEDUP
+        )
+    assert "adaptive_route_experts" not in calls[0]
+    assert calls[1].pop("adaptive_route_experts") == 3
+    assert calls[0] == calls[1]
+
+
+def _kernel_common(capacity: int, **options: object) -> dict:
+    """The kernel builder's arguments of a bucket of ``capacity`` tokens per rank."""
+    return dict(
         static_expert_shape=(96, 6144, 7168),
         world_size=4,
         num_topk=6,
@@ -251,11 +285,70 @@ def test_dedup_never_reaches_a_kernel_without_the_option(
         in_kernel_fc2_reduce=False,
         fc2_tma_stages=2,
         weight_evict_first=False,
-        combine_dedup=True,
+        **options,
     )
+
+
+@pytest.mark.parametrize("sm_version, capacity", [(107, 256), (100, 8192)])
+def test_dedup_never_reaches_a_kernel_without_the_option(
+    op: types.ModuleType, sm_version: int, capacity: int
+) -> None:
+    common = _kernel_common(capacity, combine_dedup=True)
     # A gen-phase bucket and the Blackwell kernel would drop the undeclared option.
     with pytest.raises(ValueError, match="SM107 generic MegaMoE kernel only"):
         op._construct_megamoe_kernel(sm_version=sm_version, common=common, combine_format="bf16")
+
+
+@pytest.mark.parametrize("capacity", [256, 8192], ids=["genphase", "generic"])
+def test_an_adaptive_route_never_reaches_a_kernel_without_it(
+    op: types.ModuleType, capacity: int
+) -> None:
+    """A kernel class that declares no adaptive route (the stubs here) may still forward the option
+    to a router that then maps expert ids while the kernel passes it no route table, or refuse it
+    in a gen-phase bucket, which would fall back to the generic kernel. Both are refused at
+    construction."""
+    common = _kernel_common(capacity, adaptive_route_experts=384)
+    with pytest.raises(NotImplementedError, match="no adaptive route in its dispatch router"):
+        op._construct_megamoe_kernel(sm_version=107, common=common, combine_format="bf16")
+    kernel = op._construct_megamoe_kernel(sm_version=100, common=common, combine_format="bf16")
+    assert kernel.implementation["adaptive_route_experts"] == 384
+
+
+def test_a_built_kernel_routes_adaptively_only_through_a_router_that_declares_it(
+    op: types.ModuleType,
+) -> None:
+    """A kernel class that declares the adaptive route still routes a bucket adaptively only when
+    the router its token comm built for that bucket declares it too."""
+
+    def built(router_cls):
+        kernel = _AdaptiveRouteMetadata()
+        kernel.token_comm = types.SimpleNamespace(_router=router_cls())
+        return kernel
+
+    class _Router:
+        @classmethod
+        def impl_desc_require(cls) -> dict:
+            return {}
+
+    class _AdaptiveRouter(_Router):
+        @classmethod
+        def impl_desc_require(cls) -> dict:
+            return {"adaptive_route_experts": int}
+
+    assert op.megamoe_kernel_routes_adaptive(_AdaptiveRouteMetadata)
+    assert op.megamoe_kernel_routes_adaptive(built(_AdaptiveRouter))
+    assert not op.megamoe_kernel_routes_adaptive(built(_Router))
+    assert not any(map(op.megamoe_kernel_routes_adaptive, (_GenphaseMetadata, _GenericMetadata)))
+
+
+def test_the_properties_tell_whether_a_bucket_routes_adaptively(op: types.ModuleType) -> None:
+    query = _problem()
+    for key in ("local_rank", "output_dtype"):
+        query.pop(key)
+    assert not op.query_megamoe_kernel_properties(**query).routes_adaptive
+    kernels = sys.modules["tensorrt_llm._torch.moe.kernels.megamoe_kernels"]
+    kernels.RubinInferenceMegaMoE = _AdaptiveRouteMetadata
+    assert op.query_megamoe_kernel_properties(**query).routes_adaptive
 
 
 def test_shape_defaults_and_autotune_space_never_select_dedup(op: types.ModuleType) -> None:
@@ -361,7 +454,9 @@ def test_query_sizes_the_provider_for_dedup_and_its_base(
             max_tokens_per_rank=tokens,
             gate_up_clamp=10.0,
         )
-        assert op.query_megamoe_kernel_properties(**query) == (max(world, 6) * 128, False)
+        properties = op.query_megamoe_kernel_properties(**query)
+        assert properties.shared_workspace_bytes == max(world, 6) * 128
+        assert not properties.supports_direct_inputs
         key = op._sm107_dsv4_pro_problem_key(world, experts, tokens)
         runner = op.Sm100MegaMoENvfp4Runner(**_problem(**query, output_dtype="torch.bfloat16"))
         assert runner.unique_id() == key

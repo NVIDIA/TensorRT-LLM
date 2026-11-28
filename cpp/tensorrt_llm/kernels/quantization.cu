@@ -32,6 +32,67 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+__global__ static void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4, float const* scalePtr)
+{
+    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
+    {
+        float const scale = __ldg(scalePtr);
+        char4 tmp;
+        float4 const floatTmp = __ldg(src + idx);
+        tmp.x = cuda_cast<int8_t>(floatTmp.x * scale);
+        tmp.y = cuda_cast<int8_t>(floatTmp.y * scale);
+        tmp.z = cuda_cast<int8_t>(floatTmp.z * scale);
+        tmp.w = cuda_cast<int8_t>(floatTmp.w * scale);
+        dst[idx] = tmp;
+    }
+}
+
+__global__ static void quantizedKernel(char4* dst, half2 const* src, int64_t const sizeDiv4, float const* scalePtr)
+{
+    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
+    {
+        float const scale = __ldg(scalePtr);
+        char4 tmp;
+        int srcId = idx << 1;
+
+        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
+
+        half2 const half2Tmp = reinterpret_cast<half2 const&>(h2.x);
+        half2 const half2Tmp2 = reinterpret_cast<half2 const&>(h2.y);
+
+        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.x) * scale);
+        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.y) * scale);
+        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp2.x) * scale);
+        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp2.y) * scale);
+        dst[idx] = tmp;
+    }
+}
+
+#ifdef ENABLE_BF16
+__global__ static void quantizedKernel(
+    char4* dst, __nv_bfloat162 const* src, int64_t const sizeDiv4, float const* scalePtr)
+{
+    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
+    {
+        float const scale = __ldg(scalePtr);
+        char4 tmp;
+        int srcId = idx << 1;
+
+        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
+
+        __nv_bfloat162 const bfloat162Tmp = reinterpret_cast<__nv_bfloat162 const&>(h2.x);
+        __nv_bfloat162 const bfloat162Tmp2 = reinterpret_cast<__nv_bfloat162 const&>(h2.y);
+
+        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.x) * scale);
+        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.y) * scale);
+        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.x) * scale);
+        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.y) * scale);
+
+        dst[idx] = tmp;
+    }
+}
+#endif
+
 template <typename T>
 void invokeQuantization(
     int8_t* dst, T const* src, int64_t const size, float const* scalePtr, cudaStream_t stream, int maxGridSize)

@@ -58,6 +58,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import (
     RankKvCacheStats,
+    RankMoeLoadBalancerStats,
     RankSchedulingCounters,
     RankSpecDecodingStats,
 )
@@ -2664,3 +2665,62 @@ class TestDefaultADPRouterKVBalance:
         queue = _gen_queue([8000, 300, 400])
         chosen, placement = router.pop_requests(queue, _states([20000, 21000], [8, 7]), 1, 8)
         assert _ids(chosen) == [0] and placement == {}
+
+
+def test_moe_snapshot_rank_state_roundtrip_and_legacy_frame():
+    """Transport each rank's counters without changing messages that lack MoE stats."""
+    for rank in range(4):
+        payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=11)
+        legacy = payload.serialize()
+        assert legacy == [1, 11, 0, 0, 0, 0, 0, 0, 0]
+        payload.moe_load_balancer_stats = RankMoeLoadBalancerStats(
+            rank + 1, rank * 2, rank * 3, rank * 4096, 1.25 + rank, 1
+        )
+        state = RankState(
+            rank=rank, iter_stats=payload, num_context_requests=7, num_generation_requests=5
+        )
+        for include_load in (False, True):
+            encoded = state.serialize(include_load)
+            restored = RankState.deserialize(encoded)
+            assert restored == state
+            assert restored.iter_stats.moe_load_balancer_stats.as_dict() == dict(
+                windows=rank + 1,
+                installs=rank * 2,
+                installedLayers=rank * 3,
+                copiedBytes=rank * 4096,
+                imbalance=1.25 + rank,
+                enabled=1,
+            )
+            with pytest.raises(ValueError):
+                RankState.deserialize(encoded[:-1])
+        payload.moe_load_balancer_stats = None
+        assert payload.serialize() == legacy
+
+
+def test_moe_snapshot_coexists_with_old_snapshots():
+    """The MoE stats frame has a wire version of its own: the earlier snapshot frames stay intact,
+    and the MoE counters follow their fields."""
+    kv = RankKvCacheStats(100, 80, 20, 16, 40, 30, 7, 5, 0.375)
+    payload = RankIterStatsPayload(
+        has_iter_stats=1, kv_cache_stats=kv, specdec_stats=RankSpecDecodingStats(3, 2, 1)
+    )
+    old = payload.serialize()
+    assert old[0] == -3
+    assert RankIterStatsPayload.deserialize(old) == payload
+    payload.moe_load_balancer_stats = RankMoeLoadBalancerStats(0, 0, 0)
+    new = payload.serialize()
+    assert new[0] == -5
+    assert RankIterStatsPayload.deserialize(new) == payload
+    bad = new.copy()
+    bad[6] = 2
+    with pytest.raises(ValueError):
+        RankIterStatsPayload.deserialize(bad)
+    # The queued counters and pending-work flag travel with the MoE counters.
+    payload.num_queued_gen_requests = 4
+    payload.has_pending_work = True
+    assert RankIterStatsPayload.deserialize(payload.serialize()) == payload
+    payload.moe_load_balancer_stats = None
+    assert payload.serialize()[0] == -4
+    payload.num_queued_gen_requests = 0
+    payload.has_pending_work = False
+    assert payload.serialize() == old

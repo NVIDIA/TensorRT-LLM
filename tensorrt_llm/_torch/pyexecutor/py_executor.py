@@ -132,9 +132,9 @@ from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          MultimodalEncoderRequestError, get_draft_token_length,
-                          get_mm_context_chunk_start, get_mm_items_for_chunk,
-                          get_mm_pending_items,
+                          MultimodalEncoderRequestError, generation_progress,
+                          get_draft_token_length, get_mm_context_chunk_start,
+                          get_mm_items_for_chunk, get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
@@ -906,6 +906,9 @@ class PyExecutor:
         self._profile_manager = PyExecutorProfileManager(self)
 
         self.model_engine = model_engine
+        # The engine's load balancer (None for most models): the executor
+        # feeds it the scheduled batches and reports its iteration stats.
+        self._moe_load_balancer = model_engine.moe_load_balancer
         self._uses_torch_compile = model_engine.uses_torch_compile
 
         model = self.model_engine.model
@@ -4156,6 +4159,9 @@ class PyExecutor:
                 prev_device_step_time_ms = self._latest_prev_device_step_time_ms
 
         scheduler_mode = self._stats_scheduler_mode()
+        balancer = getattr(self, "_moe_load_balancer", None)
+        balancer_stats = (balancer.iteration_stats()
+                          if balancer is not None else None)
 
         # Legacy callers keep the historical tuple slot order: the saved stats
         # buffer used to carry attention_dp_rank on rank-local rows. Those rows
@@ -4183,7 +4189,8 @@ class PyExecutor:
             mm_encoder_stats=mm_encoder_stats,
             executor_loop=loop_metrics,
             fmha_step_stats=(fmha_step_stats(self.kv_cache_manager)
-                             if self._fmha_step_stats_enabled else None))
+                             if self._fmha_step_stats_enabled else None),
+            moe_load_balancer_stats=balancer_stats)
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -4351,6 +4358,7 @@ class PyExecutor:
                                         batch_state.scheduled_batch_stats,
                                         current_batch=current_batch)
         if self.enable_attention_dp:
+            balancer = getattr(self, "_moe_load_balancer", None)
             self._adp_iter_stats.queue(
                 stats,
                 req_stats,
@@ -4358,7 +4366,9 @@ class PyExecutor:
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                moe_load_balancer_stats=None
+                if balancer is None else balancer.iteration_stats())
         else:
             self._append_iter_stats(
                 stats,
@@ -12499,6 +12509,22 @@ class PyExecutor:
                         "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
 
             cache_indirection_buffer = self.sampler.get_cache_indirection()
+
+            balancer = getattr(self, "_moe_load_balancer", None)
+            if balancer is not None:
+                generation = scheduled_requests.generation_requests
+                # The forward lays out the context tokens first, then each
+                # generation request's token and draft tokens.
+                generation_tokens = sum(1 + get_draft_token_length(req)
+                                        for req in generation)
+                balancer.observe_scheduled_batch(
+                    len(generation),
+                    not scheduled_requests.context_requests,
+                    self.is_warmup,
+                    lambda start, stop: generation_progress(
+                        generation, start, stop),
+                    generation_rows=(num_ctx_tokens,
+                                     num_ctx_tokens + generation_tokens))
 
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations. With the

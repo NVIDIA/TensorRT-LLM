@@ -61,6 +61,13 @@ def test_serialization_allowed_class():
             ).MoePerLayerDynamicLoadBalancerConfig(num_slots=16),
             id="per-layer-dynamic",
         ),
+        pytest.param(
+            __import__(
+                "tensorrt_llm.llmapi.llm_args",
+                fromlist=["MoeAdaptiveLoadBalancerConfig"],
+            ).MoeAdaptiveLoadBalancerConfig(num_slots=16),
+            id="adaptive",
+        ),
     ],
 )
 def test_moe_load_balancer_configs_use_restricted_serialization(config):

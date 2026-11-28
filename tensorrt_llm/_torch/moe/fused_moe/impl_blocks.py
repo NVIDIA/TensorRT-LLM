@@ -69,6 +69,12 @@ class MoEExecutionContractMixin:
     # (``trtllm_gen.decode_moe.rows_in_lamport``).
     takes_lamport_fc2_out: bool = False
 
+    # ``run_moe`` calls ``MoERunContext.before_launch`` itself, after its own
+    # input preparation and before its first kernel that waits for peer ranks;
+    # a scheduler then hands it that wait instead of issuing it before
+    # ``run_moe``.
+    takes_before_launch: bool = False
+
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
         """Whether ``run_moe`` can write its output into the alltoall workspace.
 

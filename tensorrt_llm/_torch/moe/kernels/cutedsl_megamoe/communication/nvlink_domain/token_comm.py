@@ -1178,7 +1178,7 @@ class _MetadataPushRouter(AdaptiveRouteMixin, KernelComponent):
         for register_idx in cutlass.range_constexpr(elements_per_thread):
             if cutlass.const_expr(topk_indices.dtype.width == 64):
                 expert_registers[register_idx] = raw_indices_i32[2 * register_idx]
-            token_idx, _ = self._router_value_coordinate(register_idx, topk_indices.dtype)
+            token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_indices.dtype)
             if cutlass.const_expr(self.adaptive_route_experts > 0):
                 # Expert ids: count the live rows' picks and route each through the layer's tables; any other
                 # id becomes -1, which the slot test below drops.
@@ -1193,6 +1193,9 @@ class _MetadataPushRouter(AdaptiveRouteMixin, KernelComponent):
                         token_idx,
                         self._router_local_rank,
                     )
+                    if cutlass.const_expr(self.dropped_pick_cells is not None):
+                        if expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count):
+                            self._zero_dropped_pick_cells(self._device_workspace, token_idx * Int32(self.topk) + topk_slot)
                 else:
                     expert_registers[register_idx] = Int32(-1)
                 is_invalid = expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)
@@ -1536,6 +1539,20 @@ class TokenCommNonDeterministic(KernelComponent):
             if self.one_round_dispatch
             else _MetadataPushRouter(problem_desc, impl_desc)
         )
+        if self._router.adaptive_route_experts > 0 and not self.reduce_topk_in_kernel:
+            quantized = self.combine_format.is_quantized
+            cell_bytes = self.hidden_size * self.combine_format.act_dtype.width // 8
+            sf_bytes = self.combine_sf_hidden_padded * self.combine_format.scale_dtype.width // 8 if quantized else 0
+            if cell_bytes <= 0 or cell_bytes % 8 != 0 or (quantized and (sf_bytes <= 0 or sf_bytes % 8 != 0)):
+                raise ValueError(
+                    f"Adaptive route combine cells must be positive multiples of 8 bytes, got cell={cell_bytes}, sf={sf_bytes}."
+                )
+            self._router.dropped_pick_cells = (
+                self.pre_reduced_activation_region,
+                cell_bytes,
+                self.pre_reduced_activation_sf_region if quantized else None,
+                sf_bytes,
+            )
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
         self._device_workspace = None
         self._token_comm_args = None
@@ -1886,9 +1903,6 @@ class TokenCommNonDeterministic(KernelComponent):
         tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         if cutlass.const_expr(self.one_round_dispatch):
-            if cutlass.const_expr(adaptive_route is not None):
-                # TensorRT-LLM local patch: the one-round router (TensorRT-LLM local) has no adaptive route.
-                raise ValueError("The one-round dispatch router has no adaptive route.")
             self._router.launch_router(
                 topk_indices,
                 topk_scores,
@@ -1901,6 +1915,8 @@ class TokenCommNonDeterministic(KernelComponent):
                 device_workspace,
                 stream,
                 tmp_buffer=tmp_buffer,
+                # Only an adaptive-route build passes it: every other router keeps its signature.
+                **({} if adaptive_route is None else {"adaptive_route": adaptive_route}),
             )
         else:
             self._router.launch_router(

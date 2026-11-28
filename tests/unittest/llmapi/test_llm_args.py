@@ -56,8 +56,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
                                           ExecutorMemoryType, KvCacheConfig,
-                                          MambaStateConfig, MoeConfig,
-                                          MoeLoadBalancerConfig,
+                                          MambaStateConfig,
+                                          MoeAdaptiveLoadBalancerConfig,
+                                          MoeConfig, MoeLoadBalancerConfig,
                                           MoePerLayerDynamicLoadBalancerConfig,
                                           MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
@@ -745,6 +746,115 @@ class TestMoeConfigTactic:
         kwargs = checkpoint_loader.load_config.call_args.kwargs
         assert kwargs["moe_tactic"] == "grouped_gemm.nvfp4"
         assert kwargs["moe_backend"] == "AUTO"
+
+
+@pytest.mark.cpu_only
+class TestMoeConfigAdaptiveEplb:
+
+    def test_adaptive_mode_parses_to_its_config(self) -> None:
+        config = MoeConfig(backend="MEGAMOE_CUTEDSL",
+                           load_balancer={
+                               "mode": "adaptive",
+                               "num_slots": 512
+                           })
+        assert isinstance(config.load_balancer, MoeAdaptiveLoadBalancerConfig)
+        assert config.load_balancer.num_slots == 512
+
+    @pytest.mark.parametrize("backend", ["AUTO", "MEGAMOE_CUTEDSL"])
+    def test_keeps_a_backend_that_can_balance(self, backend: str) -> None:
+        """AUTO stays AUTO; no model is refused here.
+
+        Resolution picks MegaMoE CuteDSL per layer and runs a layer it cannot
+        serve as plain EP.
+        """
+        config = MoeConfig(backend=backend,
+                           load_balancer={
+                               "mode": "adaptive",
+                               "num_slots": 512
+                           })
+        assert config.backend == backend
+
+    @pytest.mark.parametrize("backend",
+                             ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM"])
+    def test_refuses_a_backend_that_cannot_balance(self, backend: str) -> None:
+        """The error says which backend balances, why, and what to set.
+
+        Before, every layer ran outside the balancer and it only logged.
+        """
+        with pytest.raises(ValidationError) as error:
+            MoeConfig(backend=backend,
+                      load_balancer={
+                          "mode": "adaptive",
+                          "num_slots": 512
+                      })
+        text = str(error.value)
+        assert f"moe_config.backend='{backend}' cannot run adaptive EPLB" in text
+        assert "runs only on the MEGAMOE_CUTEDSL MoE backend" in text
+        assert "Set moe_config.backend to 'MEGAMOE_CUTEDSL' or 'AUTO'" in text
+
+    def test_tactic_must_match_an_implementation_that_balances(self) -> None:
+        adaptive = {"mode": "adaptive", "num_slots": 512}
+        MoeConfig(tactic="cutedsl.mega_moe", load_balancer=adaptive)
+        with pytest.raises(ValidationError,
+                           match="none of which supports adaptive EPLB"):
+            MoeConfig(tactic="cutlass", load_balancer=adaptive)
+
+    @pytest.mark.parametrize(
+        "num_slots, num_experts, message",
+        [
+            pytest.param(12, 6, "multiple of `ep_size`", id="experts-ep"),
+            pytest.param(8, 12, "at least `num_experts`", id="few-slots"),
+            pytest.param(10, 8, "divisible by `ep_size`", id="slots-ep"),
+            pytest.param(8, 8, "at least 16", id="no-spare-slot"),
+            pytest.param(12, 8, "at least 16", id="one-spare-slot"),
+        ],
+    )
+    def test_validates_expert_capacity_after_setup(self, num_slots: int,
+                                                   num_experts: int,
+                                                   message: str) -> None:
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=num_slots)
+        with pytest.raises(ValueError, match=message):
+            config.setup(ep_rank=0, ep_size=4)
+            config.validate_expert_capacity(num_experts)
+
+    def test_expert_capacity_requires_setup(self) -> None:
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=16)
+        with pytest.raises(ValueError, match=r"Call setup\(\)"):
+            config.validate_expert_capacity(num_experts=8)
+        config.setup(ep_rank=0, ep_size=4)
+        config.validate_expert_capacity(num_experts=8)
+
+    @pytest.mark.parametrize(
+        "ep_size, least",
+        [(32, 448), (64, 512), (128, 640), (96, 576)],
+    )
+    def test_least_slots_leave_every_rank_a_free_slot(self, ep_size: int,
+                                                      least: int) -> None:
+        """The least slot count gives every rank two spare slots.
+
+        384 experts: one spare slot per rank (512 slots at EP128) leaves a planned layout no free
+        slot to install into.
+        """
+        from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+            ExpertGeometry, active_slots)
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=least)
+        config.setup(ep_rank=0, ep_size=ep_size)
+        assert config.least_slots(384) == least
+        config.validate_expert_capacity(384)
+        geometry = ExpertGeometry(384, least, ep_size)
+        assert active_slots(geometry) == least - ep_size
+        with pytest.raises(ValueError, match=f"at least {least}"):
+            short = MoeAdaptiveLoadBalancerConfig(num_slots=least - ep_size)
+            short.setup(ep_rank=0, ep_size=ep_size)
+            short.validate_expert_capacity(384)
+
+    @pytest.mark.parametrize("ep_size", [72, 144])
+    def test_experts_not_divisible_by_ep_are_refused(self,
+                                                     ep_size: int) -> None:
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=ep_size * 8)
+        config.setup(ep_rank=0, ep_size=ep_size)
+        with pytest.raises(ValueError, match="multiple of `ep_size`"):
+            config.validate_expert_capacity(384)
 
 
 @pytest.mark.cpu_only

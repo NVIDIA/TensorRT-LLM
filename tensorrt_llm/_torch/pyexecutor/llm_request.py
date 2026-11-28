@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python extensions for executor requests."""
 
+import operator
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
@@ -2170,3 +2171,37 @@ def get_request_tokens_per_gen_step(request: LlmRequest,
     if verify_len is None:
         return runtime_tokens_per_gen_step
     return 1 + int(verify_len)
+
+
+# The request fields generation_progress reads, fetched together.
+_GENERATION_PROGRESS_FIELDS = operator.attrgetter(
+    "is_attention_dp_dummy", "is_cuda_graph_dummy",
+    "py_num_accepted_draft_tokens", "py_max_new_tokens", "py_orig_prompt_len",
+    "max_beam_num_tokens")
+
+
+def generation_progress(requests: List[LlmRequest], start: int,
+                        stop: int) -> tuple[int, int, int]:
+    """Progress of the generation requests ``requests[start:stop]``.
+
+    Returns their unused max-new-token budget, the number of real requests
+    (the padding dummies left out) and the tokens they accept per
+    step (one plus the draft tokens accepted at their last step), each summed.
+    The budget remaining uses confirmed host token lengths, with the same
+    prompt boundary as the sampler's max-token stop condition. In overlap
+    execution this does not include an in-flight step not yet consumed on host.
+    """
+    remaining = 0
+    count = 0
+    accepted_tokens = 0
+    for dp_dummy, graph_dummy, drafts, max_new, prompt_len, num_tokens in map(
+            _GENERATION_PROGRESS_FIELDS, requests[start:stop]):
+        if dp_dummy or graph_dummy:
+            continue
+        accepted = 1 + drafts
+        left = max_new - (num_tokens - prompt_len)
+        if left > 0:
+            remaining += left
+        accepted_tokens += accepted
+        count += 1
+    return remaining, count, accepted_tokens

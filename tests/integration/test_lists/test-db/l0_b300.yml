@@ -34,6 +34,12 @@ l0_b300:
   - unittest/_torch/speculative/test_dspark_tp1_argmax.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_wkv_projection.py
   - unittest/_torch/moe/test_dsv4_route_quant.py
+  # The MegaMoE route staging and the adaptive route of the dispatch routers against its definition.
+  - unittest/_torch/moe/test_megamoe_stage_routes.py
+  # Adaptive EPLB GPU tests: only B300 and GB300 run them, B200 does not.
+  - unittest/_torch/moe/test_adaptive_eplb_kernels.py
+  - unittest/_torch/moe/test_adaptive_eplb_mixed_step_gpu.py
+  - unittest/_torch/moe/test_adaptive_eplb_live_rows.py
   - unittest/_torch/moe/test_moe_module.py::test_dsv4_fused_route_quant_matches_separate_launches
   - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
   # Four disjoint attention batches use the default per-entry timeout.
