@@ -46,6 +46,9 @@ _CTX_TILE_BLOCK_N = 64
 _CTX_TILE_TILES = 16
 _CTX_TILE_WARPS = 4
 _CTX_TILE_STAGES = 2
+#: The smallest contraction Triton's 8-bit `tl.dot` takes: every kernel here contracts the e4m3
+#: key and query over the index head dimension.
+_MIN_FP8_DOT_K = 32
 
 
 @triton.jit
@@ -229,9 +232,15 @@ def _qsa_index_scores_fp8_kernel(
             per_head_scores = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.float32)
             for slot in tl.static_range(GROUP_ROWS):
                 request = tl.sum(tl.where(slots == slot, requests, 0), axis=0)
+                # This row's own visible blocks: a shorter request's table ends before the run's
+                # longest row (its later entries name no page of it). The columns past it are
+                # not stored for this row, so its scores are unchanged.
+                row_blocks = valid_blocks & (
+                    block_columns < tl.sum(tl.where(slots == slot, visible, 0), axis=0)
+                )
                 physical_pages = tl.load(
                     block_table + request * block_table_stride_request + logical_pages,
-                    mask=valid_blocks,
+                    mask=row_blocks,
                     other=0,
                 ).to(tl.int64)
                 keys = tl.load(
@@ -239,7 +248,7 @@ def _qsa_index_scores_fp8_kernel(
                     + physical_pages[:, None] * cache_stride_page
                     + token_in_page[:, None] * cache_stride_token
                     + dim_offsets[None, :],
-                    mask=valid_blocks[:, None],
+                    mask=row_blocks[:, None],
                     other=0.0,
                 )
                 per_head_scores = tl.where(
@@ -275,15 +284,8 @@ def _qsa_index_scores_fp8(
 ) -> torch.Tensor:
     """One launch of the fp8 kernel: request groups of `rows_per_request` rows (4 rows of one
     request for a context call), one key gather a group where its rows name one request."""
-    if index_cache.ndim != 4 or index_cache.shape[2] != 1:
-        raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
-    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_table.stride(1) != 1:
-        raise ValueError("QSA index scoring requires a two-dimensional int32 block table")
+    _check_operands(q, index_cache, block_table)
     rows, num_index_heads, index_head_dim = q.shape
-    if index_cache.shape[3] != index_head_dim or index_cache.dtype != torch.bfloat16:
-        raise ValueError("fp8 index keys need a bf16-sized index plane of the query's dimension")
-    if num_index_heads % 2 or num_index_heads > 8:
-        raise ValueError("fp8 index scoring serves 2, 4 or 8 index heads")
     max_compressed_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
     if only_visible_blocks:
         output = torch.empty((rows, max_compressed_blocks), dtype=torch.float32, device=q.device)
@@ -629,12 +631,18 @@ def _qsa_index_scores_flat_kernel(
             if ROW_BY_ROW:
                 request = tl.sum(tl.where(slots == sub, requests, 0), axis=0)
                 store_ok = row_ok & (shared | (slots == sub))
+                # A row-by-row pass reads only its row's visible blocks: a shorter request's
+                # table ends before the run's longest row. The pass stores that row only.
+                bound = tl.where(
+                    shared, max_visible, tl.sum(tl.where(slots == sub, visible, 0), axis=0)
+                )
             else:
                 request = lead
                 store_ok = row_ok
+                bound = max_visible
             for tile in tl.range(first_tile, last_tile):
                 block_columns = tile * BLOCK_N + block_offsets
-                valid_blocks = block_columns < max_visible
+                valid_blocks = block_columns < bound
                 anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
                 logical_pages = anchor_positions // TOKENS_PER_BLOCK
                 token_in_page = (anchor_positions % TOKENS_PER_BLOCK).to(tl.int64)
@@ -691,8 +699,8 @@ def _flat_refusal(
     rows, heads, dim = q.shape
     if heads != _FLAT_HEADS:
         return f"{heads} index heads (serves {_FLAT_HEADS})"
-    if dim < 16 or dim & (dim - 1):
-        return f"index head dimension {dim} (serves a power of two from 16)"
+    if dim < _MIN_FP8_DOT_K or dim & (dim - 1):
+        return f"index head dimension {dim} (serves a power of two from {_MIN_FP8_DOT_K})"
     if not 1 <= rows <= _FLAT_MAX_ROWS:
         return f"{rows} rows (serves 1..{_FLAT_MAX_ROWS})"
     if not 1 <= rows_per_request <= _FLAT_MAX_GROUP_ROWS:
@@ -803,6 +811,28 @@ def _takes_ctx_tile(q, only_visible_blocks: bool, context_rows: bool, rows_per_r
     )
 
 
+def _check_operands(q, index_cache, block_table) -> None:
+    """The layout every kernel here assumes, checked before any of them is picked."""
+    if q.ndim != 3:
+        raise ValueError("QSA index scoring takes a [rows, heads, dim] query")
+    if index_cache.ndim != 4 or index_cache.shape[2] != 1:
+        raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
+    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_table.stride(1) != 1:
+        raise ValueError("QSA index scoring requires a two-dimensional int32 block table")
+    rows, num_index_heads, index_head_dim = q.shape
+    if index_cache.shape[3] != index_head_dim or index_cache.dtype != torch.bfloat16:
+        raise ValueError("fp8 index keys need a bf16-sized index plane of the query's dimension")
+    if index_cache.stride(3) != 1:
+        raise ValueError("fp8 index scoring reads each key with a unit dimension stride")
+    if num_index_heads % 2 or num_index_heads > 8:
+        raise ValueError("fp8 index scoring serves 2, 4 or 8 index heads")
+    if index_head_dim < _MIN_FP8_DOT_K or index_head_dim & (index_head_dim - 1):
+        raise ValueError(
+            f"fp8 index scoring serves a power-of-two index head dimension from "
+            f"{_MIN_FP8_DOT_K} (Triton's 8-bit dot), got {index_head_dim}"
+        )
+
+
 def qsa_index_scores_fp8_launch(
     q: torch.Tensor,
     index_cache: torch.Tensor,
@@ -819,6 +849,10 @@ def qsa_index_scores_fp8_launch(
     decode-sized generation call on the flat grid and a prefill-sized context call on the
     ctx-tile kernel (both bitwise the request-group kernel's scores), every other call on the
     request-group kernel."""
+    _check_operands(q, index_cache, block_table)
+    # The kernels read one position and one request index a row at unit stride.
+    query_positions = query_positions.contiguous()
+    request_indices = request_indices.contiguous()
     if (
         only_visible_blocks
         and not context_rows
