@@ -398,16 +398,20 @@ def test_forced_gate_allows_suffix_derived_answer_changes(
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "length"])
-def test_forced_gate_checks_each_prefix_against_ordinary_completion(finish_reason: str) -> None:
+@pytest.mark.parametrize("resident_only", [False, True])
+def test_forced_gate_checks_each_prefix_against_ordinary_completion(
+    finish_reason: str, resident_only: bool
+) -> None:
     forced = {**_forced(), "token_ids": [7, 8, 12, 10, 11]}
+    candidate = _forced() if resident_only else copy.deepcopy(forced)
     ordinary = {**_completion(), "finish_reason": finish_reason}
-    with pytest.raises(AssertionError, match="valid prefix"):
+    with pytest.raises(AssertionError, match="valid prefix differs"):
         assert_forced_token_parity(
             forced,
-            copy.deepcopy(forced),
+            candidate,
             ordinary_reference=ordinary,
             ordinary_candidate=ordinary,
-            label="wrong shared prefix",
+            label="wrong forced prefix",
         )
 
 
@@ -494,20 +498,33 @@ def test_history_verifier_rejects_injected_wrong_slots() -> None:
     assert torch.equal(units, original_units)
 
 
-def test_history_verifier_counts_eviction_and_refetch_per_layer() -> None:
+@pytest.mark.parametrize("move_unit", [False, True])
+def test_history_verifier_counts_eviction_and_refetch_per_layer(move_unit: bool) -> None:
     verifier = SparseHistoryVerifier()
     verifier.check(0, [10, 11], [0, 1], b"ab", b"ab", row_bytes=1, token_position=8)
-    verifier.check(0, [12, 11], [0, 1], b"cb", b"cb", row_bytes=1, token_position=9)
-    verifier.check(0, [10, 11], [0, 1], b"ab", b"ab", row_bytes=1, token_position=10)
+    position = 9
+    if move_unit:
+        verifier.check(0, [10, 11], [2, 1], b"ab", b"ab", row_bytes=1, token_position=position)
+        position += 1
+    verifier.check(0, [12, 11], [0, 1], b"cb", b"cb", row_bytes=1, token_position=position)
+    verifier.check(
+        0,
+        [10, 11],
+        [2 if move_unit else 0, 1],
+        b"ab",
+        b"ab",
+        row_bytes=1,
+        token_position=position + 1,
+    )
     verifier.check(1, [12, 11], [0, 1], b"cb", b"cb", row_bytes=1, token_position=8)
     assert verifier.metrics() == {
-        "checked_rows": 8,
+        "checked_rows": 10 if move_unit else 8,
         "mismatched_rows": 0,
         "aliased_rows": 0,
         "pool_mismatches": 0,
-        "evictions": 2,
-        "refetches": 1,
-        "checked_positions": {"0": [8, 9, 10], "1": [8]},
+        "evictions": 0 if move_unit else 2,
+        "refetches": 0 if move_unit else 1,
+        "checked_positions": {"0": list(range(8, position + 2)), "1": [8]},
         "first_mismatch": None,
         "first_alias": None,
         "first_pool_mismatch": None,

@@ -428,6 +428,10 @@ class SparseHistoryVerifier:
         returned = selected & evicted
         self.refetches += len(returned)
         evicted.difference_update(returned)
+        current_slots = dict(zip(units, slots, strict=True))
+        for previous_slot, previous_unit in list(previous.items()):
+            if previous_unit in current_slots and current_slots[previous_unit] != previous_slot:
+                del previous[previous_slot]
         for slot, unit in zip(slots, units, strict=True):
             old_unit = previous.get(slot)
             if old_unit is not None and old_unit != unit and old_unit not in selected:
