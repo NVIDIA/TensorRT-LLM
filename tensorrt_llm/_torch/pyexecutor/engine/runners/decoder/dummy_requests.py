@@ -516,6 +516,7 @@ class DummyRequestFactory:
             token_num_upper_bound=max_seq_len,
             batch_size=available_tokens_batch_size,
             max_num_draft_tokens=_kv_draft,
+            max_beam_width=self._config.max_beam_width,
         )
 
         # Also consider draft KV cache capacity when it exists
@@ -524,8 +525,16 @@ class DummyRequestFactory:
                 batch_size=available_tokens_batch_size,
                 token_num_upper_bound=max_seq_len,
                 max_num_draft_tokens=_kv_draft,
+                max_beam_width=self._config.max_beam_width,
             )
             available_tokens = min(available_tokens, draft_available_tokens)
+
+        # With beam search the free blocks may not cover even one token per
+        # beam. add_dummy_requests cannot always catch this (it does not size
+        # VSWA pools per beam), so skip this batch size here.
+        if self._config.max_beam_width > 1 and available_tokens < 1:
+            free_warmup_requests()
+            return None
 
         token_num = max(
             self._dummy_request_tokens or 1,
