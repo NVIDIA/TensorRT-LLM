@@ -37,6 +37,11 @@ K tiles minus ring stages the CTA's whole weight slice is on chip when the activ
 MMAs of those tiles read A from tensor memory (``kind::mxf8f6f4.block_scale`` with A in TMEM),
 in the same K-tile and K-block order as the ring MMAs, so the output is bitwise the unstaged
 kernel's. The CTA then allocates 256 or 512 tensor-memory columns instead of 128.
+
+Sigmoid tiles (``sigmoid_tile0`` = ``j >= 0``): the outputs of N tiles ``j`` and up are stored as
+:func:`k3_fp8w_lowm_gemm.sigmoid_bf16` of their BF16 value (``torch.sigmoid`` of the BF16 output,
+bit for bit), the others as plain BF16. One launch then serves a weight whose last rows feed a
+sigmoid gate, such as the MLA in-projection with the output gate's rows appended.
 """
 
 from __future__ import annotations
@@ -394,8 +399,12 @@ class K3Fp8wLowMMxGemmKernel:
         strides: tuple[int, int, int] | None = None,
         push_addend: bool = False,
         ag_hidden: int = 0,
+        sigmoid_tile0: int = -1,
     ):
         validate_tactic(n, k, tactic)
+        if sigmoid_tile0 >= 0 and (ar_push or sigmoid_tile0 >= _ceil_div(n, MMA_M)):
+            raise ValueError(f"sigmoid tiles from {sigmoid_tile0}: BF16 store of N={n} only")
+        self.sigmoid_tile0 = sigmoid_tile0
         if ar_push and (
             ar_push not in (lowm.AR_PUSH_TWO_SHOT, lowm.AR_PUSH_ONE_SHOT) or ar_world < 2
         ):
@@ -1055,6 +1064,9 @@ class K3Fp8wLowMMxGemmKernel:
         out_gmem = mOut.iterator.toint() + Int64(n_tile * MMA_M * 2)
         row_stride = Int64(self.n * 2)
         store_cols = Int32(16)
+        sig = cutlass.Boolean(False)
+        if cutlass.const_expr(self.sigmoid_tile0 >= 0):
+            sig = n_tile >= self.sigmoid_tile0
         if cutlass.const_expr(self.n % MMA_M != 0):
             if n_tile * MMA_M + (q & 15) * 8 >= self.n:
                 store_cols = Int32(0)
@@ -1094,7 +1106,7 @@ class K3Fp8wLowMMxGemmKernel:
                         for v in cutlass.range_constexpr(4):
                             _sts_u16(
                                 out_base + (4 * c + v) * (MMA_M * 2) + q * 2,
-                                _f32_to_bf16_bits(rAcc[4 * c4 + v]),
+                                self._out_bits(rAcc[4 * c4 + v], sig),
                             )
                 else:
                     if rank == c % S:
@@ -1156,7 +1168,7 @@ class K3Fp8wLowMMxGemmKernel:
                         for v in cutlass.range_constexpr(4):
                             _sts_u16(
                                 out_base + (4 * (rank + i * S) + v) * (MMA_M * 2) + q * 2,
-                                _f32_to_bf16_bits(acc[v]),
+                                self._out_bits(acc[v], sig),
                             )
                 cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
                 for p in cutlass.range(q, my_chunks * 4 * store_cols, MMA_M, unroll=1):
@@ -1173,6 +1185,17 @@ class K3Fp8wLowMMxGemmKernel:
                             )  # fmt: skip
                         else:
                             _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
+
+    @cute.jit
+    def _out_bits(self, value, sig):
+        """The stored BF16 bits of one FP32 output: ``sigmoid_bf16`` of its BF16 value in a
+        sigmoid tile (``sig``), else the BF16 value."""
+        bits = _f32_to_bf16_bits(value)
+        if cutlass.const_expr(self.sigmoid_tile0 >= 0):
+            if sig:
+                gate = lowm.sigmoid_bf16(cutlass.Float32(value).to(cutlass.BFloat16))
+                bits = _f32_to_bf16_bits(gate.to(cutlass.Float32))
+        return bits
 
     @cute.jit
     def _push(
@@ -1216,8 +1239,10 @@ class K3Fp8wLowMMxGemmKernel:
 
 
 @functools.cache
-def _compiled_kernel(n: int, k: int, tactic: K3LowMMxTactic, use_pdl: bool):
-    kernel = K3Fp8wLowMMxGemmKernel(n, k, tactic, use_pdl)
+def _compiled_kernel(
+    n: int, k: int, tactic: K3LowMMxTactic, use_pdl: bool, sigmoid_tile0: int = -1
+):
+    kernel = K3Fp8wLowMMxGemmKernel(n, k, tactic, use_pdl, sigmoid_tile0=sigmoid_tile0)
     dummy = 1 << 20
     ptrs = [
         make_ptr(dtype, dummy, cute.AddressSpace.gmem, assumed_align=16)
@@ -1322,6 +1347,42 @@ def can_run_mxfp8(
     return xq.data_ptr() % 16 == 0 and w.data_ptr() % 16 == 0 and xs.data_ptr() % 4 == 0
 
 
+def _run_k3_fp8w_lowm_gemm_mxfp8(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tactic: K3LowMMxTactic | None = None,
+    use_pdl: bool = True,
+    stage_weights: bool = False,
+    sigmoid_tile0: int = -1,
+) -> torch.Tensor:
+    """``out = dequant(xq, xs) @ dequant(w, w_scale)^T`` into ``out`` (bf16 ``[M, N]``) on the
+    current stream, bitwise the low-M kernel on the BF16 activation that ``(xq, xs)`` quantizes
+    (inputs are not re-validated; see :func:`can_run_mxfp8`). ``stage_weights`` (no ``tactic``):
+    :func:`staged_mx_tactic`, the same bits. ``sigmoid_tile0`` >= 0: N tiles from that one on
+    store ``sigmoid_bf16`` of their BF16 output (module docstring)."""
+    m, k = xq.shape
+    n = w.shape[0]
+    if tactic is None:
+        tactic = staged_mx_tactic(m, n, k) if stage_weights else default_mx_tactic(m, n, k)
+    if m > tactic.mma_n:
+        raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
+    compiled = _compiled_kernel(n, k, tactic, use_pdl, sigmoid_tile0)
+    compiled(
+        _gmem_ptr(cutlass.Float8E4M3FN, w),
+        _gmem_ptr(cutlass.Float8E4M3FN, xq),
+        _gmem_ptr(cutlass.Uint8, xs),
+        _gmem_ptr(cutlass.Uint8, w_scale),
+        _gmem_ptr(cutlass.BFloat16, out),
+        Int32(m),
+        cuda.CUstream(torch.cuda.current_stream(xq.device).cuda_stream),
+    )
+    return out
+
+
 def run_k3_fp8w_lowm_gemm_mxfp8(
     xq: torch.Tensor,
     xs: torch.Tensor,
@@ -1337,23 +1398,9 @@ def run_k3_fp8w_lowm_gemm_mxfp8(
     current stream, bitwise the low-M kernel on the BF16 activation that ``(xq, xs)`` quantizes
     (inputs are not re-validated; see :func:`can_run_mxfp8`). ``stage_weights`` (no ``tactic``):
     :func:`staged_mx_tactic`, the same bits."""
-    m, k = xq.shape
-    n = w.shape[0]
-    if tactic is None:
-        tactic = staged_mx_tactic(m, n, k) if stage_weights else default_mx_tactic(m, n, k)
-    if m > tactic.mma_n:
-        raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
-    compiled = _compiled_kernel(n, k, tactic, use_pdl)
-    compiled(
-        _gmem_ptr(cutlass.Float8E4M3FN, w),
-        _gmem_ptr(cutlass.Float8E4M3FN, xq),
-        _gmem_ptr(cutlass.Uint8, xs),
-        _gmem_ptr(cutlass.Uint8, w_scale),
-        _gmem_ptr(cutlass.BFloat16, out),
-        Int32(m),
-        cuda.CUstream(torch.cuda.current_stream(xq.device).cuda_stream),
+    return _run_k3_fp8w_lowm_gemm_mxfp8(
+        xq, xs, w, w_scale, out, tactic=tactic, use_pdl=use_pdl, stage_weights=stage_weights
     )
-    return out
 
 
 def run_k3_fp8w_lowm_gemm_mxfp8_ar_push(

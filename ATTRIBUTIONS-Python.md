@@ -64341,7 +64341,7 @@ SOFTWARE.
   - `Homepage`: https://github.com/vllm-project/MSA
 
 
-## vLLM (MiniMax-M3 sparse attention sources)
+## vLLM (MiniMax-M3 and Kimi K3 sources)
 
 Source files with NVIDIA modifications, in
 `tensorrt_llm/_torch/modeling_v2/models/minimax_m3/`, derived from
@@ -64357,6 +64357,10 @@ Copyright contributors to the vLLM project. Each file and the upstream file it d
   - `minimax_m3_1_flash_nvfp4__sm_107__tp2/ops/attention/m3_index_score_t2sc.py`: `tests/kernels/attention/test_minimax_m3.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp2/ops/gqamix_sparse_decode.py`: `vllm/models/minimax_m3/common/ops/sparse_attn.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp8/ops/attention/m3_index_score.py`: `tests/kernels/attention/test_minimax_m3.py`
+
+For Kimi K3, `tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_common/ull/tensor_views.py`
+is derived from `vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py` at vLLM commit
+`3f1bcfd82bb2e93fcd364fc7a5491718453a77e2`. Copyright contributors to the vLLM project. Modified by NVIDIA.
 
 ### Licenses
 License: `Apache License 2.0`
@@ -64573,12 +64577,13 @@ License: `Apache License 2.0`
 ## FlashInfer (CuTe DSL split-K GEMM source)
 
 Source files with NVIDIA modifications, in
-`tensorrt_llm/_torch/modeling_v2/models/minimax_m3/`, derived from
+`tensorrt_llm/_torch/modeling_v2/models/`, derived from
 `flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py` of https://github.com/flashinfer-ai/flashinfer
 (Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0):
 
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp2/kernels/m3_lowm_splitk.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp8/kernels/m3_lowm_splitk.py`
+  - `minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/kernels/m3_lowm_splitk.py`
+  - `minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/kernels/m3_lowm_splitk.py`
+  - `kimi_k3_vl/kernels/k3r_gemm/ull/splitk.py` (adapted from FlashInfer v0.7.0.post1)
 
 ### Licenses
 License: `Apache License 2.0`

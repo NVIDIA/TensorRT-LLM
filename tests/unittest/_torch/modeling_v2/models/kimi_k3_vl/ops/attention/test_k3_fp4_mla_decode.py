@@ -26,7 +26,7 @@ The FP4 cache helpers are those of ``kernels/k3r_mla_q/test_k3_mla_q_fused.py``.
 
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -242,17 +242,16 @@ _SEQ_LENS = {
 }
 
 
-def _decode_case(seq_lens, seed, helix):
-    """Real FP4 cache with this step's query rows written by the cache update; returns
-    (manager, metadata, qf module)."""
+def _sm107_q_fused_helpers() -> ModuleType:
     qf = _q_fused_helpers()
-
     if qf.k3_decode_unavailable():
         pytest.skip("needs an SM107 GPU and a CuTe DSL that builds the FP4 MLA decode kernels")
-    n = len(seq_lens)
-    mgr, md = qf._fp4_case(n, seq_lens, seed)
-    num_tokens = n * qf.Q_LEN
-    rot = qf._rotary_table(md.max_seq_len, "identity")
+    return qf
+
+
+def _decode_inputs(
+    qf: ModuleType, num_tokens: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cuda").manual_seed(seed)
     latent = (
         torch.randn(num_tokens, qf.LORA + qf.ROPE, device="cuda", generator=gen) * 0.5
@@ -261,6 +260,17 @@ def _decode_case(seq_lens, seed, helix):
         num_tokens, qf.H, qf.LORA + qf.ROPE, device="cuda", generator=gen
     ).bfloat16()
     q_pe = q_input[..., qf.LORA :].clone()
+    return latent, q_input, q_pe
+
+
+def _decode_case(seq_lens, seed, helix):
+    """Real FP4 cache with this step's query rows written by the cache update; returns
+    (manager, metadata, qf module)."""
+    qf = _sm107_q_fused_helpers()
+    n = len(seq_lens)
+    mgr, md = qf._fp4_case(n, seq_lens, seed)
+    rot = qf._rotary_table(md.max_seq_len, "identity")
+    latent, q_input, q_pe = _decode_inputs(qf, n * qf.Q_LEN, seed)
     qf._scatter(md, latent, rot, q_pe, q_input[..., qf.LORA :], q_input)
     torch.cuda.synchronize()
     if not helix:
@@ -270,7 +280,7 @@ def _decode_case(seq_lens, seed, helix):
     return mgr, md, qf
 
 
-def _run(md, qf, decode, helix, **settings):
+def _run(md, qf, decode, helix, *, sm_scale=0.1, **settings):
     """One decode of every query row on fresh outputs (``settings``: K3's ``page_plan`` /
     ``reduce_pdl``); returns (output, stats or None)."""
     state = md.fp4_mla_state
@@ -286,7 +296,7 @@ def _run(md, qf, decode, helix, **settings):
         0,
         q,
         out,
-        sm_scale=0.1,
+        sm_scale=sm_scale,
         kv_lora_rank=qf.LORA,
         qk_rope_head_dim=qf.ROPE,
         prequantized_q=state.prequantized_q,

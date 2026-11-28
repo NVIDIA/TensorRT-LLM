@@ -6,7 +6,8 @@ The layouts come from the perf-sanity deployments of the SM107 targets
 (``tests/scripts/perf-sanity/disaggregated/vr200_kimi-k3-nvfp4-dspark_gsm8k_*.yaml``): each
 worker's parallel fields build a real ``Mapping`` as ``ParallelConfig.to_mapping`` does, and the
 fields ``route`` reads off ``llm_args`` (MoE backend, DWDP, KV cache dtype) come from the same
-worker config. No model is loaded.
+worker config. No model is loaded. The ULL generation server (Helix CP16, MoE TP16) also needs
+DSpark with 7 draft tokens and at most 4 requests per step.
 """
 
 from __future__ import annotations
@@ -42,6 +43,10 @@ _RECIPE_TARGETS = {
         "kimi_k3_nvfp4__sm_107__tp1",
         "kimi_k3_nvfp4__sm_107__helix8_moeep8",
     ),
+    "vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx12_dwdp12_gen1_helix16_moetp16ep1_bs4_dspark7": (
+        "kimi_k3_nvfp4__sm_107__tp1",
+        "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1",
+    ),
 }
 
 _TARGET_CLASSES = {
@@ -49,6 +54,7 @@ _TARGET_CLASSES = {
     "kimi_k3_nvfp4__sm_107__helix8_moeep8": "ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8",
     "kimi_k3_nvfp4__sm_107__helix8_moetp2ep4": "ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4",
     "kimi_k3_nvfp4__sm_107__dep16": "ModelingV2KimiK3Nvfp4Sm107Dep16",
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1": "ModelingV2KimiK3Nvfp4Sm107Helix16Moetp16ep1",
 }
 
 
@@ -79,6 +85,7 @@ def _model_config(mapping: Mapping, *, spec: str = "DSPARK", expert_algo: str = 
         mapping=mapping,
         spec_config=spec_config,
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        extra_attrs={},
     )
 
 
@@ -106,10 +113,19 @@ def _mapping(worker: dict) -> Mapping:
 
 
 def _llm_args(worker: dict, **overrides):
+    transceiver = worker.get("cache_transceiver_config")
     fields = {
         "moe_config": SimpleNamespace(backend=worker["moe_config"]["backend"]),
         "dwdp_config": worker.get("dwdp_config"),
         "kv_cache_config": SimpleNamespace(dtype=worker["kv_cache_config"]["dtype"]),
+        "speculative_config": SimpleNamespace(
+            max_draft_len=worker["speculative_config"]["max_draft_len"]
+        ),
+        "max_batch_size": worker["max_batch_size"],
+        "cache_transceiver_config": SimpleNamespace(**transceiver) if transceiver else None,
+        "guided_decoding_backend": worker.get("guided_decoding_backend"),
+        "disable_overlap_scheduler": worker.get("disable_overlap_scheduler", False),
+        "cuda_graph_config": worker.get("cuda_graph_config"),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -124,7 +140,8 @@ def _route_name(model_config, llm_args) -> str:
 def test_each_recipe_role_routes_to_its_target(stem, role):
     worker = _worker(stem, role)
     expected = _RECIPE_TARGETS[stem][0 if role == "ctx" else 1]
-    assert _route_name(_model_config(_mapping(worker)), _llm_args(worker)) == expected
+    args = _llm_args(worker, env_overrides={"TRTLLM_DISAGG_ROLE": role})
+    assert _route_name(_model_config(_mapping(worker)), args) == expected
 
 
 def test_context_servers_of_a_dwdp12_recipe_route_to_tp1():
@@ -307,3 +324,138 @@ def test_pdl_off_gets_no_target(monkeypatch):
         _route_name(model_config, _llm_args(worker, env_overrides={"TRTLLM_ENABLE_PDL": "1"}))
         == "kimi_k3_nvfp4__sm_107__dep16"
     )
+
+
+def _helix16_moetp16(*, moe_tp_size: int = 16, moe_ep_size: int = 1, **cp_config) -> Mapping:
+    return Mapping(
+        world_size=16,
+        rank=0,
+        tp_size=1,
+        cp_size=16,
+        cp_config={"cp_type": "HELIX", "use_nccl_for_alltoall": False, **cp_config},
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+
+
+def _ull_args(**overrides):
+    fields = {
+        **vars(_FC12),
+        "speculative_config": SimpleNamespace(max_draft_len=7),
+        "max_batch_size": 4,
+        "cache_transceiver_config": SimpleNamespace(backend="NIXL"),
+        "guided_decoding_backend": None,
+        "disable_overlap_scheduler": False,
+        "cuda_graph_config": SimpleNamespace(batch_sizes=[1, 2, 3, 4], enable_padding=True),
+        "env_overrides": {"TRTLLM_DISAGG_ROLE": "generation"},
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize("max_batch_size", [1, 4])
+def test_ull_generation_server_routes_to_the_ull_target(max_batch_size):
+    assert (
+        _route_name(_model_config(_helix16_moetp16()), _ull_args(max_batch_size=max_batch_size))
+        == "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1"
+    )
+
+
+def test_ull_declines_the_implicit_moe_split() -> None:
+    mapping = _helix16_moetp16(moe_tp_size=-1, moe_ep_size=-1)
+    assert (mapping.moe_tp_size, mapping.moe_ep_size) == (16, 1)
+    with pytest.raises(NoTarget, match="explicit MoE TP16"):
+        _route_name(_model_config(mapping), _ull_args())
+
+
+@pytest.mark.parametrize(
+    "llm_args, match",
+    [
+        (_ull_args(speculative_config=SimpleNamespace(max_draft_len=3)), "max_draft_len 3"),
+        (_ull_args(max_batch_size=8), "max_batch_size 8"),
+        (_ull_args(max_batch_size=None), "max_batch_size None"),
+        (_ull_args(kv_cache_config=SimpleNamespace(dtype="fp8")), "NVFP4 KV cache"),
+        (
+            _ull_args(
+                kv_cache_config=SimpleNamespace(dtype="nvfp4", enable_kv_pool_rebalance=True)
+            ),
+            "enable_kv_pool_rebalance=False",
+        ),
+        (_ull_args(env_overrides={"TRTLLM_ENABLE_PDL": "0"}), "TRTLLM_ENABLE_PDL='0'"),
+        (_ull_args(cache_transceiver_config=None), "cache_transceiver_config.backend"),
+        (
+            _ull_args(cache_transceiver_config=SimpleNamespace(backend=None)),
+            "cache_transceiver_config.backend",
+        ),
+        (
+            _ull_args(env_overrides={"TRTLLM_DISAGG_ROLE": "context"}),
+            "disaggregated generation server",
+        ),
+        (_ull_args(disable_overlap_scheduler=True), "disable_overlap_scheduler=False"),
+        (_ull_args(cuda_graph_config=None), "cuda_graph_config"),
+        (_ull_args(guided_decoding_backend="xgrammar"), "guided_decoding_backend"),
+        (
+            _ull_args(moe_config=SimpleNamespace(backend="CUTLASS")),
+            "moe_config.backend CUTEDSL_FC12",
+        ),
+        (_ull_args(allreduce_strategy="NCCL"), "allreduce_strategy AUTO or MNNVL"),
+        (
+            _ull_args(
+                speculative_config=SimpleNamespace(
+                    max_draft_len=7, draft_is_embedded_in_target=True
+                )
+            ),
+            "standalone MLA DSpark drafter",
+        ),
+        (
+            _ull_args(
+                scheduler_config=SimpleNamespace(gen_preemption=SimpleNamespace(enabled=True))
+            ),
+            "GEN slot preemption",
+        ),
+    ],
+)
+def test_ull_declines_other_generation_steps(llm_args, match):
+    with pytest.raises(NoTarget, match=match):
+        _route_name(_model_config(_helix16_moetp16()), llm_args)
+
+
+def test_ull_accepts_a_transceiver_when_the_launcher_does_not_forward_the_role(monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    args = _ull_args(env_overrides={})
+    assert _route_name(_model_config(_helix16_moetp16()), args).endswith("__helix16_moetp16ep1")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("acceptance_rate_window_size", 10),
+        ("acceptance_rate_threshold", 0.3),
+        ("max_concurrency", 4),
+        ("draft_len_schedule", [(4, 7)]),
+    ],
+)
+def test_ull_declines_dynamic_draft_length(field, value):
+    spec = SimpleNamespace(max_draft_len=7, **{field: value})
+    with pytest.raises(NoTarget, match=field):
+        _route_name(_model_config(_helix16_moetp16()), _ull_args(speculative_config=spec))
+
+
+def test_ull_declines_the_nccl_all_to_all():
+    with pytest.raises(NoTarget, match="cp_nccl_alltoall=True"):
+        _route_name(_model_config(_helix16_moetp16(use_nccl_for_alltoall=True)), _ull_args())
+
+
+def test_route_declines_a_non_ull_helix16_moetp16ep1_before_importing_the_target():
+    with pytest.raises(NoTarget, match="max_batch_size 8"):
+        routing.route(_model_config(_helix16_moetp16()), _ull_args(max_batch_size=8), _SM107)
+
+
+def test_route_returns_the_ull_target(monkeypatch):
+    monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", "1")
+    model_config = _model_config(_helix16_moetp16())
+    args = _ull_args(env_overrides={"TLLM_NUMA_AWARE_WORKER_AFFINITY": "0"})
+    cls = routing.route(model_config, args, _SM107)
+    assert cls.__name__ == _TARGET_CLASSES["kimi_k3_nvfp4__sm_107__helix16_moetp16ep1"]
+    assert cls.__module__ == f"{_FAMILY}.kimi_k3_nvfp4__sm_107__helix16_moetp16ep1.modeling"
+    assert model_config.extra_attrs["kimi_k3_ull_pin_executor"] is False

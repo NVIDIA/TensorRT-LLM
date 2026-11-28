@@ -1915,9 +1915,13 @@ class ModelLoader:
         # built-in class and applied its model defaults to `llm_args`: a
         # modeling_v2 target reads the arguments as the engine will run with
         # them and never overrides those defaults.
-        config = replace(config,
-                         modeling_v2_target=modeling_v2_resolve_on_all_ranks(
-                             config, self.llm_args))
+        modeling_v2_target = modeling_v2_resolve_on_all_ranks(
+            config, self.llm_args)
+        resolved_config = replace(config, modeling_v2_target=modeling_v2_target)
+        if modeling_v2_target is not None:
+            # The target may need metadata from routing; replace skips init=False fields.
+            resolved_config.extra_attrs.update(config.extra_attrs)
+        config = resolved_config
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a

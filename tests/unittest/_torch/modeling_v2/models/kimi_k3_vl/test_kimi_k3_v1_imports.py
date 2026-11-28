@@ -86,11 +86,18 @@ RUNTIME_INTERFACES: Dict[str, Tuple[object, str]] = {
         "the packed decode plan geometry the metadata contract builds every step (as above)",
     ),
     "tensorrt_llm._torch.modules.kimi_kda.cache_manager": (
-        {"KimiK3HybridCacheManager", "KDAReplayState"},
+        {
+            "KimiK3HybridCacheManager",
+            "KDAReplayState",
+            "KDAReplayLayerCache",
+            "_is_disagg_context_server",
+        },
         "the KV cache manager the engine resolves for K3 (README: 'the KV cache managers'), "
         "a runtime interface that lives under modules/ for history only: "
         "ops/cache/k3_sm107_cache_manager.py subclasses it as the SM107 targets' "
-        "RuntimeHooks.kv_cache_manager_cls, and the DSpark worker checks its KDA state update",
+        "RuntimeHooks.kv_cache_manager_cls, and the DSpark worker checks its KDA state update; "
+        "ops/cache/k3_ull_cache_manager.py also subclasses its per-layer replay cache and sizes "
+        "its checkpoints with the predicate that sets the manager's kda_context_only",
     ),
     "tensorrt_llm._torch.modules.mamba.mamba2_metadata": (
         {"Mamba2Metadata"},
@@ -144,7 +151,8 @@ MOE_KERNELS: Dict[str, Tuple[object, str]] = {
 }
 
 #: V1 code still imported, by the line of the K3 v2 plan that replaces it:
-#: module -> (symbols or "*", owner). Delete an entry with the import.
+#: module -> (symbols or "*", owner). Delete an entry with the import. Empty: every scanned
+#: target imports V1 only through the declared runtime interfaces.
 PENDING: Dict[str, Tuple[object, str]] = {}
 
 
@@ -292,7 +300,7 @@ def stale_pending(report: Report) -> List[str]:
 
 
 def test_scope_covers_every_sm107_target():
-    """Every target package is scanned, except the two listed sm100 targets.
+    """Every target package is scanned, except the ones listed in ``EXEMPT_TARGETS``.
 
     A target is a package (``__init__.py``): a directory a checkout switch left with only
     ``__pycache__`` in it is not one.

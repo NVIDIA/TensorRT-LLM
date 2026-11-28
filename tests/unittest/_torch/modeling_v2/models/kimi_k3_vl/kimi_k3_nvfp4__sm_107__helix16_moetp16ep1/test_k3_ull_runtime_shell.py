@@ -1,0 +1,218 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""The ULL target's GEN-step shell (``ops/common/k3_ull_runtime.py``), host-side.
+
+Covered without a GPU: ``make_runtime_hooks`` declares the served shell; the executor selects the
+expected core on synthetic topologies, and the pin and the GIL switch interval are applied.
+The engine hook points are tested in ``tests/unittest/_torch/pyexecutor/``
+(``test_runtime_hooks.py``, ``test_step_inputs.py``)."""
+
+import ast
+import hashlib
+import json
+import pathlib
+import sys
+import types
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.common import (  # noqa: E501
+    k3_ull_runtime as runtime,
+)
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
+
+pytestmark = pytest.mark.cpu_only
+
+_REPO = pathlib.Path(__file__).resolve().parents[7]
+_FAM_DIR = _REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl"
+_RUNTIME_SOURCE = _FAM_DIR / "ops/common/k3_ull_runtime.py"
+
+
+def test_make_runtime_hooks_declares_the_served_shell():
+    base = RuntimeHooks(skip_greedy_rng_upload=True)
+    hooks = runtime.make_runtime_hooks(base)
+    assert hooks.pack_step_inputs and hooks.pack_spec_rng_uploads
+    assert callable(hooks.step_input_pack_factory)
+    assert isinstance(hooks.spec_step_fold, runtime.OverlapFixupFold)
+    assert isinstance(hooks.executor_events, runtime.StepShellEvents)
+    assert callable(getattr(hooks.executor_events, "on_iteration", None))
+    assert hooks.skip_greedy_rng_upload is base.skip_greedy_rng_upload
+    # Nothing else of the measured run's engine changes.
+    for name in (
+        "pack_parallel_scatter",
+        "pack_in_graph",
+        "loop_on_execution_stream",
+        "skip_unchanged_h2d",
+    ):
+        assert getattr(hooks, name) == getattr(DEFAULT_RUNTIME_HOOKS, name), name
+    assert runtime.GIL_SWITCH_US == 200
+    assert runtime.InputCommitPack.issue_after_prepare
+
+
+def test_fold_declines_without_an_open_commit():
+    fold = runtime.OverlapFixupFold()
+    assert fold.begin_step([0], 1) is False
+    assert fold.sampler_rows_stored({}, 0, [0]) is False
+    assert fold.scatter(*([None] * 5)) is False
+    t = torch.zeros(1, dtype=torch.int32)
+    assert fold.gather(t, t, t, t, t, 1, 8, 7, 0, 0, 0) is False
+    assert runtime.fold_block_offsets_copy(t, t, t, t, t) is False
+
+
+def test_commit_pack_declines_host_destinations():
+    pack = object.__new__(runtime.InputCommitPack)
+    pack._dtypes = frozenset({torch.int32})
+    pack.commit = None  # a declined copy never reaches the commit
+    assert pack.stage(torch.zeros(2, dtype=torch.int32), torch.ones(2, dtype=torch.int32)) is False
+
+
+def _topology(siblings_of):
+    return lambda cpu: set(siblings_of.get(cpu, {cpu})) | {cpu}
+
+
+_TOPOLOGIES = [
+    # 8 CPUs, SMT pairs (i, i + 4): physical cores 0..3, core 0 skipped.
+    {i: {i % 4, i % 4 + 4} for i in range(8)},
+    # No SMT.
+    {},
+    # A NUMA set with CPU 0's core outside it.
+    {i: {i, i + 72} for i in range(72)} | {i + 72: {i, i + 72} for i in range(72)},
+]
+
+
+@pytest.mark.parametrize("topo", range(len(_TOPOLOGIES)))
+@pytest.mark.parametrize("gpu", range(8))
+def test_pinned_core_choice(topo, gpu, monkeypatch):
+    monkeypatch.setattr(runtime, "smt_siblings", _topology(_TOPOLOGIES[topo]))
+    available = set(range(8)) if topo < 2 else set(range(36, 72)) | set(range(108, 144))
+    cpu = runtime.pin_executor_cpu(available, gpu_index=gpu)
+    assert cpu in available
+    assert 0 not in runtime.smt_siblings(cpu) or available == {0}
+    expected = (
+        (1, 2, 3, 1, 2, 3, 1, 2),
+        (1, 2, 3, 4, 5, 6, 7, 1),
+        (36, 37, 38, 39, 40, 41, 42, 43),
+    )
+    assert cpu == expected[topo][gpu]
+
+
+@pytest.mark.parametrize(
+    ("visible", "device", "expected_cpu"),
+    [
+        (None, 2, 3),
+        ("6,1", 1, 2),
+        ("3", 0, 4),
+        ("GPU-00000000-0000-0000-0000-000000000001", 0, None),
+        ("MIG-00000000-0000-0000-0000-000000000001", 0, None),
+        ("3", None, None),
+    ],
+)
+def test_executor_pin_requires_a_known_gpu_index(visible, device, expected_cpu, monkeypatch):
+    cuda = types.SimpleNamespace(
+        is_available=lambda: device is not None, current_device=lambda: device
+    )
+    monkeypatch.setattr(runtime, "torch", types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(runtime, "smt_siblings", lambda cpu: {cpu})
+    affinity_changes = []
+    monkeypatch.setattr(
+        runtime,
+        "os",
+        types.SimpleNamespace(
+            environ={} if visible is None else {"CUDA_VISIBLE_DEVICES": visible},
+            sched_getaffinity=lambda pid: set(range(1, 9)),
+            sched_setaffinity=lambda pid, cpus: affinity_changes.append((pid, cpus)),
+            listdir=lambda path: [],
+        ),
+    )
+
+    pin = runtime.ExecutorThreadPin.create()
+    if expected_cpu is None:
+        assert pin is None
+        assert affinity_changes == []
+    else:
+        assert pin is not None and pin.cpu == expected_cpu
+        assert affinity_changes == [(0, {expected_cpu})]
+
+
+def test_executor_pin_moves_the_other_threads(monkeypatch):
+    monkeypatch.setattr(runtime, "smt_siblings", _topology(_TOPOLOGIES[0]))
+    monkeypatch.setattr(runtime, "physical_gpu_index", lambda: 1)
+    me = runtime.threading.get_native_id()
+    affinities = {
+        0: set(range(8)),
+        111: set(range(8)),
+        222: {2, 3, 6},
+        333: {3},
+        444: {2, 6},
+    }
+    tasks = [str(me), "111", "222", "333", "444"]
+    calls = []
+    fake_os = types.SimpleNamespace(
+        sched_getaffinity=affinities.__getitem__,
+        sched_setaffinity=lambda pid, cpus: calls.append((pid, frozenset(cpus))),
+        listdir=lambda path: list(tasks),
+        environ={},
+    )
+    monkeypatch.setattr(runtime, "os", fake_os)
+    pin = runtime.ExecutorThreadPin.create()
+    assert pin is not None and pin.cpu == 2
+    others = frozenset(range(8)) - {2, 6}
+    assert calls == [(0, frozenset({2})), (111, others), (222, frozenset({3}))]
+    calls.clear()
+    tasks.extend(["555", "666"])
+    affinities[555] = {4, 6}
+    affinities[666] = {2}
+    pin.maybe_refresh(runtime.PIN_REFRESH_ITERS - 1)
+    assert calls == []
+    pin.maybe_refresh(runtime.PIN_REFRESH_ITERS)
+    assert calls == [(555, frozenset({4})), (666, others)]
+
+
+def test_overlap_loops_restore_the_switch_interval_after_the_last_exit(monkeypatch):
+    pin_calls = []
+    monkeypatch.setattr(
+        runtime.ExecutorThreadPin, "create", classmethod(lambda cls: pin_calls.append(True))
+    )
+    previous = sys.getswitchinterval()
+    events = runtime.StepShellEvents()
+    unpinned = runtime.StepShellEvents(pin_executor=False)
+    try:
+        events.before_overlap_loop()
+        unpinned.before_overlap_loop()
+        assert pin_calls == [True]
+        # CPython keeps the interval in whole microseconds (200e-6 reads back as 199e-6).
+        assert round(sys.getswitchinterval() * 1e6) in (199, 200)
+        events.on_iteration(runtime.PIN_REFRESH_ITERS)  # no pin: only the fold counters
+        events.after_warmup()
+        events.at_shutdown()
+        assert round(sys.getswitchinterval() * 1e6) in (199, 200)
+        unpinned.at_shutdown()
+        assert abs(sys.getswitchinterval() - previous) < 2e-6
+    finally:
+        events.at_shutdown()
+        unpinned.at_shutdown()
+        sys.setswitchinterval(previous)
+
+
+def test_the_only_environment_read_is_the_gpu_index():
+    source = _RUNTIME_SOURCE.read_text()
+    tree = ast.parse(source)
+    reads = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv")
+    ]
+    assert reads == ["os.environ"]
+    assert '"CUDA_VISIBLE_DEVICES"' in source
+
+
+def test_ull_step_kernels_match_the_source_manifest():
+    files = json.loads((_FAM_DIR / "kernels" / "SOURCE.json").read_text())["files"]
+    for name in ("kernels/k3r_step/input_commit.py", "kernels/k3r_step/step_upload_kernels.py"):
+        entry = files[name]
+        assert entry["source"] == f"tensorrt_llm/_torch/pyexecutor/{pathlib.Path(name).name}"
+        assert hashlib.sha256((_FAM_DIR / name).read_bytes()).hexdigest() == entry["sha256"]
+        assert entry["local_edits"]
+    text = (_FAM_DIR / "kernels/k3r_step/step_upload_kernels.py").read_text()
+    assert "os.environ" not in text.split("def _cdiv")[0]
