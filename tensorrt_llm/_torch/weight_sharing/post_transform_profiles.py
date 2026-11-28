@@ -101,6 +101,27 @@ QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-targe
 DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = (
     "trtllm-deepseek-v3-mla-cutlass-target-layout-v1"
 )
+# Stable contract for the GLM-5 DSA + MoE root with FP8 block-scale (128x128)
+# weights on SM90. Every Linear that the realized quant config quantizes holds
+# E4M3 weights [N, K], FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim
+# FP32 `input_scale` and `inv_input_scale` as loaded: per layer the fused
+# `kv_a_proj_with_mqa` (the `q_a_proj` rows before the `kv_a_proj_with_mqa`
+# rows), `q_b_proj`, `o_proj`, the indexer's `wq_b`, and the gated MLP, which is
+# dense in the first three layers and the fused gate-up shared-expert MLP in
+# every later layer. `kv_b_proj` holds BF16 weights dequantized from the
+# checkpoint, re-laid out per tensor-parallel head split as
+# `[all K-nope rows; all V rows]`, with the `k_b_proj_trans` absorption weight
+# and `v_b_proj` as a view of its V rows, as in the DeepSeek-V3 contract. Every
+# layer owns a DSA indexer whose `wk` and `weights_proj` projections and
+# `k_norm` are fp32. Every MoE layer has an fp32 `e_score_correction_bias` on
+# the replicated BF16 router and DeepGEMM Hopper routed experts (`w3_w1_weight`
+# with the up projection before the gate projection, `w2_weight`, and their
+# FP32 block scales) partitioned by MoE TP or EP. The target-only receiver
+# finalization rebuilds each indexer's fused `wk` and `weights_proj` projection,
+# which is not transferred.
+GLM5_DSA_FP8_BLOCK_SM90_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-glm5-dsa-fp8-block-sm90-target-layout-v1"
+)
 _MISSING = object()
 
 
@@ -161,6 +182,51 @@ def _realized_sliding_window(model: nn.Module) -> str | None:
     if realized_values == {None}:
         return "none"
     return "uniform" if len(realized_values) == 1 else "mixed"
+
+
+def _realized_dsa_indexers(model: nn.Module) -> list[nn.Module | None]:
+    """Return the indexer of every DSA sparse-attention module, in module order.
+
+    A DSA attention module carries `sparse_params` whose `algorithm` is `dsa`.
+    It owns an `indexer` module when it computes its own top-k, and holds
+    `None` when it reuses the top-k of an earlier layer (cross-layer indexer
+    sharing). The list is empty when the model has no DSA module.
+    """
+    return [
+        getattr(module, "indexer", None)
+        for module in model.modules()
+        if getattr(getattr(module, "sparse_params", None), "algorithm", None) == "dsa"
+    ]
+
+
+def _realized_dsa_indexer_sharing(model: nn.Module) -> bool | None:
+    """Whether any DSA layer reuses another layer's top-k instead of owning an indexer.
+
+    `None` when the model has no DSA module.
+    """
+    indexers = _realized_dsa_indexers(model)
+    if not indexers:
+        return None
+    return any(indexer is None for indexer in indexers)
+
+
+def _realized_dsa_indexer_projection_dtype(model: nn.Module) -> str | None:
+    """Return the dtype of the DSA indexers' `wk` and `weights_proj` projections.
+
+    The `TRTLLM_DSA_INDEXER_BF16` environment variable selects it when the
+    model is built. The result is `None` when the model has no DSA indexer
+    with both projections, or when the projections do not share one dtype.
+    """
+    dtypes: set[str | None] = set()
+    for indexer in _realized_dsa_indexers(model):
+        if indexer is None:
+            continue
+        for projection_name in ("wk", "weights_proj"):
+            projection = getattr(indexer, projection_name, None)
+            if projection is None:
+                return None
+            dtypes.add(_canonical_string(getattr(projection, "dtype", None)))
+    return dtypes.pop() if len(dtypes) == 1 else None
 
 
 def _same_weight_memory(first: object, second: object) -> bool | None:
@@ -333,6 +399,13 @@ class PostTransformRuntimeConfig:
     # `first_k_dense_replaces` or `moe_layer_freqs` rejects it.
     first_k_dense_replace: int | None = None
     moe_layer_freq: int | None = None
+    # Whether a DSA sparse-attention layer of the constructed model reuses the
+    # top-k of an earlier layer instead of owning an indexer, and the dtype of
+    # the DSA indexers' `wk` and `weights_proj` projections. Both are `None` for
+    # a model without DSA layers; the dtype is also `None` when the indexers do
+    # not share one.
+    dsa_indexer_sharing: bool | None = None
+    dsa_indexer_projection_dtype: str | None = None
 
     @classmethod
     def from_model_config(
@@ -434,6 +507,12 @@ class PostTransformRuntimeConfig:
                 getattr(pretrained_config, "first_k_dense_replace", None)
             ),
             moe_layer_freq=_canonical_int(getattr(pretrained_config, "moe_layer_freq", None)),
+            dsa_indexer_sharing=(
+                _realized_dsa_indexer_sharing(model) if model is not None else None
+            ),
+            dsa_indexer_projection_dtype=(
+                _realized_dsa_indexer_projection_dtype(model) if model is not None else None
+            ),
         )
 
 
@@ -469,6 +548,8 @@ class PostTransformRuntimeConstraints:
         ("weight_block_sizes", "weight_block_size"),
         ("first_k_dense_replaces", "first_k_dense_replace"),
         ("moe_layer_freqs", "moe_layer_freq"),
+        ("dsa_indexer_sharing", "dsa_indexer_sharing"),
+        ("dsa_indexer_projection_dtypes", "dsa_indexer_projection_dtype"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -498,6 +579,8 @@ class PostTransformRuntimeConstraints:
     weight_block_sizes: frozenset[tuple[int, ...] | None] | None = None
     first_k_dense_replaces: frozenset[int | None] | None = None
     moe_layer_freqs: frozenset[int | None] | None = None
+    dsa_indexer_sharing: frozenset[bool | None] | None = None
+    dsa_indexer_projection_dtypes: frozenset[str | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:

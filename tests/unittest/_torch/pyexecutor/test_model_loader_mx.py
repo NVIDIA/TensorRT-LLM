@@ -63,6 +63,9 @@ from tensorrt_llm._torch.modules import linear as linear_mod
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
+from tensorrt_llm._torch.moe.fused_moe.cutlass.fp8_block_scales_hopper import (
+    DeepgemmCudaHopperFp8BlockScalesImpl,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
@@ -774,6 +777,26 @@ def _qwen3_5_35b_a3b_expert_config() -> PretrainedConfig:
     )
 
 
+_GLM5_PROFILE_ID = "glm-moe-dsa-for-causal-lm-fp8-block-sm90-cutlass-target-v1"
+
+
+def _glm5_fp8_expert_config() -> PretrainedConfig:
+    # The GLM-5-FP8 expert shapes: 256 routed experts, top-8, MoE intermediate size 2048.
+    return PretrainedConfig(
+        architectures=["GlmMoeDsaForCausalLM"],
+        model_type="glm_moe_dsa",
+        hidden_size=6144,
+        intermediate_size=12288,
+        moe_intermediate_size=2048,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        num_experts_per_tok=8,
+        num_hidden_layers=78,
+        first_k_dense_replace=3,
+        torch_dtype=torch.bfloat16,
+    )
+
+
 # The language-model config, at its canary's expert shapes, that each qualified
 # MoE profile resolves its pinned MoE backend literal with. Every MoE profile
 # needs an entry.
@@ -781,6 +804,7 @@ _MOE_PROFILE_CANARY_CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     _QWEN3_MOE_PROFILE_ID: _qwen3_30b_a3b_expert_config,
     _DEEPSEEK_V3_PROFILE_ID: _deepseek_v3_lite_expert_config,
     _QWEN3_5_MOE_PROFILE_ID: _qwen3_5_35b_a3b_expert_config,
+    _GLM5_PROFILE_ID: _glm5_fp8_expert_config,
 }
 
 
@@ -1270,11 +1294,22 @@ _DOCUMENTED_SLIDING_WINDOWS = {
 _DOCUMENTED_MOE_LAYER_LAYOUTS = {
     (None, None): "",
     (frozenset({1}), frozenset({1})): "a dense first layer and MoE in every later layer, ",
+    (frozenset({3}), frozenset({1})): "dense first three layers and MoE in every later layer, ",
+}
+# Keyed by the profile's (`sparse_attention_enabled`, `dsa_indexer_sharing`,
+# `dsa_indexer_projection_dtypes`) constraints: the attention description that
+# follows the attention backend, and whether sparse attention is excluded.
+_DOCUMENTED_SPARSE_ATTENTION = {
+    (frozenset({False}), None, None): (" attention", True),
+    (frozenset({True}), frozenset({False}), frozenset({"float32"})): (
+        " DSA sparse attention with an indexer in every layer and fp32 indexer projections",
+        False,
+    ),
 }
 # Documented weight-quantization envelopes, keyed by the quant_algorithms,
-# sm_versions, and weight_block_sizes constraints of a dense row. A row with any
+# sm_versions, and weight_block_sizes constraints of a row. A row with any
 # other combination needs its own description here and in the support table.
-_DOCUMENTED_DENSE_QUANTIZATION = {
+_DOCUMENTED_QUANTIZATION = {
     (frozenset({"none"}), None, None): "unquantized weights and KV cache",
     (
         frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
@@ -1289,17 +1324,24 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
 
     A MoE profile also names its pinned MoE backend, MoE layer layout, and
     admitted routed-expert partitions, and adds the MoE load balancer and DWDP
-    to the exclusions.
+    to the exclusions. A profile that admits DSA sparse attention names its
+    indexer layout instead of excluding sparse attention.
     """
     constraints = profile.runtime_constraints
-    quantization = _DOCUMENTED_DENSE_QUANTIZATION[
+    quantization = _DOCUMENTED_QUANTIZATION[
         (constraints.quant_algorithms, constraints.sm_versions, constraints.weight_block_sizes)
+    ]
+    attention_description, sparse_attention_excluded = _DOCUMENTED_SPARSE_ATTENTION[
+        (
+            constraints.sparse_attention_enabled,
+            constraints.dsa_indexer_sharing,
+            constraints.dsa_indexer_projection_dtypes,
+        )
     ]
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
     assert constraints.layerwise_quantization == frozenset({False})
     assert constraints.force_dynamic_quantization == frozenset({False})
     assert constraints.lora_enabled == frozenset({False})
-    assert constraints.sparse_attention_enabled == frozenset({False})
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
     # Each profile pins one embedding layout. A family that also qualifies tied
@@ -1357,13 +1399,14 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
         constraints.tied_word_embeddings,
         labels={False: "untied", True: "tied"},
     )
+    sparse_attention_exclusion = "sparse attention, " if sparse_attention_excluded else ""
     return (
         f"Single-node {model_description}, {quantization}, "
-        f"{attention_backends} attention, {moe_backend_description}"
+        f"{attention_backends}{attention_description}, {moe_backend_description}"
         f"{moe_layer_layout_description}{rope_description}"
         f"{sliding_window_description}, {embeddings} embeddings, {partition_description}, "
-        f"PP/CP={pp_cp_sizes}, no LoRA, sparse attention, attention DP, {moe_exclusions}"
-        "speculative mode, or separately loaded draft model"
+        f"PP/CP={pp_cp_sizes}, no LoRA, {sparse_attention_exclusion}attention DP, "
+        f"{moe_exclusions}speculative mode, or separately loaded draft model"
     )
 
 
@@ -1493,6 +1536,7 @@ _MX_FAMILY_DISPLAY_NAMES = {
     "Qwen3MoeForCausalLM": "Qwen3 MoE",
     "DeepseekV3ForCausalLM": "DeepSeek-V3",
     "Qwen3_5MoeForConditionalGeneration": "Qwen3.5 MoE",
+    "GlmMoeDsaForCausalLM": "GLM-5",
 }
 
 
@@ -1553,6 +1597,11 @@ _MX_E2E_ROWS = {
         "qwen3_5-moe",
         "TRTLLM_MX_QWEN3_5_MOE_MODEL",
     ),
+    "glm-moe-dsa-for-causal-lm-fp8-block-sm90-cutlass-target-v1": (
+        "glm5-fp8-block",
+        "glm5-fp8-block",
+        "TRTLLM_MX_GLM5_MODEL",
+    ),
     "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
         "qwen3-fp8-block",
         "qwen3-fp8-block",
@@ -1573,7 +1622,8 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     `_MX_E2E_ROWS` names the rows of each profile and needs one entry per
     qualified profile. The `_MX_CASES` rows must follow the shared naming
     scheme, and `l0_model_express.yml` must list each row exactly once, in a
-    block whose GPU count matches the row's two TP groups.
+    block whose GPU count matches the row's two TP groups. All rows of a
+    profile load the same checkpoint with the same `model_kwargs`, if any.
     """
     profiles = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
     assert set(_MX_E2E_ROWS) == {profile.profile_id for profile in profiles}, (
@@ -1606,6 +1656,8 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
                 # MoE rows disable the CUTLASS FC2+finalize fusion, which is not
                 # deterministic for top-k greater than 2.
                 expected_row["moe_disable_finalize_fusion"] = True
+            if "model_kwargs" in cases[f"{case_stem}-tp1"]:
+                expected_row["model_kwargs"] = cases[f"{case_stem}-tp1"]["model_kwargs"]
             assert cases[case_id] == expected_row
             assert case_id in ci_case_ids[2 * tp_size]
         # A MoE profile has one more row for each admitted MoE EP size above 1. It
@@ -3387,6 +3439,21 @@ def test_qwen3_moe_auto_backend_resolves_to_qualified_cutlass(
     assert _qwen3_moe_profile().runtime_constraints.moe_backends == frozenset({resolved})
 
 
+# The routed-expert implementation that a MoE profile's pinned quantization
+# realizes under its pinned `CUTLASS` literal on the SMs the profile admits.
+_PINNED_MOE_IMPLEMENTATIONS = {
+    "none": TrtllmCutlassUnquantizedImpl.__name__,
+    QuantAlgo.FP8_BLOCK_SCALES.value: DeepgemmCudaHopperFp8BlockScalesImpl.__name__,
+}
+
+
+def _moe_profile_quant_config(quant_algorithm: str) -> QuantConfig:
+    """The model quantization of a MoE profile's pinned quantization algorithm."""
+    if quant_algorithm == "none":
+        return QuantConfig()
+    return QuantConfig(quant_algo=QuantAlgo(quant_algorithm), group_size=_FP8_BLOCK_SIZE)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [80, 89, 90, 100, 103, 107, 120, 121])
 @pytest.mark.parametrize(
@@ -3404,11 +3471,12 @@ def test_moe_profile_backend_literals_realize_one_implementation(
 
     MoE profiles pin the configured literal and the model quantization, not the
     realized implementation. That is exact only while one implementation can
-    serve the pinned format under the literal, on every SM and admitted
-    partition, so neither a degraded resolution nor a newer architecture
-    realizes a different expert layout. A family that gains a second
-    implementation for that format needs a realized-implementation dimension
-    first.
+    serve the pinned format under the literal, on every SM the profile admits
+    and every admitted partition, so neither a degraded resolution nor a newer
+    architecture realizes a different expert layout. A family that gains a
+    second implementation for that format needs a realized-implementation
+    dimension first. A profile that pins its SM versions is checked on those
+    SMs only.
     """
     moe_profiles = [
         profile
@@ -3424,7 +3492,10 @@ def test_moe_profile_backend_literals_realize_one_implementation(
     environment = MoEEnvironment(sm=sm, available_deps=tuple(dep.value for dep in MoEDep))
     for profile in moe_profiles:
         constraints = profile.runtime_constraints
-        assert constraints.quant_algorithms == frozenset({"none"})
+        if constraints.sm_versions is not None and sm not in constraints.sm_versions:
+            continue
+        (quant_algorithm,) = constraints.quant_algorithms
+        expected_implementation = _PINNED_MOE_IMPLEMENTATIONS[quant_algorithm]
         # Each MoE profile must admit every partition parametrized here, or it goes unchecked.
         assert mapping.tp_size in constraints.tp_sizes, (
             f"{profile.profile_id} does not admit TP={mapping.tp_size}; "
@@ -3433,14 +3504,15 @@ def test_moe_profile_backend_literals_realize_one_implementation(
         for moe_backend in constraints.moe_backends:
             model_config = ModelConfig(
                 pretrained_config=_MOE_PROFILE_CANARY_CONFIGS[profile.profile_id](),
+                quant_config=_moe_profile_quant_config(quant_algorithm),
                 mapping=mapping,
                 moe_backend=moe_backend,
             )
             with override_moe_environment(environment):
                 report = resolve_moe_impl(model_config)
 
-            assert report.eligible == (TrtllmCutlassUnquantizedImpl.__name__,), profile.profile_id
-            assert report.winner == TrtllmCutlassUnquantizedImpl.__name__
+            assert report.eligible == (expected_implementation,), profile.profile_id
+            assert report.winner == expected_implementation
             assert not report.degraded
 
 
