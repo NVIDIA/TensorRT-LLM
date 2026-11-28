@@ -46,14 +46,22 @@ def test_switch_refuses_another_value(monkeypatch):
         M._dp_moe_comm()
 
 
-class _Trip:
-    """A stand-in transport that takes up to `max_rows` rows a rank."""
+def _trip(max_rows: int, hidden: int = 8):
+    """A transport of up to `max_rows` rows a rank at `hidden`, with no buffers or launches:
+    the real `DepRoundTrip`, so its own eligibility check (`takes`: rows, bf16, width) runs."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import dep_lamport_round_trip
 
-    def __init__(self, max_rows: int):
-        self.max_rows = max_rows
-
-    def takes(self, rows: int, x: torch.Tensor) -> bool:
-        return 1 <= rows <= self.max_rows
+    return dep_lamport_round_trip.DepRoundTrip(
+        hidden=hidden,
+        max_rows=max_rows,
+        rank=0,
+        world=4,
+        buffer=None,
+        peer_buffers=[],
+        state=None,
+        gather_fn=None,
+        reduce_fn=None,
+    )
 
 
 def _round_trip(monkeypatch, comm: str, max_rows: int = 4):
@@ -78,23 +86,26 @@ def _round_trip(monkeypatch, comm: str, max_rows: int = 4):
         dp_size=4,
         dp_group=[0, 1, 2, 3],
         mapping=SimpleNamespace(tp_group_pg=None),
-        _dp_lamport=lambda group: _Trip(max_rows),
+        _dp_lamport=lambda group: _trip(max_rows),
     )
     return M.Qwen4ExpDefaultModelingV2._expert_sum_op(core), calls
 
 
 @pytest.mark.parametrize(
-    "comm, rows, pad, expected",
+    "comm, rows, pad, dtype, expected",
     [
-        ("nccl", 3, 1, [("nccl gather", 4), ("nccl reduce", 16)]),
-        ("lamport", 3, 1, [("lamport gather", 4), ("lamport reduce", 16)]),
-        ("lamport_step", 3, 1, [("lamport gather", 4), ("lamport reduce", 16)]),
-        ("lamport", 5, 0, [("nccl gather", 5), ("nccl reduce", 20)]),  # past the transport's rows
+        ("nccl", 3, 1, torch.bfloat16, [("nccl gather", 4), ("nccl reduce", 16)]),
+        ("lamport", 3, 1, torch.bfloat16, [("lamport gather", 4), ("lamport reduce", 16)]),
+        ("lamport_step", 3, 1, torch.bfloat16, [("lamport gather", 4), ("lamport reduce", 16)]),
+        # past the transport's rows
+        ("lamport", 5, 0, torch.bfloat16, [("nccl gather", 5), ("nccl reduce", 20)]),
+        # the same shape in fp32: the transport carries bf16 only
+        ("lamport", 3, 1, torch.float32, [("nccl gather", 4), ("nccl reduce", 16)]),
     ],
 )
-def test_round_trip_transport(monkeypatch, comm, rows, pad, expected):
+def test_round_trip_transport(monkeypatch, comm, rows, pad, dtype, expected):
     expert_sum, calls = _round_trip(monkeypatch, comm)
-    x = torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8)
+    x = torch.arange(rows * 8, dtype=dtype).reshape(rows, 8)
     out = expert_sum(lambda gathered: gathered, x, pad)
     assert calls == expected
     assert out.shape == x.shape and torch.equal(out, x)
@@ -292,10 +303,14 @@ def test_shell_step_is_one_region(comm):
     steps = M.LamportSteps() if comm == "lamport_step" else None
 
     def step(*args, **kwargs):
-        seen.append((steps.depth if steps is not None else None, args[0], kwargs))
+        seen.append((steps.depth if steps is not None else None, args, kwargs))
         return "out"
 
     shell = SimpleNamespace(model=SimpleNamespace(_lamport_steps=steps), _step=step)
     out = M.ModelingV2Qwen38FlashNextNvfp4Sm10xDefault.forward(shell, "md", spec_metadata="sm")
     assert out == "out"
-    assert seen == [(1 if steps is not None else None, "md", {})]
+    [(depth, args, kwargs)] = seen
+    assert depth == (1 if steps is not None else None) and kwargs == {}
+    # `_step(attn_metadata, input_ids, position_ids, inputs_embeds, return_context_logits,
+    # spec_metadata, lora_params)`: the speculative metadata reaches the step.
+    assert args[0] == "md" and args[5] == "sm"
