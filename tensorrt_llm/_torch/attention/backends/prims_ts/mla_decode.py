@@ -155,12 +155,13 @@ class _MLADecodePlanState:
     mask_type: Literal["dense", "causal"]
     max_kv_len: int
     required_page_columns: int
-    workspace_buffer: torch.Tensor
+    workspace_buffer: Optional[torch.Tensor]
     workspace_layout: _MLAWorkspaceLayout
-    workspace_views: _MLAWorkspaceViews
-    compiled: Callable[..., object]
+    workspace_views: Optional[_MLAWorkspaceViews]
+    compiled: Optional[Callable[..., object]]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    compile_spec: "_MLADecodeCompileSpec"
     softmax_rescale_threshold_log2: float = 0.0
     lse_mode: str = "none"
     softmax_scale: GlobalScale = 1.0
@@ -1858,6 +1859,27 @@ class BatchMLADecodePagedTSWrapper:
         """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._plan_state: Optional[_MLADecodePlanState] = None
 
+    def is_kernel_cached(self) -> bool:
+        """Whether this plan's kernel has a matching on-disk export.
+
+        Call after `plan`, including `plan(compile=False)`. This scheduling hint
+        neither loads nor builds a kernel. An executable plan still requires
+        `plan(compile=True)`. A process-local executable remains usable if its
+        disk export is later evicted; this query only describes the disk cache.
+        """
+        state = self._plan_state
+        if state is None:
+            raise RuntimeError("plan() must be called before is_kernel_cached()")
+        spec = state.compile_spec
+        with torch.cuda.device(state.device):
+            return is_attention_kernel_cached(
+                "mla_decode",
+                "main",
+                spec,
+                _COMPILE_OPTIONS,
+                functools.partial(_compile_mla_decode, spec),
+            )
+
     @flashinfer_experimental_api
     def plan(
         self,
@@ -1884,6 +1906,7 @@ class BatchMLADecodePagedTSWrapper:
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
         tuning: Optional[MLAAttentionTuning] = None,
+        compile: bool = True,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1985,11 +2008,20 @@ class BatchMLADecodePagedTSWrapper:
             when enabling it for FP8. BF16 P is not scaled. The value is
             compiled into the kernel, so each distinct value builds its own
             kernel. It is range-checked even when ``validate`` is False.
+        compile : bool
+            With ``False``, resolve the plan without allocating or binding a
+            workspace and without compiling or loading a kernel. A supplied
+            ``workspace_buffer`` is still validated but not retained.
+            :meth:`is_kernel_cached` then reports whether the selected kernel
+            has an on-disk export. Plan again with ``compile=True`` before
+            :meth:`run`.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        if not isinstance(compile, bool):
+            raise TypeError("compile must be a bool")
         _validate_mla_cp(cp_world, cp_interleave_size)
         if not isinstance(zero_empty_rows, bool):
             raise TypeError("zero_empty_rows must be a bool")
@@ -2073,18 +2105,22 @@ class BatchMLADecodePagedTSWrapper:
             max_q_len,
             include_lse=False,
         )
-        if workspace_buffer is None:
-            workspace_buffer = torch.empty(
-                workspace_layout.total_bytes, device=device, dtype=torch.int8
-            )
-        elif validate:
+        if workspace_buffer is not None and validate:
             _validate_workspace_buffer(
                 workspace_buffer,
                 device=device,
                 required_bytes=workspace_layout.total_bytes,
             )
-        workspace = _bind_mla_workspace(workspace_buffer, workspace_layout)
-        compiled = _get_compiled_mla_decode(compile_spec)
+        if compile:
+            if workspace_buffer is None:
+                workspace_buffer = torch.empty(
+                    workspace_layout.total_bytes, device=device, dtype=torch.int8
+                )
+            workspace = _bind_mla_workspace(workspace_buffer, workspace_layout)
+            compiled = _get_compiled_mla_decode(compile_spec)
+        else:
+            # A plan that is not compiled cannot run, so it keeps no scratch.
+            workspace_buffer = workspace = compiled = None
 
         # Publish only after validation, compilation, allocation, and binding
         # succeed, so a failed re-plan leaves the previous plan usable.
@@ -2109,6 +2145,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=spec.split_kv,
+            compile_spec=compile_spec,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
             lse_mode=lse_mode,
@@ -2179,6 +2216,8 @@ class BatchMLADecodePagedTSWrapper:
         state = self._plan_state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
+        if state.compiled is None:
+            raise RuntimeError("plan(compile=True) must be called before run()")
         softmax_scale = resolve_scale(
             softmax_scale, state.softmax_scale, "softmax_scale", state.device
         )

@@ -46,7 +46,8 @@ def _init_worker(search_path: list[str]) -> None:
     sys.meta_path.insert(0, _VendorPackages())
 
 
-def _plan(payload: dict[str, Any]) -> None:
+def compile_payload(payload: dict[str, Any]) -> None:
+    """Compile the kernel one encoded plan selects and publish it to the disk cache."""
     import torch
 
     device = torch.device("cuda", payload["device_index"])
@@ -54,10 +55,17 @@ def _plan(payload: dict[str, Any]) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
     kwargs = payload["plan_kwargs"].copy()
-    kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
-    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
     try:
-        wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
+        # prims_ts_precompile.DENSE_MLA_DECODE; this standalone script cannot import it.
+        if payload.get("kind") == "dense_mla_decode":
+            for name in ("q_dtype", "kv_dtype", "out_dtype"):
+                kwargs[name] = getattr(torch, kwargs[name])
+            wrapper = mla_decode.BatchMLADecodePagedTSWrapper()
+            wrapper.plan(device, **kwargs)
+        else:
+            kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
+            wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+            wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
     except Exception as error:
         # Native compilation failures need the specialization that triggered them.
         raise RuntimeError(f"PrimTS worker could not compile {payload!r}: {error}") from error
@@ -84,4 +92,4 @@ if __name__ == "__main__":
         initializer=_init_worker,
         initargs=(request["sys_path"],),
     ) as pool:
-        list(pool.map(_plan, request["payloads"]))
+        list(pool.map(compile_payload, request["payloads"]))

@@ -17,6 +17,7 @@ from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
+from flashinfer.jit.core import MissingJITCacheError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -450,3 +451,184 @@ def test_selected_provider_and_capture_gates(
         torch.cuda, "is_current_stream_capturing", Mock(side_effect=AssertionError("CUDA touched"))
     )
     assert _run(warmer, planners, cpu_model) == (0, 0)
+
+
+@pytest.mark.parametrize("pool", [True, False], ids=["pool", "local"])
+def test_dense_decode_prepare_loads_each_kernel_once_before_forward(
+    planners: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, pool: bool
+) -> None:
+    planned = []
+    cached_kernels = {("small", 1)}
+
+    class Wrapper:
+        """Kernels change with the width and at batch 3, like a launch-policy boundary."""
+
+        def plan(self, **kwargs: object) -> None:
+            planned.append(kwargs)
+            kernel = ("small" if kwargs["batch_size"] <= 2 else "large", kwargs["max_q_len"])
+            self._plan_state = SimpleNamespace(compile_spec=kernel)
+
+        def is_kernel_cached(self) -> bool:
+            return self._plan_state.compile_spec in cached_kernels
+
+    planners.decode.BatchMLADecodePagedTSWrapper = Wrapper
+    precompile = ModuleType("tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile")
+    precompile.pool_enabled = Mock(return_value=pool)
+    precompile.encode_dense_payload = lambda index, kwargs: (
+        index,
+        kwargs["batch_size"],
+        kwargs["max_q_len"],
+        kwargs["zero_empty_rows"],
+    )
+    precompile.precompile_payloads = Mock()
+    monkeypatch.setitem(sys.modules, precompile.__name__, precompile)
+    planners.metadata.max_total_draft_tokens = 2
+    template = _decode_profile(max_q_len=1)
+    library = SimpleNamespace(mla_decode_warmup_profile=Mock(return_value=template))
+    layers = [(object(), library), (object(), library)]
+    limits = dict(max_batch_size=4, max_num_tokens=8)
+
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    assert warmer.prepare(layers, planners.metadata, **limits, local_ranks=4) == (
+        3,
+        2 if pool else 0,
+    )
+    assert [c.args for c in library.mla_decode_warmup_profile.call_args_list] == [
+        (layer, planners.metadata) for layer, _ in layers
+    ]
+    # Widths {1, 1 + draft}; batches up to min(max_batch_size, max_num_tokens // width).
+    resolved = [(p["batch_size"], p["max_q_len"]) for p in planned if p.get("compile") is False]
+    assert resolved == [(1, 1), (2, 1), (3, 1), (4, 1), (1, 3), (2, 3)]
+    loaded = [(p["batch_size"], p["max_q_len"]) for p in planned if "compile" not in p]
+    assert loaded == [(1, 1), (3, 1), (1, 3)]
+    assert all(p["zero_empty_rows"] is False for p in planned)
+    if pool:
+        precompile.precompile_payloads.assert_called_once_with(
+            [(0, 3, 1, False), (0, 1, 3, False)], local_ranks=4
+        )
+    else:
+        precompile.precompile_payloads.assert_not_called()
+    # Resolving plans allocates nothing; the loads share one workspace sized
+    # for the largest loaded plan (batch 1, width 3).
+    assert not any("workspace_buffer" in p for p in planned if p.get("compile") is False)
+    assert len(planners.allocations) == 1 and planners.allocations[0][1] == 127 * 3
+    assert len({id(p["workspace_buffer"]) for p in planned if "compile" not in p}) == 1
+
+    # Prepared profiles are complete; neither phase plans them again.
+    planned.clear()
+    assert warmer.prepare(layers, planners.metadata, **limits) == (0, 0)
+    model, _, _ = _model(planners, decodes=(replace(template, max_q_len=3),))
+    assert _run(warmer, planners, model, **limits) == (0, 0)
+    assert not planned
+
+    # With JIT disabled, loading a kernel missing from the disk cache is left
+    # to the forward that selects it.
+    resolve = Wrapper.plan
+
+    def plan_without_jit(self, **kwargs: object) -> None:
+        resolve(self, **kwargs)
+        if "compile" not in kwargs and self._plan_state.compile_spec not in cached_kernels:
+            raise MissingJITCacheError("kernel is not cached")
+
+    monkeypatch.setattr(Wrapper, "plan", plan_without_jit)
+    assert _warmup.PrimsTSDenseMlaWarmup().prepare(
+        layers, planners.metadata, **limits, local_ranks=4
+    ) == (3, 2 if pool else 0)
+    assert [(p["batch_size"], p["max_q_len"]) for p in planned if "compile" not in p] == loaded
+    planned.clear()
+
+    # Gates: metadata type, unsupported layers and CUDA graph capture.
+    fresh = _warmup.PrimsTSDenseMlaWarmup()
+    assert fresh.prepare(layers, None, **limits) == (0, 0)
+    library.mla_decode_warmup_profile.return_value = None
+    assert fresh.prepare(layers, planners.metadata, **limits) == (0, 0)
+    library.mla_decode_warmup_profile.return_value = replace(template, device=torch.device("cpu"))
+    assert fresh.prepare(layers, planners.metadata, **limits) == (0, 0)
+    library.mla_decode_warmup_profile.return_value = template
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="during capture"):
+        fresh.prepare(layers, planners.metadata, **limits)
+    assert not planned
+
+
+@pytest.mark.parametrize("case", ["shared", "private", "peer_error", "local_error"])
+def test_dense_decode_prepare_splits_misses_between_cache_peers(
+    planners: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    planned = []
+
+    class Wrapper:
+        def plan(self, **kwargs: object) -> None:
+            planned.append(kwargs)
+            kernel = ("small" if kwargs["batch_size"] <= 2 else "large", kwargs["max_q_len"])
+            self._plan_state = SimpleNamespace(compile_spec=kernel)
+
+        def is_kernel_cached(self) -> bool:
+            return False
+
+    planners.decode.BatchMLADecodePagedTSWrapper = Wrapper
+    precompile = ModuleType("tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile")
+    precompile.can_publish = lambda: True
+    precompile.pool_enabled = Mock(return_value=True)
+    precompile.encode_dense_payload = lambda index, kwargs: {
+        "device_index": index,
+        "rows": (kwargs["batch_size"], kwargs["max_q_len"]),
+    }
+    precompile.payload_key = lambda payload: str(payload["rows"])
+    precompile.precompile_payloads = Mock()
+    precompile.compile_payloads_in_process = Mock()
+    monkeypatch.setitem(sys.modules, precompile.__name__, precompile)
+    monkeypatch.setattr(_warmup, "_share_cache_key", lambda: "host:/cache")
+    planners.metadata.max_total_draft_tokens = 2
+    library = SimpleNamespace(mla_decode_warmup_profile=Mock(return_value=_decode_profile()))
+    if case == "local_error":
+        library.mla_decode_warmup_profile.side_effect = ValueError("bad layer")
+    exchanged = []
+
+    def exchange(report: object) -> list:
+        exchanged.append(report)
+        if len(exchanged) == 2:
+            return [None, report]  # the barrier
+        # A peer that sorts first, on another GPU with the same misses.
+        peer = replace(
+            report,
+            token="peer",
+            cache="host:/other" if case == "private" else report.cache,
+            missing={k: {**p, "device_index": 1} for k, p in report.missing.items()},
+            error="OSError: peer failed" if case == "peer_error" else None,
+        )
+        return [peer, report]
+
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    limits = dict(max_batch_size=4, max_num_tokens=8, local_ranks=2)
+    if case in ("peer_error", "local_error"):
+        error = RuntimeError if case == "peer_error" else ValueError
+        with pytest.raises(error, match="on a peer: OSError" if case == "peer_error" else "bad"):
+            warmer.prepare([(object(), library)], planners.metadata, **limits, exchange=exchange)
+        # Every peer raises after the same exchange, before compiling anything.
+        assert len(exchanged) == 1 and exchanged[0].error == (
+            "ValueError: bad layer" if case == "local_error" else None
+        )
+        precompile.precompile_payloads.assert_not_called()
+        precompile.compile_payloads_in_process.assert_not_called()
+        return
+
+    result = warmer.prepare([(object(), library)], planners.metadata, **limits, exchange=exchange)
+    assert exchanged[0].cache == "host:/cache" and exchanged[1] is None
+    assert sorted(exchanged[0].missing) == ["(1, 1)", "(1, 3)", "(3, 1)"]
+    if case == "shared":
+        # The second of two peers compiles the second of the sorted misses, on its own GPU.
+        assert result == (3, 1)
+        precompile.compile_payloads_in_process.assert_called_once_with(
+            [{"device_index": 0, "rows": (1, 3)}]
+        )
+        precompile.precompile_payloads.assert_not_called()
+    else:
+        assert result == (3, 3)
+        (payloads,), kwargs = precompile.precompile_payloads.call_args
+        assert sorted(p["rows"] for p in payloads) == [(1, 1), (1, 3), (3, 1)]
+        assert kwargs == {"local_ranks": 2}
+        precompile.compile_payloads_in_process.assert_not_called()
+    # Loading follows the barrier and covers every kernel this rank uses.
+    loaded = [(p["batch_size"], p["max_q_len"]) for p in planned if "compile" not in p]
+    assert loaded == [(1, 1), (3, 1), (1, 3)]

@@ -11,6 +11,7 @@ import os
 import time
 from collections.abc import Callable
 from enum import Enum, auto
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -532,6 +533,8 @@ class DecoderWarmup:
             self._prewarm_model_decode_kernels(kv_cache_manager)
         with self._warmup_timer.phase("prims_ts_sparse_mla"):
             self._prewarm_prims_ts_sparse_mla(resource_manager, kv_cache_manager)
+        with self._warmup_timer.phase("prims_ts_dense_mla"):
+            self._prewarm_prims_ts_dense_mla(resource_manager, kv_cache_manager)
         if self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
@@ -1102,6 +1105,55 @@ class DecoderWarmup:
         for peer_error in _gather_prewarm_errors(self.dist, self.mapping):
             if peer_error is not None:
                 raise RuntimeError(f"PrimTS sparse MLA warmup failed on a peer: {peer_error}")
+
+    def _prewarm_prims_ts_dense_mla(
+        self, resource_manager: ResourceManager, kv_cache_manager: KVCacheManager | KVCacheManagerV2
+    ) -> None:
+        """Load dense PrimTS MLA decode kernels before the first warmup forward.
+
+        The kernels are derived from each layer's configuration and this pass's
+        KV cache, so missing ones compile together in the PrimTS precompile pool
+        rather than one after another in the forwards that first select them.
+        Tensor and context parallel peers that share a host's kernel cache split
+        those compiles between them.
+        """
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup import (
+            dense_mla_decode_layers,
+        )
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile import local_rank_count
+
+        if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
+            return
+        if is_context_only_kv_cache(kv_cache_manager):
+            return
+        layers = dense_mla_decode_layers(self.model)
+        if not layers:
+            return
+        try:
+            with torch.inference_mode():
+                metadata = self._metadata.setup_attention(
+                    kv_cache_manager,
+                    get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
+                )
+                self._prims_ts_dense_mla_warmup.prepare(
+                    layers,
+                    metadata,
+                    max_batch_size=self._config.max_batch_size,
+                    max_num_tokens=self._config.max_num_tokens,
+                    local_ranks=local_rank_count(self.mapping),
+                    # The peer-error allgather also lets peers split their compiles.
+                    exchange=partial(_gather_prewarm_errors, self.dist, self.mapping),
+                )
+            torch.cuda.synchronize()
+        except Exception as exc:
+            # A CUDA error can also break the communicator. Preserve the original
+            # failure for the executor's distributed warmup guard in that case.
+            with contextlib.suppress(Exception):
+                _gather_prewarm_errors(self.dist, self.mapping, f"{type(exc).__name__}: {exc}")
+            raise
+        for peer_error in _gather_prewarm_errors(self.dist, self.mapping):
+            if peer_error is not None:
+                raise RuntimeError(f"PrimTS dense MLA warmup failed on a peer: {peer_error}")
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so

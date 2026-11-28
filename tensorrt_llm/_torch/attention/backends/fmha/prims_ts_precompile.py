@@ -64,16 +64,23 @@ def default_worker_count(local_ranks: int = 1) -> int:
     return max(1, min(_MAX_DEFAULT_WORKERS, _HOST_COMPILE_BUDGET // max(1, int(local_ranks))))
 
 
+def can_publish() -> bool:
+    """Whether a kernel compiled here reaches the disk cache other processes load from.
+
+    False when the on-disk cache or JIT compilation is disabled.
+    """
+    return os.environ.get("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "0") != "1" and not os.environ.get(
+        "FLASHINFER_DISABLE_JIT"
+    )
+
+
 def worker_count(num_payloads: int, *, local_ranks: int = 1) -> int:
     """Subprocess count from ``TLLM_PRIMTS_WARM_WORKERS``; ``0``/``1`` disables.
 
     Without the variable, divide the host compile budget among its local ranks.
-    Zero when the on-disk cache or JIT compilation is disabled: a worker could
-    then compile but keep nothing.
+    Zero when a worker could compile but keep nothing (:func:`can_publish`).
     """
-    if os.environ.get("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "0") == "1" or os.environ.get(
-        "FLASHINFER_DISABLE_JIT"
-    ):
+    if not can_publish():
         return 0
     raw = os.environ.get("TLLM_PRIMTS_WARM_WORKERS")
     if raw is None:
@@ -146,6 +153,41 @@ def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) 
     return {"device_index": device_index, "rows": rows, "heads": heads, "plan_kwargs": kwargs}
 
 
+DENSE_MLA_DECODE = "dense_mla_decode"
+
+
+def encode_dense_payload(device_index: int, plan_kwargs: dict) -> dict[str, Any]:
+    """JSON-safe description of one ``BatchMLADecodePagedTSWrapper.plan`` call."""
+    kwargs = dict(plan_kwargs)
+    for name in ("q_dtype", "kv_dtype", "out_dtype"):
+        kwargs[name] = str(kwargs[name]).removeprefix("torch.")
+    return {"kind": DENSE_MLA_DECODE, "device_index": device_index, "plan_kwargs": kwargs}
+
+
+def payload_key(payload: dict[str, Any]) -> str:
+    """Identify an encoded plan the same way on every rank, whichever GPU it uses."""
+    return json.dumps({k: v for k, v in payload.items() if k != "device_index"}, sort_keys=True)
+
+
+def compile_payloads_in_process(payloads: Sequence[dict[str, Any]]) -> None:
+    """Compile encoded plans one after another in this process, as a worker would."""
+    from ._prims_ts_worker import compile_payload
+
+    start = time.perf_counter()
+    try:
+        for payload in payloads:
+            compile_payload(payload)
+    except RuntimeError as error:
+        if strict():
+            raise
+        logger.warning(f"PrimTS precompile failed. Planning missing kernels locally.\n{error}")
+        return
+    logger.info(
+        f"PrimTS MLA precompiled {len(payloads)} kernel variants in process "
+        f"in {time.perf_counter() - start:.1f} s"
+    )
+
+
 def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> None:
     """Run the encoded plans with up to ``workers`` compiler processes and join them."""
     from tensorrt_llm.llmapi._llmapi_process_guard import _cleanup_group
@@ -210,6 +252,6 @@ def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int 
         )
         return
     logger.info(
-        f"PrimTS sparse MLA precompiled {len(payloads)} kernel variants with {workers} workers "
+        f"PrimTS MLA precompiled {len(payloads)} kernel variants with {workers} workers "
         f"in {time.perf_counter() - start:.1f} s"
     )

@@ -436,6 +436,14 @@ rename. Every cubin read from the shared directory is checked against its
 SHA-256. Headers and other compiler inputs are never shared. Set
 `TRTLLM_FLASHINFER_SHARED_CUBINS=0` to keep these cubins per-rank as well.
 
+PrimTS CuTe DSL kernels have no compiler inputs on disk either: each compiles
+in-process and is published as an object file with a `meta.json` marker, both
+by atomic rename and under file locks. Ranks with persistent slots therefore
+keep them in one `cute_dsl` directory next to the slots. During decoder warmup,
+tensor- and context-parallel peers that share this directory split the dense
+MLA decode kernels they are missing, so each kernel compiles once per host.
+Set `TRTLLM_FLASHINFER_SHARED_CUTE_DSL=0` to keep these kernels per-rank.
+
 Persistent slots are not pruned automatically, so their count can grow with
 peak job concurrency. When no TensorRT-LLM processes are using the cache, the
 slots may be deleted safely; subsequent launches rebuild the removed JIT

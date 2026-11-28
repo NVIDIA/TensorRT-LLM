@@ -113,6 +113,39 @@ def test_resolve_shared_dir_is_off_outside_managed_rank_slots(env: dict) -> None
     assert pool.resolve_shared_cubin_dir(env) is None
 
 
+def test_prims_ts_cute_dsl_cache_sits_beside_rank_slots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from flashinfer.jit import cute_dsl_core
+
+    from tensorrt_llm._torch.attention.backends import _cute_dsl_compat as compat
+
+    relative = Path(".cache/flashinfer/0.7.3/100a/cached_ops")
+    workspace = tmp_path / "rank-3"
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", workspace / relative)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")  # no device query
+    monkeypatch.setenv("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", "1")
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(workspace))
+    monkeypatch.delenv("TRTLLM_FLASHINFER_SHARED_CUTE_DSL", raising=False)
+    shared = tmp_path / "cute_dsl" / relative
+    assert compat.shared_jit_dir() == compat.cache_dir() == shared
+    spec = compat.JitSpecCuteDsl("prims_ts_mla_decode", "kernel", lambda: None, "sha")
+    assert spec.meta_path.parent == spec.module_dir == shared / spec.module_dir_name
+    assert spec.object_path == spec.module_dir / "kernel.o"
+    assert spec.lock_path.parent == spec.module_lock_path.parent == shared / "tmp"
+
+    for name, value in (
+        ("TRTLLM_FLASHINFER_SHARED_CUTE_DSL", "0"),
+        ("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", "0"),
+        ("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "trtllm-flashinfer-rank-0.abcd1234")),
+    ):
+        with monkeypatch.context() as patched:
+            patched.setenv(name, value)
+            assert compat.shared_jit_dir() is None
+            spec = compat.JitSpecCuteDsl("prims_ts_mla_decode", "kernel", lambda: None, "sha")
+            assert spec.module_dir.parent == workspace / relative
+
+
 def test_cubin_downloaded_once_is_reused_by_peer_ranks(ranks) -> None:
     root, downloads, (r0, r1, r2, _) = ranks
     data = _CUBIN.encode()
