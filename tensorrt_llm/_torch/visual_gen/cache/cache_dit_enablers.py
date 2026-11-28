@@ -42,6 +42,8 @@ class CacheDiTEnableResult:
     refresh: Callable[..., None]
     disable: Callable[[], None]
     summary_modules: List[nn.Module]
+    # Set to opt into the cache-aware startup warmup: default steps -> warmup steps.
+    min_warmup_steps: Optional[Callable[[int], int]] = None
 
 
 def _has_compiled_blocks(*block_lists: Any) -> bool:
@@ -308,10 +310,16 @@ def enable_cache_dit_for_flux(
             False,
         )
 
+    def min_warmup_steps(default_steps: int) -> int:
+        # Warmup steps plus two forced cached steps (after a full and after a cached step).
+        return max(default_steps, cache_dit_cfg.max_warmup_steps + 2)
+
     return CacheDiTEnableResult(
         refresh=refresh_flux,
         disable=lambda: cache_dit.disable_cache(_cached),
         summary_modules=[pipeline.transformer],
+        # Cache-aware startup warmup is validated on FLUX.1 only.
+        min_warmup_steps=None if is_flux2 else min_warmup_steps,
     )
 
 
