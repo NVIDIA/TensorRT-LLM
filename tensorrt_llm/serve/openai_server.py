@@ -2576,11 +2576,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 # ``_build_forced_tool_call_decoding``) while the media loads,
                 # or once it has loaded for a renderer that needs it.
                 # Tokenization stays with the engine's input processor, except
-                # that a tokenizer-native renderer's own ids are taken: it
-                # keeps control-token strings in message content as text, and
-                # encoding its rendered string would not. Only for text-only
-                # prompts, since the input processor expands media placeholders
-                # in the text.
+                # for a prompt that comes back as ids: a tokenizer-native
+                # renderer's own ids, which keep control-token strings in
+                # message content as text (only for text-only prompts, since
+                # the input processor expands media placeholders in the text),
+                # or a prompt whose control-token text in the messages was
+                # encoded as text. The engine adds no special tokens to ids and
+                # does not truncate them: native ids are taken only when neither
+                # is asked for, and the renderer applies both to the others.
                 rendered, (
                     mm_data,
                     mm_embeddings) = await render_conversation_with_media(
@@ -2602,9 +2605,12 @@ class OpenAIServer(_VideoRoutesMixin):
                         truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
                 if rendered.text is None:
-                    if forced_tool_begin_prefix is not None:
+                    if (forced_tool_begin_prefix is not None
+                            and not rendered.prefix_applied):
                         # The prefix is text; appending it to rendered token
                         # ids would need a re-encode that loses control tokens.
+                        # Ids that encode control-token text as text carry
+                        # the prefix already (``prefix_applied``).
                         raise ValueError(
                             "tool_choice with a named function is not "
                             "supported for this model, whose chat template "
@@ -2612,10 +2618,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     prompt = rendered.token_ids
                 else:
                     prompt = rendered.text
-                    # Captured before the forced-tool prefix is appended:
-                    # resolve_prefilled_thinking() inspects what the chat
-                    # template rendered, and the prefix is not part of it.
-                    rendered_prompt = rendered.template_text
+                # Captured before the forced-tool prefix is appended:
+                # resolve_prefilled_thinking() inspects what the chat
+                # template rendered, and the prefix is not part of it.
+                rendered_prompt = rendered.template_text
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:

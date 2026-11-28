@@ -62,6 +62,9 @@ class RenderResources:
     tool_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
     custom_tokenizer: Optional[str] = None
+    # Encode control-token spellings in messages, tools and documents as text (see
+    # :mod:`.control_tokens`). False leaves them to become control tokens.
+    control_tokens_as_text: bool = True
 
     def fingerprint(self) -> dict:
         """Rendering-configuration fingerprint (see :mod:`.fingerprint`)."""
