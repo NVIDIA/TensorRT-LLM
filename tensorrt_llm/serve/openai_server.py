@@ -3497,6 +3497,10 @@ class OpenAIServer(_VideoRoutesMixin):
             except Exception:
                 logger.error(traceback.format_exc())
                 raise
+            finally:
+                # A client that disconnects closes this generator before the
+                # final result is post-processed.
+                get_harmony_adapter().cleanup_stream_state(str(promise.id))
 
         input_started = _start_input_processing()
         try:
@@ -3610,9 +3614,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
-                                         media_type="text/event-stream")
+                return ClosingStreamingResponse(
+                    content=create_streaming_generator(promise,
+                                                       postproc_params),
+                    media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
@@ -3701,25 +3706,30 @@ class OpenAIServer(_VideoRoutesMixin):
             for initial_response in initial_responses:
                 yield initial_response
 
-            # The promise yields itself as each result, so a promise that is
-            # already finished is its own first and last result and the
-            # stream ends with that result's terminal event.
-            first_response = await anext(promise, promise)
-            raw_request.state.server_first_token_time = (
-                self._adjusted_steady_clock.now())
-            pp_results = first_response.outputs[
-                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                    first_response, args)
-            for pp_res in pp_results:
-                yield pp_res
-            # The loop below binds nothing when there is only one result.
-            res = first_response
-            async for res in promise:
-                pp_results = res.outputs[
+            try:
+                # The promise yields itself as each result, so a promise that is
+                # already finished is its own first and last result and the
+                # stream ends with that result's terminal event.
+                first_response = await anext(promise, promise)
+                raw_request.state.server_first_token_time = (
+                    self._adjusted_steady_clock.now())
+                pp_results = first_response.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        res, args)
+                        first_response, args)
                 for pp_res in pp_results:
                     yield pp_res
+                # The loop below binds nothing when there is only one result.
+                res = first_response
+                async for res in promise:
+                    pp_results = res.outputs[
+                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                            res, args)
+                    for pp_res in pp_results:
+                        yield pp_res
+            finally:
+                # A client that disconnects closes this generator before the
+                # final result is post-processed.
+                streaming_processor.cleanup_stream_state()
             await self._extract_metrics(res, raw_request)
 
         input_started = _start_input_processing()
