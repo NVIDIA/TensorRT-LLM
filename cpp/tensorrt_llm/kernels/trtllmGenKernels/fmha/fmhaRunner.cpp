@@ -32,15 +32,11 @@ namespace kernels
 TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
     int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
     bool fusesDsv4InvRopeFp8Quant)
-    : mSM(tensorrt_llm::common::getSMVersion())
-    , mDtypeQ(dtypeQ)
+    : mDtypeQ(dtypeQ)
     , mDtypeK(dtypeK)
     , mDtypeV(dtypeV)
     , mDtypeOut(dtypeOut)
-    , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
-    , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
-    , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
-    , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
+    , mSM(tensorrt_llm::common::getSMVersion())
     , mFusesDsv4InvRopeFp8Quant(fusesDsv4InvRopeFp8Quant)
 {
     TLLM_CHECK_WITH_INFO(tensorrt_llm::common::isSM100Family(mSM), "Unsupported architecture");

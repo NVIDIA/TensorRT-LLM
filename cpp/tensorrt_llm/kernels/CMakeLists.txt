@@ -15,6 +15,18 @@
 # the License.
 #
 
+# Warnings for the host (C++) sources of the kernel libraries; matches the other
+# tensorrt_llm subdirectories. CUDA sources are not affected.
+if(NOT WIN32)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  if(WARNING_IS_ERROR)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
+else() # Windows
+  # warning level 4
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
+endif()
+
 add_subdirectory(cutlass_kernels)
 add_subdirectory(moe)
 add_subdirectory(flashMLA)

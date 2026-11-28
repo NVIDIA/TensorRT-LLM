@@ -106,7 +106,7 @@ bool is_valid_split_k_factor(int64_t const m, int64_t const n, int64_t const k, 
     int const ctas_in_n_dim = (n + tile_shape.n - 1) / tile_shape.n;
     int const required_ws_bytes = split_k_factor == 1 ? 0 : sizeof(int) * ctas_in_m_dim * ctas_in_n_dim;
 
-    if (required_ws_bytes > workspace_bytes)
+    if (static_cast<size_t>(required_ws_bytes) > workspace_bytes)
     {
         return false;
     }
@@ -737,7 +737,7 @@ CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmC
     int current_m_tile = 0;
 
     int const max_split_k = n >= multi_processor_count * 256 ? 1 : split_k_limit;
-    for (int ii = 0; ii < candidate_configs.size(); ++ii)
+    for (size_t ii = 0; ii < candidate_configs.size(); ++ii)
     {
         CutlassGemmConfig candidate_config = candidate_configs[ii];
         TileShape tile_shape = get_cta_shape_for_config(candidate_config.tile_config_sm80);

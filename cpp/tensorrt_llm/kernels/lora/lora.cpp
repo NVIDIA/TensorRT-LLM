@@ -69,13 +69,13 @@ void _runGemm(int const M, int const N, int const K, bool const transA, bool con
 LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool transA, bool transB,
     int num_lora_modules, tensorrt_llm::DataType type, int max_low_rank,
     std::shared_ptr<CublasGemmWrapper> cublasWrapper)
-    : mInHiddenSize(in_hidden_size)
-    , mTransA(transA)
+    : mTransA(transA)
     , mTransB(transB)
-    , mNumLoraModules(num_lora_modules)
     , mType(type)
-    , mMaxLowRank(max_low_rank)
+    , mNumLoraModules(num_lora_modules)
     , mCublasWrapper(std::move(cublasWrapper))
+    , mInHiddenSize(in_hidden_size)
+    , mMaxLowRank(max_low_rank)
 {
     mOutHiddenSizes.resize(mNumLoraModules);
     mOutHiddenSizes.assign(out_hidden_sizes.begin(), out_hidden_sizes.end());

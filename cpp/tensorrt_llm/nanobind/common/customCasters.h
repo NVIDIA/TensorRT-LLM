@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -184,7 +184,7 @@ public:
         if (THPVariable_Check(obj))
         {
             at::Tensor const& t = THPVariable_Unpack(obj);
-            value = std::move(tensorrt_llm::runtime::TorchView::of(t));
+            value = tensorrt_llm::runtime::TorchView::of(t);
             return true;
         }
         return false;
@@ -215,7 +215,7 @@ public:
         if (THPVariable_Check(obj))
         {
             at::Tensor const& t = THPVariable_Unpack(obj);
-            value = std::move(tensorrt_llm::runtime::TorchView::of(t));
+            value = tensorrt_llm::runtime::TorchView::of(t);
             return true;
         }
         return false;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -102,7 +102,6 @@ LayoutDetails getLayoutDetailsForArchAndQuantType()
 template <typename cutlassArch>
 LayoutDetails getLayoutDetailsForArch(QuantType quant_type)
 {
-    int const bits_per_weight_element = get_weight_quant_bits(quant_type);
     LayoutDetails details;
     switch (quant_type)
     {
@@ -203,8 +202,6 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t con
 
     int const BITS_PER_ELT = get_weight_quant_bits(quant_type);
     int const K = 16 / BITS_PER_ELT;
-    int const ELTS_PER_BYTE = 8 / BITS_PER_ELT;
-    int const ELTS_PER_REG = 32 / BITS_PER_ELT;
 
     uint32_t const* input_byte_ptr = reinterpret_cast<uint32_t const*>(quantized_tensor);
     uint32_t* output_byte_ptr = reinterpret_cast<uint32_t*>(permuted_quantized_tensor);
@@ -224,10 +221,10 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t con
 
     TLLM_CHECK_WITH_INFO(size_t(B_ROWS_PER_MMA) == row_permutation.size(), "Unexpected number of LDSM rows permuted.");
 
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (size_t expert = 0; expert < num_experts; ++expert)
     {
         const int64_t matrix_offset = expert * int64_t(num_rows) * int64_t(num_vec_cols);
-        for (int base_row = 0; base_row < num_rows; base_row += B_ROWS_PER_MMA)
+        for (size_t base_row = 0; base_row < num_rows; base_row += B_ROWS_PER_MMA)
         {
             for (int tile_row = 0; tile_row < B_ROWS_PER_MMA; ++tile_row)
             {
@@ -267,7 +264,6 @@ void subbyte_transpose_impl(
 
     const size_t col_bytes = num_cols * bits_per_elt / 8;
     const size_t col_bytes_trans = num_rows * bits_per_elt / 8;
-    const size_t num_bytes = size_t(num_experts) * num_rows * col_bytes;
 
     uint8_t const* input_byte_ptr = reinterpret_cast<uint8_t const*>(quantized_tensor);
     uint8_t* output_byte_ptr = reinterpret_cast<uint8_t*>(transposed_quantized_tensor);
@@ -287,9 +283,6 @@ void subbyte_transpose_impl(
         fmtstr("Number of bytes for rows and cols must be a multiple of %d. However, num_rows_bytes = %ld and "
                "num_col_bytes = %ld.",
             VECTOR_WIDTH, col_bytes_trans, col_bytes));
-
-    int const num_m_tiles = (num_rows + M_TILE_L1 - 1) / M_TILE_L1;
-    int const num_n_tiles = (col_bytes + N_TILE_L1 - 1) / N_TILE_L1;
 
     for (size_t expert = 0; expert < num_experts; ++expert)
     {
@@ -417,7 +410,7 @@ void subbyte_transpose(int8_t* transposed_quantized_tensor, int8_t const* quanti
 
 void add_bias_and_interleave_int8s_inplace(int8_t* int8_tensor, const size_t num_elts)
 {
-    for (int ii = 0; ii < num_elts; ++ii)
+    for (size_t ii = 0; ii < num_elts; ++ii)
     {
         int8_tensor[ii] = int8_t(int(int8_tensor[ii]) + 128);
     }
@@ -441,7 +434,7 @@ void add_bias_and_interleave_int8s_inplace(int8_t* int8_tensor, const size_t num
 
 void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const size_t num_elts)
 {
-    int const num_bytes = num_elts / 2;
+    size_t const num_bytes = num_elts / 2;
 
     // Step 1 will be to transform all the int4s to unsigned in order to make the dequantize take as little
     // instructions as possible in the CUDA code.
@@ -543,10 +536,10 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, int8_t
     int const vec_rows_per_tile = rows_per_tile / elts_in_int32;
     int const interleave = details.columns_interleaved;
 
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (size_t expert = 0; expert < num_experts; ++expert)
     {
         const int64_t matrix_offset = expert * int64_t(num_vec_rows) * int64_t(num_cols);
-        for (int read_col = 0; read_col < num_cols; ++read_col)
+        for (size_t read_col = 0; read_col < num_cols; ++read_col)
         {
             const int64_t write_col = read_col / interleave;
             for (int base_vec_row = 0; base_vec_row < num_vec_rows; base_vec_row += vec_rows_per_tile)
@@ -696,21 +689,21 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
 
     std::vector<float> per_col_max(num_cols);
 
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (size_t expert = 0; expert < num_experts; ++expert)
     {
         WeightType const* current_weight = input_weight_ptr + expert * input_mat_size;
         int8_t* current_quantized_weight = unprocessed_quantized_weight + expert * quantized_mat_size;
 
         // First we find the per column max for this expert weight.
-        for (int jj = 0; jj < num_cols; ++jj)
+        for (size_t jj = 0; jj < num_cols; ++jj)
         {
             per_col_max[jj] = 0.f;
         }
 
-        for (int ii = 0; ii < num_rows; ++ii)
+        for (size_t ii = 0; ii < num_rows; ++ii)
         {
             WeightType const* current_weight_row = current_weight + ii * num_cols;
-            for (int jj = 0; jj < num_cols; ++jj)
+            for (size_t jj = 0; jj < num_cols; ++jj)
             {
                 per_col_max[jj] = std::max(per_col_max[jj], std::abs(float(current_weight_row[jj])));
             }
@@ -718,14 +711,14 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
 
         // Then, we construct the scales
         ComputeType* current_scales = scale_ptr + expert * num_cols;
-        for (int jj = 0; jj < num_cols; ++jj)
+        for (size_t jj = 0; jj < num_cols; ++jj)
         {
             per_col_max[jj] *= quant_range_scale;
             current_scales[jj] = ComputeType(per_col_max[jj]);
         }
 
         // Finally, construct the weights.
-        for (int ii = 0; ii < num_rows; ++ii)
+        for (size_t ii = 0; ii < num_rows; ++ii)
         {
             int8_t* current_quantized_weight_row = current_quantized_weight + ii * bytes_per_out_col;
             WeightType const* current_weight_row = current_weight + ii * num_cols;
@@ -748,7 +741,7 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
                     for (int packed_idx = 0; packed_idx < 2; ++packed_idx)
                     {
                         int const input_idx = 2 * jj + packed_idx;
-                        if (input_idx < num_cols)
+                        if (static_cast<size_t>(input_idx) < num_cols)
                         {
                             float const col_scale = per_col_max[input_idx];
                             float const weight_elt = float(current_weight_row[input_idx]);

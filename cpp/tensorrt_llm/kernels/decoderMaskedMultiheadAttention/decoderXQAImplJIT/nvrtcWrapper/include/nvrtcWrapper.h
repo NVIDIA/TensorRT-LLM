@@ -40,7 +40,7 @@ extern "C"
         TLLM_XQA_JIT_ROPE_GPTJ = 2
     } tllmXqaJitRopeStyle;
 
-    typedef struct
+    typedef struct tllmXqaJitContext
     {
         // Compute capability, e.g. 89.
         int sm;

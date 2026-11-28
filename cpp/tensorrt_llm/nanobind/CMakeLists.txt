@@ -54,6 +54,18 @@ target_include_directories(${TRTLLM_NB_MODULE}
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
+# Warnings for the binding sources only. Set them on the module target rather
+# than in CMAKE_CXX_FLAGS so they do not reach the nanobind library itself,
+# which nanobind_add_module builds in this directory.
+if(NOT WIN32)
+  target_compile_options(${TRTLLM_NB_MODULE} PRIVATE -Wall)
+  if(WARNING_IS_ERROR)
+    target_compile_options(${TRTLLM_NB_MODULE} PRIVATE -Werror)
+  endif()
+else() # Windows
+  target_compile_options(${TRTLLM_NB_MODULE} PRIVATE /W4)
+endif()
+
 target_link_directories(${TRTLLM_NB_MODULE} PUBLIC
                         "${TORCH_INSTALL_PREFIX}/lib")
 

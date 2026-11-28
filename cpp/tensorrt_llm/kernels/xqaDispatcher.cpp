@@ -55,7 +55,7 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     float const* rotary_inv_freq_buf, int multiProcessorCount)
 {
     QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms;
-    memset(&preprocessingParms, 0, sizeof(preprocessingParms));
+    memset(static_cast<void*>(&preprocessingParms), 0, sizeof(preprocessingParms));
     // Set parameters.
     preprocessingParms.qkv_input = static_cast<T*>(const_cast<void*>(params.qkv));
     preprocessingParms.q_output = static_cast<T*>(xqa_q_input_ptr);
@@ -277,7 +277,7 @@ bool XqaDispatcher::isSupported()
 
         // Create TllmGenFmhaRunnerParams.
         TllmGenFmhaRunnerParams tllmRunnerParams;
-        memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        memset(static_cast<void*>(&tllmRunnerParams), 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
         tllmRunnerParams.mMaskType
             = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
@@ -406,7 +406,7 @@ void XqaDispatcher::runImpl(
 
         // Build runner parameters.
         TllmGenFmhaRunnerParams tllmRunnerParams;
-        memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        memset(static_cast<void*>(&tllmRunnerParams), 0, sizeof(tllmRunnerParams));
 
         // Parameters to select kernels.
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;

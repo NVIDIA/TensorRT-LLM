@@ -33,16 +33,16 @@ namespace tensorrt_llm::nanobind::runtime
 void pyDoReplication(tk::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<float>& expertLoadFactor,
     tr::MoePlacementCpuInfo* cpuPlacement)
 {
-    TLLM_CHECK_WITH_INFO(
-        metaInfo.expertCount == expertLoadFactor.size(), "expert_count and expert_load_factor size mismatch");
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(metaInfo.expertCount) == expertLoadFactor.size(),
+        "expert_count and expert_load_factor size mismatch");
     tr::doReplication(metaInfo, expertLoadFactor.data(), cpuPlacement);
 };
 
 void pyDoPlacement(tk::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<float>& expertLoadFactor,
     tr::MoePlacementCpuInfo* cpuPlacement)
 {
-    TLLM_CHECK_WITH_INFO(
-        metaInfo.expertCount == expertLoadFactor.size(), "expert_count and expert_load_factor size mismatch");
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(metaInfo.expertCount) == expertLoadFactor.size(),
+        "expert_count and expert_load_factor size mismatch");
     tr::doPlacement(metaInfo, expertLoadFactor.data(), cpuPlacement);
 };
 

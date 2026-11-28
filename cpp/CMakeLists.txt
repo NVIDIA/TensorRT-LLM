@@ -57,7 +57,7 @@ set(TRTLLM_MODELING_V2_TARGETS
 )
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
-option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
+option(WARNING_IS_ERROR "Treat all warnings as errors" ON)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)

@@ -84,10 +84,6 @@ private:
     static constexpr int kMaxBeamWidth = 4;
 
     XQADataType mDataType;
-    int mNumHeads;
-    int mNumKVHeads;
-    int mHeadSize;
-    bool mMultiBlockMode;
     int mMultiProcessorCount;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     std::shared_ptr<DecoderXQARunnerResource> mResource;
