@@ -240,11 +240,14 @@ class _Checkpoint(dict):
         # Without a key list every key exists, so a test can read a few of a
         # full-size model's tensors without enumerating the rest.
         self.cfg, self.reads, self.open = cfg, [], keys is None
+        self.released: set = set()
 
     def __contains__(self, key):
-        return self.open or dict.__contains__(self, key)
+        return key not in self.released and (self.open or dict.__contains__(self, key))
 
     def __getitem__(self, key):
+        if key in self.released:
+            raise KeyError(f"{key} was read after mark_consumed_keys released it")
         entry = dict.get(self, key)
         if entry is None:
             full = _full(key, self.cfg)
@@ -254,6 +257,16 @@ class _Checkpoint(dict):
 
     def full(self, key) -> torch.Tensor:
         return _full(key, self.cfg)
+
+    def mark_consumed_keys(self, keys) -> int:
+        """The engine dict's release: the keys are gone, and a later read of one raises."""
+        deleted = 0
+        for key in keys:
+            self.released.add(key)
+            if dict.__contains__(self, key):
+                dict.pop(self, key)
+                deleted += 1
+        return deleted
 
 
 def _read_first(core, ckpt, param_key):
@@ -702,6 +715,8 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        # Every key has left the dict: unread ones at the start, read ones after their last read.
+        assert not set(ckpt.keys()), sorted(ckpt.keys())[:4]
 
         seen = [k for k, _, _ in ckpt.reads]
         assert len(seen) == len(set(seen)), "a checkpoint key was read twice"
