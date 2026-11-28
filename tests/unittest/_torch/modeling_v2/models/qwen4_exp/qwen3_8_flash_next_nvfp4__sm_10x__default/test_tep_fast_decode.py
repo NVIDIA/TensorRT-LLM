@@ -286,3 +286,35 @@ def test_draft_gate_view_through_the_dispatch():
     )
     flat = torch.as_strided(gate, (rows, _HQ, _D), (2 * _HQ * _D, _D, 1))
     assert not torch.equal(out, op.reference(**dict(args, output_gate=flat)))
+
+
+@_GPU
+def test_splitk_shard_plans_follow_the_largest_reach(monkeypatch):
+    """The tep4 shard is not in the op's row table, so a call's `max_rows` sets how far its first
+    call plans. A 4-row call without it plans 4 rows; the same call with `max_rows=16` then
+    compiles the plans past them (a form already planned is not settled for good); a 16-row call
+    and a smaller reach compile nothing more."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
+        qsa_sparse_gqa_splitk_cute__decode as splitk,
+    )
+
+    monkeypatch.setattr(splitk, "_COMPILED", {})
+    monkeypatch.setattr(splitk, "_PLANNED", {})
+    op = M.qsa_sparse_gqa_splitk_cute
+    args = _tep4_call(16, 3002, torch.device("cuda"))
+    sliced = ("q", "selected_tokens", "request_indices", "output_gate")
+
+    def call(rows, **kw):
+        op(**{n: (v[:rows] if n in sliced else v) for n, v in args.items()}, **kw)
+        torch.cuda.synchronize()
+        return set(splitk._COMPILED)
+
+    at_4 = call(4)
+    width, elem = args["selected_tokens"].shape[1], 1
+    assert splitk.reachable_plans(16, _HKV, width, elem) != splitk.reachable_plans(
+        4, _HKV, width, elem
+    ), "the reach must add plans for this test to show anything"
+    at_16 = call(4, max_rows=16)
+    assert at_16 > at_4
+    assert call(16) == at_16
+    assert call(4, max_rows=8) == at_16
