@@ -20,6 +20,9 @@
 
 #include "tensorrt_llm/common/logger.h"
 
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -225,6 +228,60 @@ size_t busyStreamSkip() noexcept
 void setBusyStreamSkipForTesting(size_t maxBusy) noexcept
 {
     gBusyStreamSkip.store(maxBusy, std::memory_order_relaxed);
+}
+
+namespace
+{
+
+std::mutex gCopyStreamConfigMutex;
+size_t gDeepPageStagingManagers = 0; // guarded by gCopyStreamConfigMutex
+
+} // namespace
+
+DeepPageStagingHold configureCopyStreams(size_t busySkip, size_t pageStagingDepth)
+{
+    std::lock_guard<std::mutex> lock(gCopyStreamConfigMutex);
+    if (pageStagingDepth > 1)
+    {
+        size_t const effective = gBusyStreamSkip.load(std::memory_order_relaxed);
+        if (busySkip > 0 || effective > 0)
+        {
+            throw std::invalid_argument("KVCacheManagerV2: pageStagingDepth " + std::to_string(pageStagingDepth)
+                + " cannot be combined with busy-stream skipping, which is process-wide ("
+                + (busySkip > 0 ? "copyStreamBusySkip " + std::to_string(busySkip) + " of this manager"
+                                : "copyStreamBusySkip " + std::to_string(effective) + " set in this process")
+                + ")");
+        }
+    }
+    else if (busySkip > 0 && gDeepPageStagingManagers > 0)
+    {
+        throw std::invalid_argument("KVCacheManagerV2: copyStreamBusySkip " + std::to_string(busySkip)
+            + " cannot be set while " + std::to_string(gDeepPageStagingManagers)
+            + " manager(s) with pageStagingDepth > 1 live in this process: busy-stream skipping is process-wide");
+    }
+    configureBusyStreamSkip(busySkip);
+    DeepPageStagingHold hold;
+    if (pageStagingDepth > 1)
+    {
+        ++gDeepPageStagingManagers;
+        hold.mActive = true;
+    }
+    return hold;
+}
+
+void DeepPageStagingHold::release() noexcept
+{
+    if (std::exchange(mActive, false))
+    {
+        std::lock_guard<std::mutex> lock(gCopyStreamConfigMutex);
+        --gDeepPageStagingManagers;
+    }
+}
+
+size_t deepPageStagingManagersForTesting() noexcept
+{
+    std::lock_guard<std::mutex> lock(gCopyStreamConfigMutex);
+    return gDeepPageStagingManagers;
 }
 
 uint64_t busyStreamsSkippedForTesting() noexcept

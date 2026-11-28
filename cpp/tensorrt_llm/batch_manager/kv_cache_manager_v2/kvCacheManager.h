@@ -663,6 +663,10 @@ private:
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
 
+    //! Registers a pageStagingDepth above 1 against busy-stream skipping (configureCopyStreams) while this manager
+    //! lives; released by shutdown() and the destructor.
+    DeepPageStagingHold mDeepPageStagingHold;
+
     //! See cudaContext(). Never null: construction rejects a thread without a current context.
     CUcontext mCudaContext = nullptr;
 

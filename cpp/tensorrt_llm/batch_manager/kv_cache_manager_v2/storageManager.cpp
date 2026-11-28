@@ -1309,15 +1309,29 @@ void StorageManager::submitStagedDiskMigration(bool srcIsHot, LayerGroupId batch
     auto join = FuncGuard(
         [&]()
         {
-            std::vector<CUevent> laneEnds;
-            std::vector<CachedCudaEvent> laneEvents;
-            laneEvents.reserve(laneStreams.size());
-            for (auto const& lane : laneStreams)
+            try
             {
-                laneEvents.emplace_back(reinterpret_cast<CudaStream>(lane->get()));
-                laneEnds.push_back(laneEvents.back().handle());
+                std::vector<CUevent> laneEnds;
+                std::vector<CachedCudaEvent> laneEvents;
+                laneEvents.reserve(laneStreams.size());
+                for (auto const& lane : laneStreams)
+                {
+                    laneEvents.emplace_back(reinterpret_cast<CudaStream>(lane->get()));
+                    laneEnds.push_back(laneEvents.back().handle());
+                }
+                streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(laneEnds));
             }
-            streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(laneEnds));
+            catch (...)
+            {
+                // `stream` may not wait for every lane, yet the caller publishes readiness from it (also while
+                // unwinding): finish the lanes' work on the host first, so that whatever it publishes covers their
+                // writes. A lane that cannot be synchronized leaves the error to propagate (and poison).
+                for (auto const& lane : laneStreams)
+                {
+                    cuCheck(cuStreamSynchronize(lane->get()));
+                }
+                throw;
+            }
         });
     for (size_t lane = 0; lane < lanes; ++lane)
     {
@@ -1328,6 +1342,7 @@ void StorageManager::submitStagedDiskMigration(bool srcIsHot, LayerGroupId batch
     {
         offset += stageChunk(offset, std::min(lanePages, numPages - offset), laneStreams[chunk % lanes]->get());
         ++mPageStagingLaneChunks;
+        mPageStagingLaneReadChunks += srcIsHot ? 0 : 1;
     }
     join.run();
     trimRetainedPageIndices(stagingPageIndices);
@@ -1579,7 +1594,8 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 
 StorageManager::PageStagingInfo StorageManager::pageStagingInfo() const noexcept
 {
-    return {mPageStagingManager ? mPageStagingManager->totalSize() : 0, mPageStagingDepth, mPageStagingLaneChunks};
+    return {mPageStagingManager ? mPageStagingManager->totalSize() : 0, mPageStagingDepth, mPageStagingLaneChunks,
+        mPageStagingLaneReadChunks};
 }
 
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
@@ -2099,9 +2115,30 @@ void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex
         goals.at(level).at(pgIdx) = requirements.at(pgIdx);
     }
 
-    PagesByLifeCycle fallenPages(numLifeCycles());
-    std::vector<SharedPtr<Page>> keepAlive;
-    _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder, localityDomainId);
+    auto const attempt = [&]()
+    {
+        PagesByLifeCycle fallenPages(numLifeCycles());
+        std::vector<SharedPtr<Page>> keepAlive;
+        _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder, localityDomainId);
+    };
+    mFreeReserveApplied = false;
+    try
+    {
+        attempt();
+    }
+    catch (OutOfPagesError const&)
+    {
+        // The free-slot reserve is best effort: its extra evictions may need room the tiers below do not have (held
+        // pages falling to a full last level). The rollback guards have put every evicted page back, so try again
+        // for exactly what was asked.
+        if (!mFreeReserveApplied || mFreeReserveSuppressed != 0)
+        {
+            throw;
+        }
+        ++mFreeReserveSuppressed;
+        auto restore = FuncGuard([this]() noexcept { --mFreeReserveSuppressed; });
+        attempt();
+    }
 }
 
 void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
@@ -2380,15 +2417,19 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         SlotCount const evictableCount = isFailed ? 0 : ctrl.numEvictablePages(pgIdx, domainFilter);
         SlotCount const required = goal + fallen;
         SlotCount shortage = required > oldFree ? required - oldFree : 0;
-        if (!isLast && !isFailed && lvlId != kHotLevel && mFreeReserveFractionAt.at(lvlId) > 0.0F)
+        if (!isLast && !isFailed && lvlId != kHotLevel && mFreeReserveSuppressed == 0
+            && mFreeReserveFractionAt.at(lvlId) > 0.0F)
         {
-            // Free-slot reserve of a middle tier: evict one reserve ahead of need, so incoming pages take slots whose
-            // write-out to the tier below has finished.
+            // Free-slot reserve of a middle tier: evict one reserve ahead of need, so incoming pages are more likely
+            // to take slots whose write-out to the tier below has finished. Best effort (see the 5-argument
+            // _prepareFreeSlots).
             auto const reserve = static_cast<SlotCount>(
                 static_cast<double>(storage.numSlots(pgIdx)) * static_cast<double>(mFreeReserveFractionAt.at(lvlId)));
             if (reserve > 0 && oldFree < required + reserve)
             {
-                shortage = required + reserve - oldFree;
+                SlotCount const withReserve = required + reserve - oldFree;
+                mFreeReserveApplied = mFreeReserveApplied || std::min(withReserve, evictableCount) > shortage;
+                shortage = withReserve;
             }
         }
         numToEvict.at(pgIdx) = std::min(shortage, evictableCount);
@@ -3233,8 +3274,14 @@ void StorageManager::shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
     // Ensure free slots for the overflow pages.
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
     reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
-    // The eviction order captured above must remain stable through defragmentation.
-    _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{}, domainFilter);
+    // The eviction order captured above must remain stable through defragmentation: take exactly the slots the
+    // overflow pages need, without the free-slot reserve, whose extra evictions could take one of those pages to
+    // the tier below while the defragmentation still moves it as a page of this level.
+    {
+        ++mFreeReserveSuppressed;
+        auto restore = FuncGuard([this]() noexcept { --mFreeReserveSuppressed; });
+        _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{}, domainFilter);
+    }
 
     // A17: all overflow pages must be at the expected cache level.
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),
