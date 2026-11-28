@@ -27,6 +27,8 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.deterministic_linear import (deterministic_linear,
+                                            use_deterministic_linear)
 from ..modules.embedding import Embedding
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -67,6 +69,10 @@ class Qwen3Gate(nn.Module):
         assert not apply_routing, "Qwen3Gate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Same K reduction order for every token count, as in Qwen3NextGate.
+        if (self.out_dtype == torch.bfloat16
+                and use_deterministic_linear(hidden_states, self.weight)):
+            return deterministic_linear(hidden_states, self.weight)
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits

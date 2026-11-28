@@ -72,6 +72,7 @@ from ..distributed import (
 from ..mmap_utils import pageout_file_backed_regions
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.deterministic_linear import deterministic_linear, use_deterministic_linear
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
@@ -1614,6 +1615,10 @@ class DeepseekV4Gate(nn.Module):
     ) -> Union[torch.Tensor, RouterLogitPartials]:
         """FP32 router logits; with ``partials`` (the caller's MoE routes only in a launch that sums
         them) mid-size token counts get K-chunk partials instead, without a split-K reduce launch."""
+        if use_deterministic_linear(hidden_states, self.weight):
+            # Same K reduction order for every token count, as in DeepseekV3Gate: whole logits,
+            # also where the caller would take partials.
+            return deterministic_linear(hidden_states, self.weight, output_dtype=torch.float32)
         if hidden_states.shape[0] == 0:
             # An empty attention-DP peer still joins expert communication, but
             # the router's cuBLAS fallback does not accept an empty GEMM.

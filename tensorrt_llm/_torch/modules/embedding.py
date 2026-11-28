@@ -20,6 +20,7 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import allgather
 from ..utils import is_torch_compiling
 from .context_logits import ContextLogitsWorkspace
+from .deterministic_linear import deterministic_linear, use_deterministic_linear
 from .fla.op import gdc_wait_with_memory_clobber
 from .linear import Linear, TensorParallelMode
 
@@ -31,6 +32,12 @@ def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
     None keeps the model dtype. An FP32 override stores the result directly
     in FP32 without first rounding it to the BF16/FP16 model dtype.
     """
+    if use_deterministic_linear(input, weight):
+        # Same K reduction order for every token count, as in
+        # UnquantizedLinearMethod.apply; the FP32 accumulator is stored
+        # directly when output_dtype is FP32.
+        return deterministic_linear(input, weight, output_dtype=output_dtype)
+
     out_features = weight.shape[0]
     output_shape = (*input.shape[:-1], out_features)
     input_2d = input.reshape(-1, input.shape[-1])

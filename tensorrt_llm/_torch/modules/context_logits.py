@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Iterator, Protocol
 
 import torch
 
+from .deterministic_linear import deterministic_linear, use_deterministic_linear
+
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
@@ -192,7 +194,12 @@ class ContextLogitsWorkspace:
         kwargs = {} if self.dtype == head.weight.dtype else {"out_dtype": self.dtype}
         succeeded = False
         try:
-            torch.mm(hidden, head.weight.t(), out=local, **kwargs)
+            if use_deterministic_linear(hidden, head.weight):
+                # Same K reduction order for every chunk size, as in the LM
+                # head's own GEMM.
+                deterministic_linear(hidden, head.weight, out=local)
+            else:
+                torch.mm(hidden, head.weight.t(), out=local, **kwargs)
             succeeded = True
         except torch.OutOfMemoryError:
             pass

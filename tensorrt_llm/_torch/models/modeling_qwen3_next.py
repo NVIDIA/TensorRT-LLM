@@ -54,6 +54,8 @@ from ..distributed.ops import MNNVLAllReduce
 from ..kernels.nvfp4_quant import can_use_nvfp4_quant, nvfp4_fp8_dual_quant
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.deterministic_linear import (deterministic_linear,
+                                            use_deterministic_linear)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.expert_l2_prefetch import ExpertL2Prefetch
 from ..modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
@@ -565,6 +567,11 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # An FP32 out_dtype stays with cublas_mm below.
+        if (self.out_dtype == torch.bfloat16
+                and use_deterministic_linear(hidden_states, self.weight)):
+            return deterministic_linear(hidden_states, self.weight)
+
         # The low-M kernels return the input dtype, so cublas_mm below still
         # owns any out_dtype promotion.
         if _should_apply_low_m_gemm(
