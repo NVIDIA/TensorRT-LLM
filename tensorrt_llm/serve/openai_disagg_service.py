@@ -56,6 +56,8 @@ from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    name_responses_reply,
+    rename_responses_reply,
     responses_done_generator,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
@@ -104,6 +106,90 @@ def _drop_ctx_handoff(response: UCompletionResponse) -> None:
         response.prompt_token_ids = None
         response.prompt_token_ids_b64 = None
         response.finish_reason = None
+
+
+def _name_responses_reply(request: UCompletionRequest, disagg_request_id: int) -> bool:
+    """Name the reply to a Responses request ``resp_<disagg_request_id>_<16 hex>``.
+
+    A worker answers a Responses request under the request's ``request_id``
+    (see ``name_responses_reply``). Each worker numbers its own engine requests,
+    so an engine request id can name different requests on different workers;
+    the disaggregated request id is unique across the deployment, and both
+    workers and this server record it with the request.
+
+    The name is given before any worker sees the request. The workers get it
+    only because assigning a field adds it to pydantic's ``model_fields_set``:
+    ``_encode_request_body`` forwards set fields only (``exclude_unset=True``),
+    and a worker names a reply whose ``request_id`` is unset after its own
+    engine request id.
+
+    A ``request_id`` the client set is kept, and other requests are left alone.
+
+    Returns:
+        Whether the reply was named here. Only such a reply is renamed when a
+        retried context request gets a new disaggregated request id.
+    """
+    return isinstance(request, ResponsesRequest) and name_responses_reply(
+        request, disagg_request_id
+    )
+
+
+class _PinnedDisaggIdHooks(ResponseHooks):
+    """Forward hooks to ``inner`` while keeping the request's correlation id pinned.
+
+    In generation-first mode, GEN runs under the initial disaggregated request
+    id (and names any Responses reply after it). If the concurrent CTX leg
+    retries with a new id, both the new id notification and any perf metrics
+    from that retried attempt are ignored so the surviving GEN reply and its
+    recorded metrics stay correlated under the initial id.
+    """
+
+    def __init__(self, inner: ResponseHooks, disagg_request_id: int) -> None:
+        self._inner = inner
+        self._disagg_request_id = disagg_request_id
+        self._id_shifted = False
+
+    def on_req_begin(self, request: UCompletionRequest):
+        return self._inner.on_req_begin(request)
+
+    def on_disagg_request_id(self, disagg_request_id: int):
+        if disagg_request_id != self._disagg_request_id:
+            self._id_shifted = True
+        return None
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        return self._inner.on_ctx_dispatch(request)
+
+    def on_perf_metrics(self, server: str, role: str, metrics: dict):
+        if self._id_shifted or metrics.get("request_id") not in (
+            None,
+            "",
+            str(self._disagg_request_id),
+        ):
+            return None
+        return self._inner.on_perf_metrics(server, role, metrics)
+
+    def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
+        return self._inner.on_ctx_resp(ctx_server, response)
+
+    def on_first_token(
+        self,
+        gen_server: str,
+        request: UCompletionRequest,
+        response: UCompletionResponse = None,
+    ):
+        return self._inner.on_first_token(gen_server, request, response)
+
+    def on_resp_done(
+        self,
+        gen_server: str,
+        request: UCompletionRequest,
+        response: UCompletionResponse = None,
+    ):
+        return self._inner.on_resp_done(gen_server, request, response)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
 
 
 class _SseErrorObserver:
@@ -325,6 +411,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        reply_named = _name_responses_reply(request, disagg_request_id)
         # reserve a gen_server if conditional disagg is needed
         gen_placement_started_at = time.monotonic()
         gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
@@ -364,10 +451,26 @@ class OpenAIDisaggregatedService(OpenAIService):
                     ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
                         0
                     ].disaggregated_params
-                    if ctx_response_disagg_params.disagg_request_id is not None:
-                        disagg_request_id = ctx_response_disagg_params.disagg_request_id
+                    effective_disagg_id = (
+                        ctx_response_disagg_params.disagg_request_id
+                        if ctx_response_disagg_params.disagg_request_id is not None
+                        else (
+                            ctx_req.disaggregated_params.disagg_request_id
+                            if ctx_req.disaggregated_params is not None
+                            else None
+                        )
+                    )
+                    if effective_disagg_id is not None:
+                        disagg_request_id = effective_disagg_id
                         if hooks:
                             hooks.on_disagg_request_id(disagg_request_id)
+                        if reply_named:
+                            # A retried context request has a new disaggregated
+                            # request id, which the perf metrics record from then
+                            # on. The reply follows it, so the generation worker
+                            # is sent the new name; without a retry the name stays
+                            # as it is.
+                            rename_responses_reply(request, disagg_request_id)
                     gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
                     if self._output_length_priority is not None:
                         # Before the generation placement, which orders by the priority it sets
@@ -437,6 +540,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                     gen_response = self._output_length_priority.track(gen_response, length_ticket)
                 return gen_response
             else:
+                if reply_named:
+                    # The context worker answered under the name it was sent,
+                    # which a retried context request leaves behind.
+                    ctx_response.id = request.request_id
                 if length_ticket is not None:
                     self._output_length_priority.track(ctx_response, length_ticket)
                 if gen_reservation_owned:
@@ -704,6 +811,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        _name_responses_reply(request, disagg_request_id)
         if need_ctx:
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
@@ -726,6 +834,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
             )
 
+        ctx_hooks = _PinnedDisaggIdHooks(hooks, disagg_request_id) if hooks is not None else None
         if request.stream:
             # For streaming gen_first requests, the gen client returns a lazy
             # async generator whose HTTP POST only fires when iterated. The ctx
@@ -766,7 +875,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 self._ctx_client.send_request(
                     ctx_req,
                     server=ctx_server,
-                    hooks=hooks,
+                    hooks=ctx_hooks,
                     req_id=disagg_request_id,
                 )
             )
@@ -827,7 +936,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         else:
             ctx_task = asyncio.create_task(
                 self._ctx_client.send_request(
-                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                    ctx_req, server=ctx_server, hooks=ctx_hooks, req_id=disagg_request_id
                 )
             )
             gen_task = asyncio.create_task(

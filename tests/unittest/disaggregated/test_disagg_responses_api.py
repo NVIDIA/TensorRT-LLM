@@ -327,6 +327,7 @@ def test_a_context_worker_with_postprocessing_workers_returns_the_prompt(monkeyp
         return None
 
     promise = SimpleNamespace(
+        request_id=1,
         outputs=[SimpleNamespace(_postprocess_result=postprocessed)],
         prompt_token_ids=[5, 6, 7],
         aresult=nothing,

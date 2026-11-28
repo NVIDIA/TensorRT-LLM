@@ -441,6 +441,23 @@ def test_the_failed_snapshot_says_failed_and_carries_no_content():
     assert response["id"] == processor.request.request_id
 
 
+def test_the_created_event_is_named_after_the_request_id():
+    """A worker opens its stream under the request_id it was sent, e.g. a disaggregated one."""
+    request_id = "resp_101_0123456789abcdef"
+    request = ResponsesRequest(model="test-model", input="hi", stream=True, request_id=request_id)
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+    )
+
+    created = processor.get_initial_responses()[0]
+
+    assert _event_type(created) == "response.created"
+    assert _event_data(created)["response"]["id"] == request_id
+
+
 @pytest.mark.asyncio
 async def test_a_relay_numbers_its_error_event_across_split_delimiters():
     frames = [
@@ -550,7 +567,7 @@ def _step(text, diff, done):
         disaggregated_params=None,
     )
     return SimpleNamespace(
-        outputs=[output], _done=done, prompt_token_ids=[1], cached_tokens=0, finished=done
+        id=1, outputs=[output], _done=done, prompt_token_ids=[1], cached_tokens=0, finished=done
     )
 
 
@@ -975,6 +992,7 @@ def _server_streaming(monkeypatch, steps, yielded_at=None):
         there is no step.
         """
 
+        id = request_id = 1
         prompt_token_ids = [1, 2, 3]
         cached_tokens = 0
 
@@ -1100,20 +1118,46 @@ async def test_the_first_token_time_is_taken_at_the_first_result(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_single_result_from_a_postprocessing_worker_is_streamed(monkeypatch):
     """With postprocessing workers the route streams the frames a worker made for the one result."""
+    from tensorrt_llm.serve.postprocess_handlers import (
+        ResponsesAPIPostprocArgs,
+        responses_api_streaming_post_processor,
+    )
+
     request = ResponsesRequest(model="test-model", input="hi", stream=True)
-    # The worker serves the route's own request.
-    worker = _processor(request)
+    # The worker serves a copy of the route's request and names it from the executor id.
+    worker_request = request.model_copy()
+    worker = _processor(worker_request)
     result = _step("Hello", "Hello", done=True)
-    frames = worker.process_single_output(result) + [worker.get_final_response_non_store(result)]
+    frames = responses_api_streaming_post_processor(
+        result,
+        ResponsesAPIPostprocArgs(
+            model="test-model",
+            request=worker_request,
+            sampling_params=worker_request.to_sampling_params(),
+            use_harmony=False,
+            streaming_processor=worker,
+        ),
+    )
     first = SimpleNamespace(outputs=[SimpleNamespace(_postprocess_result=frames)])
 
-    async def generation():
-        # Only the frames the worker made: the server must not post-process the result itself.
-        yield first
+    class Generation:
+        request_id = result.id
+
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return first
 
     server = _server_streaming(monkeypatch, steps=[])
     server.generator.args.num_postprocess_workers = 1
-    server.generator.generate_async = lambda **kwargs: generation()
+    server.generator.generate_async = lambda **kwargs: Generation()
     raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
 
     response = await server.openai_responses(request, raw_request)
