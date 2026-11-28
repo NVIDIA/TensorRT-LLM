@@ -71,6 +71,17 @@ macro(remove_compile_definition TARGET_NAME DEFINITION)
 endmacro()
 
 add_tllm_gtest(
+  preQuantScaleKernelTest
+  OWNER
+  kernel
+  SOURCES
+  preQuantScaleKernelTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_pre_quant_scale
+  LABELS
+  "unit;kernels;quantization;gpu")
+
+add_tllm_gtest(
   mixtureOfExpertsTest
   OWNER
   kernel
