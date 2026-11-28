@@ -116,7 +116,13 @@ Only final artifacts are still written into the checkout: `tensorrt_llm/libs`, `
 
 Related knobs for shared-storage workflows:
 
-- `CCACHE_DIR`: point at persistent storage so compile results survive container or job restarts even when `<dir>` is ephemeral (for example, node-local `/tmp`).
+- `CCACHE_DIR`: point at persistent storage so compile results survive container or job restarts even when `<dir>` is ephemeral (for example, node-local `/tmp`). To reuse a ccache on shared storage while building on fast local disk:
+
+  ```bash
+  CCACHE_DIR=<shared ccache dir> python3 scripts/build_wheel.py --use_ccache --build_root <node-local dir> -a "90" --skip_building_wheel --linking_install_binary
+  ```
+
+  Later builds of the same checkout with the same `--build_root` path then reuse the cache, also from other jobs and nodes. To share it across worktrees too, see [Sharing ccache across git worktrees](#sharing-ccache-across-git-worktrees).
 - `--use-3rdparty-cache`: cache FetchContent git clones as bare repos under `TRTLLM_FETCHCONTENT_CACHE` (defaults to `3rdparty/.cache_3rdparty`), avoiding repeated full clones after a clean.
 
 Plain local-disk builds are unaffected: without `--build_root`, all paths behave as before.
@@ -132,6 +138,24 @@ python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --out-of-tree --us
 ```
 
 In this mode the generated FMHA kernel sources and the configured `version.h` go to the build tree (via the `TRTLLM_FMHA_GEN_DIR` and `TRTLLM_VERSION_H_INCLUDE_DIR` CMake variables), and the wheel is assembled from a staging copy of the Python package under `<build_root>/package`, landing in `<build_root>/dist` by default. Submodules and git-lfs content must be materialized before the build (the usual `git submodule update --init --recursive`), since the build will not modify the checkout. Editable-install workflows (`--skip_building_wheel`, `--linking_install_binary`, `--install`) are incompatible with `--out-of-tree`: they import compiled artifacts from the checkout by design.
+
+### Sharing ccache across git worktrees
+
+With `--use_ccache`, the build also sets up:
+
+- ccache `base_dir` to be the git checkout root, which lets ccache see paths inside the checkout as relative paths to the build working directory.
+- Compiler flag `-fdebug-prefix-map` for `Debug` and `RelWithDebInfo` builds, which sets paths in the debug info to be relative as well.
+
+As a result, cache from one worktree can be used on another. This helps when a developer works in several worktrees at the same time, or when coding agents work in separate worktrees.
+
+For the worktrees to share the cache, you also need to:
+
+- Install ccache 4.8 or newer.
+- Leave ccache `base_dir` unset before the build.
+- Use the same ccache folder for all worktrees. If you use `build_wheel.py --build_root`, set `CCACHE_DIR` first.
+- Keep the build folder at the same path (e.g. `cpp/build` by default) inside each worktree.
+
+To build on a fast node-local disk in a container, you can mount the disk as the same build folder inside each worktree, pass that folder to `--build_root` and set `CCACHE_DIR` to a folder on persistent storage all worktree builds share.
 
 ### Python-only build (no C++ compilation)
 

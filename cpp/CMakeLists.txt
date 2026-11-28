@@ -23,6 +23,7 @@ include(resolve_dirs)
 include(parse_make_options)
 include(cuda_configuration)
 include(sanitizers)
+include(ccache)
 
 project(tensorrt_llm LANGUAGES CXX)
 
@@ -271,6 +272,9 @@ endif()
 # TRT dependencies
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
+
+# Must run before the first target is created.
+setup_ccache_base_dir(${TRT_LLM_ROOT_DIR})
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR} 3rdparty)
