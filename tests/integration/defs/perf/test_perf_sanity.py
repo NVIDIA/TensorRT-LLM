@@ -28,6 +28,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,6 +38,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
+from pydantic import TypeAdapter
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 from test_common.perf_sanity_matching import get_test_case_match_keys
@@ -203,6 +205,7 @@ def ensure_bench_serving_repo() -> str:
 
 
 DEFAULT_TIMEOUT = 10800
+WORKER_DEVICE_COUNT_TIMEOUT = 30
 # Defaults for the server *ready* wait, separate from the whole-test timeout:
 # a server that is not healthy after this long is not going to be, and failing
 # here (with server-log tails, see wait_for_endpoint_ready) instead of at the
@@ -1075,12 +1078,13 @@ MINIMIZE_METRICS = [
     *(f"d_{name}" for name in TIME_BREAKDOWN_METRICS),
 ]
 
-# Default key metrics that determine regression (throughput metrics only).
+# Default throughput gates; eligible concurrency-one clients also gate d_mean_ttft.
 # d_al is appended at runtime when any client runs spec decoding.
 REGRESSION_METRICS = [
     "d_token_throughput",
     "d_total_token_throughput",
 ]
+CONCURRENCY_ONE_LATENCY_REGRESSION_METRICS = ("d_mean_ttft",)
 
 STARTUP_METRIC_NAMES = (
     "total_model_loading_seconds",
@@ -2460,12 +2464,18 @@ class ServerConfig:
         self.disagg_run_type = server_config_data.get("disagg_run_type", "aggr")
 
         # Extract optional fields with defaults
-        self.tp = server_config_data.get("tensor_parallel_size", 1)
+        integer_field = TypeAdapter(int)
+        self.tp = integer_field.validate_python(server_config_data.get("tensor_parallel_size", 1))
         self.ep = server_config_data.get("moe_expert_parallel_size", 1)
-        self.pp = server_config_data.get("pipeline_parallel_size", 1)
-        self.cp = server_config_data.get("context_parallel_size", 1)
-        self.gpus = server_config_data.get("gpus", self.tp * self.cp * self.pp)
-        self.gpus_per_node = server_config_data.get("gpus_per_node", 0) or self.gpus
+        self.pp = integer_field.validate_python(server_config_data.get("pipeline_parallel_size", 1))
+        self.cp = integer_field.validate_python(server_config_data.get("context_parallel_size", 1))
+        self.gpus = integer_field.validate_python(
+            server_config_data.get("gpus", self.tp * self.cp * self.pp)
+        )
+        self.gpus_per_node = (
+            integer_field.validate_python(server_config_data.get("gpus_per_node", 0) or 0)
+            or self.gpus
+        )
         self.max_num_tokens = server_config_data.get("max_num_tokens", 2048)
         self.max_batch_size = server_config_data.get("max_batch_size", 512)
         self.max_seq_len = server_config_data.get("max_seq_len", 0)
@@ -2590,13 +2600,18 @@ class ServerConfig:
         self.num_serve_frontends = self.extra_llm_api_config_data.get("num_serve_frontends", 1)
 
     def to_cmd(
-        self, output_dir: str, numa_bind: bool = False, disagg_serving_type: str = ""
+        self,
+        output_dir: str,
+        numa_bind: bool = False,
+        disagg_serving_type: str = "",
+        config_path: str | None = None,
     ) -> List[str]:
-        """Generate server command."""
+        """Generate a server command using the supplied or default worker config path."""
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
-        config_filename = f"extra-llm-api-config.{self.disagg_run_type}.{self.name}.yml"
-        config_path = os.path.join(output_dir, config_filename)
+        if config_path is None:
+            config_filename = f"extra-llm-api-config.{self.disagg_run_type}.{self.name}.yml"
+            config_path = os.path.join(output_dir, config_filename)
 
         numa_bind_cmd = []
         if numa_bind:
@@ -2614,6 +2629,65 @@ class ServerConfig:
 
     def to_env(self) -> Dict[str, str]:
         return to_env_dict(self.env_vars)
+
+    def is_single_node_worker(self, worker_config: dict) -> bool:
+        """Whether rendered topology fits the serving CLI's resolved node capacity."""
+        integer_field = TypeAdapter(int)
+        parallelism = {
+            field: integer_field.validate_python(worker_config.get(field, 1))
+            for field in (
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "context_parallel_size",
+            )
+        }
+        server_env = os.environ.copy()
+        server_env.update(self.to_env())
+        worker_env_overrides = {
+            str(name): str(value)
+            for name, value in (worker_config.get("env_overrides") or {}).items()
+        }
+        node_capacity = worker_config.get("gpus_per_node")
+        if "RAY_LOCAL_WORLD_SIZE" in server_env or "RAY_LOCAL_WORLD_SIZE" in worker_env_overrides:
+            node_capacity = parallelism["tensor_parallel_size"]
+        elif node_capacity is None:
+            try:
+                probe_output = subprocess.check_output(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json, os, sys\n"
+                        "import torch\n"
+                        "capacity = torch.cuda.device_count()\n"
+                        "overrides = json.loads(sys.stdin.buffer.read())\n"
+                        "if overrides is not None:\n"
+                        "    os.environ.update(overrides)\n"
+                        "    capacity = torch.cuda.device_count()\n"
+                        "sys.stdout.buffer.write(b'\\nTRTLLM_CUDA_DEVICE_COUNT=' + "
+                        "str(capacity).encode('ascii') + b'\\n')",
+                    ],
+                    input=json.dumps(
+                        worker_env_overrides if "gpus_per_node" in worker_config else None
+                    ).encode("utf-8"),
+                    env=server_env,
+                    timeout=WORKER_DEVICE_COUNT_TIMEOUT,
+                )
+                node_capacities = {
+                    int(record)
+                    for record in re.findall(
+                        rb"^TRTLLM_CUDA_DEVICE_COUNT=([0-9]+)$", probe_output, re.MULTILINE
+                    )
+                }
+                if not node_capacities:
+                    raise ValueError("probe did not return a marked CUDA device count")
+                if len(node_capacities) > 1:
+                    raise ValueError("probe returned conflicting CUDA device counts")
+                node_capacity = node_capacities.pop()
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as error:
+                raise RuntimeError(
+                    f"CUDA capacity probe for server {self.name!r} failed: {error}"
+                ) from error
+        return math.prod(parallelism.values()) <= integer_field.validate_python(node_capacity)
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -5054,6 +5128,7 @@ class PerfSanityTestConfig:
     def __init__(self, test_case_name: str, output_dir: str):
         self._output_dir = output_dir
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
+        self._ttft_eligible_server_idxs: set[int] = set()
 
         # Initialize server configs
         self.server_configs: List = []
@@ -5574,8 +5649,10 @@ class PerfSanityTestConfig:
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    def get_commands(self):
-        """Get commands based on runtime and benchmark_mode."""
+    def get_commands(
+        self, *, collect_ttft_eligibility: bool = False
+    ) -> AggrTestCmds | DisaggTestCmds | AggrGenOnlyNoContextCmds:
+        """Get launch commands, optionally capturing eligibility for a measured TTFT verdict."""
         self.test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
         os.makedirs(self.test_output_dir, exist_ok=True)
 
@@ -5583,27 +5660,84 @@ class PerfSanityTestConfig:
             return self._get_gen_only_no_context_commands(self._output_dir, self.test_output_dir)
         # ctx_only runs in aggregated mode (uses _get_aggr_commands)
         if self.runtime == "aggr_server":
-            return self._get_aggr_commands(self._output_dir, self.test_output_dir)
+            return self._get_aggr_commands(
+                self._output_dir,
+                self.test_output_dir,
+                collect_ttft_eligibility=collect_ttft_eligibility,
+            )
         else:
             return self._get_disagg_commands(self._output_dir, self.test_output_dir)
 
-    def _get_aggr_commands(self, output_dir: str, test_output_dir: str):
+    def _aggr_result_identity(
+        self, server_config: ServerConfig, client_config: ClientConfig
+    ) -> dict[str, str]:
+        """Aggregated history fields; the job branch is shared by the batch."""
+        return {
+            "s_gpu_type": self.gpu_type,
+            "s_runtime": "multi_node_aggr_server"
+            if server_config.gpus != server_config.gpus_per_node
+            else "aggr_server",
+            "s_test_case_name": f"{server_config.name}-{client_config.name}",
+        }
+
+    def _validate_aggr_history_identities(self) -> None:
+        """Reject ambiguous measured rows without renaming existing history keys."""
+        identities: dict[tuple[str, ...], tuple[int, int]] = {}
+        match_keys = [key for key in get_test_case_match_keys() if key != "s_branch"]
+        for server_idx, client_configs in self.server_client_configs.items():
+            server_config = self.server_configs[server_idx]
+            for client_idx, client_config in enumerate(client_configs):
+                if client_config.only_run_accuracy:
+                    continue
+                identity = self._aggr_result_identity(server_config, client_config)
+                history_key = tuple(identity[key] for key in match_keys)
+                previous = identities.get(history_key)
+                if previous is not None:
+                    first_server_idx, first_client_idx = previous
+                    raise ValueError(
+                        f"Duplicate aggregated performance history key {identity!r} for "
+                        f"server {first_server_idx}, client {first_client_idx} and "
+                        f"server {server_idx}, client {client_idx}; use distinct server or client names."
+                    )
+                identities[history_key] = (server_idx, client_idx)
+
+    def _get_aggr_commands(
+        self, output_dir: str, test_output_dir: str, *, collect_ttft_eligibility: bool = False
+    ) -> AggrTestCmds:
         """Get commands for aggregated server."""
         server_cmds = []
         client_cmds = {}
+        self._ttft_eligible_server_idxs = set()
+        collect_ttft_eligibility = (
+            collect_ttft_eligibility
+            and bool(os.environ.get("OPEN_SEARCH_DB_BASE_URL"))
+            and self.benchmark_mode is None
+        )
+        if collect_ttft_eligibility:
+            self._validate_aggr_history_identities()
 
         for server_idx, client_configs in self.server_client_configs.items():
             server_config = self.server_configs[server_idx]
-            server_cmd = server_config.to_cmd(test_output_dir)
 
             # Generate extra-llm-api-config.yml
             config_content = server_config.generate_extra_llm_api_config(
                 self.page_cache_release_default
             )
-            config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
+            config_filename = f"extra-llm-api-config.aggr.{server_idx}.{server_config.name}.yml"
             config_path = os.path.join(test_output_dir, config_filename)
-            with open(config_path, "w") as f:
-                f.write(config_content)
+            with open(config_path, "w") as config_file:
+                config_file.write(config_content)
+            server_cmd = server_config.to_cmd(test_output_dir, config_path=config_path)
+
+            if collect_ttft_eligibility and any(
+                client.concurrency == 1 and not client.only_run_accuracy
+                for client in client_configs
+            ):
+                rendered_config = yaml.safe_load(config_content) or {}
+                if not (rendered_config.get("speculative_config") or {}).get(
+                    "decoding_type"
+                ) and server_config.is_single_node_worker(rendered_config):
+                    self._ttft_eligible_server_idxs.add(server_idx)
 
             server_cmds.append(server_cmd)
             client_cmds[server_idx] = []
@@ -6128,12 +6262,14 @@ class PerfSanityTestConfig:
             return {add_prefix(key, prefix_name): value for key, value in config_dict.items()}
 
         match_keys = get_test_case_match_keys()
+        ttft_gated_cmd_idxs = set()
 
         if self.runtime == "aggr_server":
             new_data_dict = {}
             cmd_idx = 0
             for server_idx, client_configs in self.server_client_configs.items():
                 server_config = self.server_configs[server_idx]
+                ttft_eligible_server = server_idx in self._ttft_eligible_server_idxs
                 server_config_dict = server_config.to_db_data()
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
@@ -6162,18 +6298,10 @@ class PerfSanityTestConfig:
                         cmd_idx += 1
                         continue
 
-                    new_data = {
-                        "s_gpu_type": self.gpu_type,
-                        "s_runtime": "multi_node_aggr_server"
-                        if server_config.gpus != server_config.gpus_per_node
-                        else "aggr_server",
-                    }
+                    new_data = self._aggr_result_identity(server_config, client_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
                     new_data["l_warmup_pass_requests"] = warmup_plan[client_idx]
-                    # Add test_case_name for convenient filtering on OpenSearch
-                    new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
-
                     add_perf_metric_value(
                         new_data,
                         server_perf_results[client_idx],
@@ -6200,6 +6328,8 @@ class PerfSanityTestConfig:
                     new_data.update(warmup_times)
 
                     new_data_dict[cmd_idx] = new_data
+                    if ttft_eligible_server and client_config.concurrency == 1:
+                        ttft_gated_cmd_idxs.add(cmd_idx)
                     startup_primary_row_pending = False
                     cmd_idx += 1
 
@@ -6359,6 +6489,15 @@ class PerfSanityTestConfig:
             if has_spec_decoding:
                 regression_metrics.append("d_al")
 
+        regression_metrics_by_cmd_idx = {
+            cmd_idx: [*regression_metrics, *CONCURRENCY_ONE_LATENCY_REGRESSION_METRICS]
+            for cmd_idx in ttft_gated_cmd_idxs
+        }
+        independent_regression_metrics_by_cmd_idx = {
+            cmd_idx: list(CONCURRENCY_ONE_LATENCY_REGRESSION_METRICS)
+            for cmd_idx in ttft_gated_cmd_idxs
+        }
+
         process_and_upload_test_results(
             new_data_dict=new_data_dict,
             match_keys=match_keys,
@@ -6369,6 +6508,8 @@ class PerfSanityTestConfig:
             upload_to_db=self.upload_to_db,
             fail_on_regression=fail_on_regression,
             metric_history_floors_ms=metric_history_floors_ms,
+            regression_metrics_by_cmd_idx=regression_metrics_by_cmd_idx,
+            independent_regression_metrics_by_cmd_idx=independent_regression_metrics_by_cmd_idx,
         )
 
 
@@ -6485,7 +6626,7 @@ def test_e2e(output_dir, perf_sanity_test_case):
     config.parse_config_file()
 
     # Get commands
-    commands = config.get_commands()
+    commands = config.get_commands(collect_ttft_eligibility=True)
 
     # Run commands and collect outputs
     outputs = config.run_ex(commands)

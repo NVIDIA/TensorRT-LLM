@@ -28,7 +28,74 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 |------|-------|----------|
 | `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
 | `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
-| `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+| `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. Eligible clients also gate `d_mean_ttft` per client. `d_al` is appended at runtime when any client runs spec decoding. |
+
+Regular `aggr-<config>[-<server>]` and `aggr_upload-<config>[-<server>]` clients
+also gate `d_mean_ttft` when
+the worker's resolved TP × PP × CP uses at most `gpus_per_node` GPUs,
+the client concurrency is one,
+and the effective worker configuration has no enabled speculative decoding.
+The effective configuration merges the perf YAML over `extra_llm_api_config_path`,
+so speculation in either source excludes the client. Eligibility is captured from
+the rendered worker configuration before launch. TP, PP, CP and node capacity
+use the worker's integer coercion, including quoted integers. Inline TP, PP, CP
+and harness GPU hints are normalized before GPU arithmetic or comparisons, so
+quoted and numeric forms produce the same integer topology metadata.
+Node capacity follows `trtllm-serve`'s argument order. When `gpus_per_node` is
+omitted from the worker YAML, retain the CUDA count from the inherited and
+per-server launch environment, before the YAML merge. An explicit numeric YAML
+value is used directly. Explicit YAML null requests the later default: a fresh
+probe mirrors initial CLI discovery, applies rendered `env_overrides` inside
+the running interpreter, then recounts. Keys and values are converted to strings;
+overrides are passed on stdin and the count uses a marked ASCII byte record.
+The parent reads raw bytes and parses only that record, so unrelated startup
+output and worker text-encoding settings do not change the capacity result.
+Every complete count record is checked, including adjacent records. Repeated
+matching counts are accepted; conflicting counts are rejected before measurement
+rather than choosing the first or last record. Missing or conflicting count
+records retain the probe's server-specific error context, as do child failures
+and the existing 30-second timeout.
+With `RAY_LOCAL_WORLD_SIZE` in the launch or rendered environment, the worker
+uses TP as node capacity instead. The hardware inventory and uploaded topology
+fields do not replace these capacity-source rules.
+Only the measured `test_e2e` path requests this snapshot, and only for regular
+aggregated servers with a measured concurrency-one client and a configured
+`OPEN_SEARCH_DB_BASE_URL` history endpoint. With that endpoint configured,
+read-only `aggr` runs still query matched history and enforce regression verdicts;
+disabling result writes does not disable TTFT eligibility. Without the endpoint,
+offline `aggr` and `aggr_upload` runs measure without a CUDA capacity query or
+database writes. Higher-concurrency-only servers,
+accuracy-only clients, command-only callers and cold-start `test_warmup` runs
+do not need a CUDA capacity probe.
+An otherwise necessary query has a 30-second timeout; a timeout or failed child
+raises with the server's name and the underlying error rather than guessing capacity.
+Each server command receives a distinct worker file even when server names match;
+existing integer case names and topology fields retain their definitions.
+Changing or removing the source file after measurement does not change the
+verdict. Partially occupied nodes qualify, but their uploaded `s_runtime` depends
+on the reporting hints, not the probed capacity. They can be labeled
+`multi_node_aggr_server` when the reported GPU count and node size differ, or
+`aggr_server` when those hints match. With TP=4 specified inline in the perf YAML
+and no hardware or GPU-count hint, a worker that sees eight devices still reports
+four GPUs and a node size of four, so it uploads as `aggr_server`. Baseline
+matching retains this reporting label.
+Higher-concurrency, speculative and genuinely multi-node clients, disaggregated
+`e2e`/`gen_only`, and aggregated `ctx_only`/`gen_only_no_context` modes do not gain
+this gate. Selection is per client, including in mixed batches.
+
+Measured regular aggregated clients with a configured history endpoint must have
+distinct history identities: `s_test_case_name`, `s_gpu_type`, `s_runtime` and
+`s_branch`. The branch is shared within the batch. Collisions fail before worker
+launch with a request for distinct server or client names, rather than silently
+sharing or discarding a baseline. Unique names and reporting labels are not
+rewritten. Accuracy-only clients emit no performance row and are excluded from
+this check; offline and command-only callers do not require a history identity.
+
+Mean TTFT uses the matched case's baseline and configured pre-merge or post-merge
+tolerance (10% and 5% by default). Without a stored override, matched post-merge
+TTFT history supplies a calculated baseline; without either, TTFT remains
+ungated. For pre-merge history, the baseline branch is `PERF_BASELINE_BRANCH`
+(`main` by default). See the pre-merge gating section below for exemptions.
 
 TPOT is time per output token, so lower values are better. Its reported delta is
 negative when latency exceeds the selected baseline. A stored `d_baseline_*`
@@ -509,14 +576,16 @@ Post-merge perf-sanity stages (stages whose names contain both `PerfSanity` and 
 
 By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
 
-**A pre-merge case does not fail when `main` has already regressed.** Both pipelines
-compare against the same post-merge baseline, so once a regression lands on `main`
-every PR measures the same regressed value and every PR fails a test it did not
-break — blocking the whole queue until a fix merges and everyone rebases. To avoid
-that, `prepare_regressive_test_cases` checks the **latest post-merge document** for
-the same test case: if that value misses the same baseline by more than the same
-pre-merge threshold (10%), the pre-merge case is reported as a warning but does not
-raise. Functional failures still fail the stage as usual.
+**A pre-merge case may be exempt when its baseline branch has already regressed.**
+`prepare_regressive_test_cases` checks the **latest post-merge document** for the
+same case on `PERF_BASELINE_BRANCH` (`main` by default), against the same baseline
+and pre-merge threshold (10% by default). For the eligible clients defined above,
+TTFT is independent of the grouped throughput gates. All other selected gates
+use a whole-case exemption. The full rule is defined once in
+[README_perf_regression_system.md](README_perf_regression_system.md#pre-merge-exemptions-against-matched-history).
+
+Exempt cases are reported as warnings without raising. Functional failures still
+fail the stage as usual.
 
 The comparison deliberately re-evaluates `main`'s value rather than reusing the
 `b_is_regression` the post-merge run recorded, because that verdict was computed at
@@ -526,10 +595,9 @@ value never fails the 10% gate, so the gate stays armed.
 
 Two things to be aware of when you see that warning:
 
-- While a case is exempt it is exempt **entirely**: a genuine new regression the PR
-  adds on top of `main`'s passes silently. The exempt band is only the range where
-  the gate would have fired on `main`'s own value anyway, but inside it there is no
-  coverage.
+- A new loss within an exempt throughput group can pass, while an independent
+  TTFT loss needs its own qualifying mainline miss. Cases with only grouped gates
+  can be exempt even when a different metric in that group recovers on the PR.
 - The exemption clears itself as the rolling baseline absorbs the regression, which
   also means the regression stops being reported. If you land the fix, the baseline
   recovers and the gate re-arms at the original level; if nobody does, it re-arms at
