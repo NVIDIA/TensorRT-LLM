@@ -38,7 +38,9 @@ import torch
 from .policy import (
     EvaluationScheduler,
     ExpertGeometry,
+    InstallFit,
     TimeModel,
+    ValueCounts,
     active_slots,
     agreed_timings,
     build_route_tables,
@@ -125,7 +127,8 @@ class LayoutUpdate:
     every rank together copies per moved layer, the window's imbalance (the mean over the layers
     of the busiest GPU's rows over the mean GPU's, at the layouts in use; ``None`` without rows),
     and the ``state`` the decision leaves: ``enabled`` while a layer holds replicas, else ``home``
-    (every layer back on its original layout, which ``reason`` explains).
+    (every layer back on its original layout, which ``reason`` explains); and the entries the run's
+    timings take in the decision process (``_Decider.timing_values``).
     """
 
     window: int
@@ -138,6 +141,7 @@ class LayoutUpdate:
     replicas: dict[int, int] = field(default_factory=dict)
     imbalance: float | None = None
     state: str = "home"
+    timing_values: int = 0
 
     @property
     def empty(self) -> bool:
@@ -174,7 +178,8 @@ def copy_items(
 
 
 class _Decider:
-    """State of the decision process: the committed layouts and every timing of the run."""
+    """State of the decision process: the committed layouts and every timing of the run, kept as
+    each distinct value and its count (the install timings per layer count), not one entry each."""
 
     def __init__(self, config: DecisionConfig, stats: np.ndarray) -> None:
         self.config = config
@@ -182,12 +187,12 @@ class _Decider:
         self.layout = np.array(config.home_layouts, dtype=np.int64)
         self.shares = (self.layout >= 0).astype(np.float64)
         self.committed = np.full(len(self.layout), -1)
-        self.install_timings: dict[int, tuple[int, float]] = {}
-        self.stats_copies: list[float] = []
+        self.install_timings, self.install_group = InstallFit(), -1  # the last group counted
+        self.stats_copies = ValueCounts()
         self.evaluations = EvaluationScheduler(config.model, config.geometry)
         self.active = active_slots(config.geometry)
-        # (apply call, ms per replica) of the timed copies; the start-up one, at call inf, always counts.
-        self.copy_samples = [] if config.copy_ms is None else [(math.inf, config.copy_ms)]
+        # ms per replica of the timed copies; the start-up one always counts.
+        self.copy_samples = ValueCounts([] if config.copy_ms is None else [config.copy_ms])
         self.forwards = 1
         self.next_forwards: int | None = None
         self.open_call = 0
@@ -195,6 +200,11 @@ class _Decider:
         # (window, rows per forward [L, E], the requests they stand for) of the last two windows.
         self.kept: deque[tuple[int, np.ndarray, float]] = deque(maxlen=2)
         self.close_requests = self.largest_change = 0.0
+
+    def timing_values(self) -> int:
+        """Entries the run's timings take: their distinct values and layer counts."""
+        timings = (self.stats_copies.values, self.copy_samples.values, self.install_timings.sums)
+        return sum(len(entries) for entries in timings)
 
     def handle(self, message: tuple) -> tuple:
         if message[0] == "window":
@@ -210,14 +220,16 @@ class _Decider:
         per_rank = [[(window, int(n), float(ms))] for n, ms in zip(col["moved"], col["copy_ms"])]
         # got: the replicas the update's busiest receiving GPU copied
         close, growth, steps_left, got = self.awaiting_copy.pop(window)
-        self.copy_samples += [(apply_call, ms / got) for _, n, ms in agreed_timings(per_rank) if n]
+        for _, n, ms in agreed_timings(per_rank):
+            if n:
+                self.copy_samples.add(ms / got)
         self.forwards = self.next_forwards or self.forwards
         plan = self.evaluations.plan(
             apply_call,
             close,
             self.forwards,
             self.stats_copies,
-            [(group, *timing) for group, timing in sorted(self.install_timings.items())],
+            self.install_timings,
             growth,
             steps_left,
         )
@@ -236,10 +248,14 @@ class _Decider:
             [(int(g), int(n), float(ms))] if g >= 0 else []
             for g, n, ms in zip(tail["applied"], tail["applied_layers"], tail["applied_ms"])
         ]
-        self.install_timings.update((g, (n, ms)) for g, n, ms in agreed_timings(applied))
+        # A group's timing comes again in every window until the next install: it counts once.
+        for g, n, ms in agreed_timings(applied):
+            if g > self.install_group:
+                self.install_timings.add(n, ms)
+                self.install_group = g
         if (tail["stats_copy_ms"] > 0).all():
-            self.stats_copies.append(float(tail["stats_copy_ms"].max()))
-        update = LayoutUpdate(window)
+            self.stats_copies.add(float(tail["stats_copy_ms"].max()))
+        update = LayoutUpdate(window, timing_values=self.timing_values())
         self.awaiting_copy[window] = (close, None, None, 0)  # until the window gives a decision
         forwards = stats[:, layers * experts : layers * (experts + 1)].astype(np.float64)
         if forwards.min() < 1:  # a rank counted no forward of some layer: this window gives no rows
@@ -315,8 +331,7 @@ class _Decider:
         # idle, the lower median of every install timed in service.
         fresh = (new_layout >= 0) & (new_layout != installed)
         copied = fresh.reshape(-1, geometry.ep_size, geometry.local_slots).sum(2)
-        timed = sorted(ms for _, ms in self.copy_samples)
-        per_replica = timed[(len(timed) - 1) // 2] if timed else None
+        per_replica = self.copy_samples.lower_median()
         # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
         # only where it gains more than the home layout, net of a layer's copy over the steps left.
         home_shares = (home >= 0).astype(np.float64)
@@ -778,7 +793,7 @@ class AdaptiveRuntime:
             f"window={update.window}, predicted_gain_ms_per_step={update.gain_ms:.4f}, "
             f"always_on_overhead_ms_per_step=unknown, layers={len(update.tables)}, "
             f"moved_layers={len(update.moved)}, copy_bytes={copy_bytes}, imbalance={imbalance}, "
-            f"state={update.state}, reason={update.reason}"
+            f"state={update.state}, reason={update.reason}, timing_values={update.timing_values}"
         )
 
     def _copies_done(self, update: LayoutUpdate, rows: np.ndarray) -> None:

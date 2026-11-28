@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import os
 import resource
+import statistics
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import policy
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import runtime as rt
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import AdaptiveMoeLoadBalancer
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
@@ -580,6 +582,7 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
         assert counters["copiedBytes"] == 4 * EXPERT_BYTES and counters["imbalance"] > 1.0
     fields = ("install", "window", "predicted_gain_ms_per_step", "always_on_overhead_ms_per_step")
     fields += ("layers", "moved_layers", "copy_bytes", "imbalance", "state", "reason")
+    fields += ("timing_values",)
     lines = [line for line in logged if line.startswith("adaptive EPLB decision: ")]
     decided = [dict(kv.split("=") for kv in line.split(": ", 1)[1].split(", ")) for line in lines]
     assert decided and all(tuple(d) == fields for d in decided)
@@ -591,7 +594,7 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
     assert decided[0]["state"] == "home" and install["state"] == "enabled"
     assert install["always_on_overhead_ms_per_step"] == "unknown"
     assert float(install["predicted_gain_ms_per_step"]) > 0.0
-    assert float(install["imbalance"]) > 1.0
+    assert float(install["imbalance"]) > 1.0 and int(install["timing_values"]) > 0
     for _ in range(2):  # two more windows, gathered after the install
         for runtime in ranks:
             set_statistics(runtime, hot, FORWARDS)
@@ -739,6 +742,48 @@ def test_one_slow_copy_does_not_price_the_next_installs_out(monkeypatch):
     window_stats(decider.stats, live=1, remaining=8)  # one step left: both copies are past it
     decider.decide(2)
     assert costs[-1] == {layer: 2 * cost for layer, cost in costs[0].items()}
+
+
+def test_a_long_run_keeps_its_timings_and_the_time_per_window_bounded():
+    """Every window brings a statistics copy, an install and a copy timing, float32 readings of a GPU
+    timer: from 1e3 to 1e5 windows the decision process's entries for them and its time per window do
+    not grow, and the medians and the install intercept stay those of every reading."""
+    stats = np.zeros((R, rt.window_stats_size(L, E)), dtype=np.float32)
+    config = rt.DecisionConfig(GEOMETRY, MODEL, np.tile(HOME, (L, 1)), 0, 1, ROWS, copy_ms=0.05)
+    decider, tail = rt._Decider(config, stats), L * (E + 2)
+    at = {name: tail + i for i, name in enumerate(rt.FIELDS)}
+    tick = np.float32(5e-4) * np.arange(1, 9, dtype=np.float32)  # a 0.5 us timer resolution
+    rows = np.zeros((R, len(rt.ROW)))
+    rows[:, rt.ROW.index("moved")] = 1
+    copies, installs, per_replica, done = [], [], [0.05], 0
+
+    def run(windows: int) -> float:
+        nonlocal done
+        times = []
+        for w in range(done, windows):
+            stats[:, at["stats_copy_ms"]], stats[:, at["applied"]] = tick[w % 8], w
+            stats[:, at["applied_layers"]], stats[:, at["applied_ms"]] = 1 + w % L, tick[w // 8 % 8]
+            rows[:, rt.ROW.index("copy_ms")], rows[:, rt.ROW.index("copied_call")] = tick[w % 5], w
+            start = time.perf_counter()
+            decider.handle(("window", w))  # no forward counted: the window gives no rows
+            # as if the window's decision had copied one replica, with a growth the plan reads
+            decider.awaiting_copy[w] = (w, policy.CostGrowth(1.0, L, 1), None, 1)
+            decider.handle(("copied", w, rows))
+            times.append(time.perf_counter() - start)
+            copies.append(float(tick[w % 8]))
+            installs.append((w, 1 + w % L, float(tick[w // 8 % 8])))
+            per_replica.append(float(tick[w % 5]))
+        done = windows
+        return float(np.median(times[-200:]))
+
+    first = run(1000)
+    for windows in (10_000, 100_000):
+        assert run(windows) < 3 * first, f"the time per window grew by {windows} windows"
+        assert decider.timing_values() == len(set(copies)) + len(set(per_replica)) + L
+    assert decider.stats_copies.median() == statistics.median(copies)
+    assert decider.copy_samples.lower_median() == sorted(per_replica)[(len(per_replica) - 1) // 2]
+    want = policy.fixed_install_ms(installs)
+    assert policy.fixed_install_ms(decider.install_timings) == pytest.approx(want, rel=1e-12)
 
 
 def test_decision_process_answers_and_reports_its_failure():

@@ -15,8 +15,7 @@ import bisect
 import heapq
 import itertools
 import math
-import statistics
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, NamedTuple, cast
 
@@ -426,18 +425,76 @@ def agreed_timings(
     return [(g, by_rank[0][g][0], max(groups[g][1] for groups in by_rank)) for g in common]
 
 
-def fixed_install_ms(timings: Sequence[tuple[int, int, float]]) -> float | None:
+class ValueCounts:
+    """A run's timings as each distinct value and its count. They are float32 GPU timer readings, so
+    the distinct values are bounded by the timer's range over its resolution, not by the run's
+    length, while the medians stay those of every reading."""
+
+    def __init__(self, values: Iterable[float] = ()) -> None:
+        self.counts: dict[float, int] = {}
+        self.values: list[float] = []  # the distinct values, ascending
+        self.total = 0
+        for value in values:
+            self.add(value)
+
+    def add(self, value: float) -> None:
+        value = float(value)
+        if value not in self.counts:
+            bisect.insort(self.values, value)
+        self.counts[value] = self.counts.get(value, 0) + 1
+        self.total += 1
+
+    def at(self, index: int) -> float:
+        """The reading at ``index`` of all the readings in ascending order."""
+        for value in self.values:
+            index -= self.counts[value]
+            if index < 0:
+                return value
+        raise IndexError("no reading at that index")
+
+    def median(self) -> float:
+        """``statistics.median`` of the readings."""
+        half = self.total // 2
+        return self.at(half) if self.total % 2 else (self.at(half - 1) + self.at(half)) / 2
+
+    def lower_median(self) -> float | None:
+        return self.at((self.total - 1) // 2) if self.total else None
+
+
+class InstallFit:
+    """Install timings against their layer counts, as the count and the summed milliseconds of the
+    timings of each layer count: one entry per layer count, however many installs a run makes."""
+
+    def __init__(self, points: Iterable[tuple[int, float]] = ()) -> None:
+        self.sums: dict[int, list] = {}  # layers -> [timings, ms]
+        for layers, ms in points:
+            self.add(layers, ms)
+
+    def add(self, layers: int, ms: float) -> None:
+        entry = self.sums.setdefault(int(layers), [0, 0.0])
+        entry[0] += 1
+        entry[1] += float(ms)
+
+    def intercept(self) -> float | None:
+        """The least-squares intercept, at least 0; ``None`` below two layer counts."""
+        if len(self.sums) < 2:
+            return None
+        count = sum(c for c, _ in self.sums.values())
+        mean_n = sum(n * c for n, (c, _) in self.sums.items()) / count
+        mean_ms = sum(ms for _, ms in self.sums.values()) / count
+        slope = sum((n - mean_n) * (ms - c * mean_ms) for n, (c, ms) in self.sums.items()) / sum(
+            c * (n - mean_n) ** 2 for n, (c, _) in self.sums.items()
+        )
+        return max(0.0, mean_ms - slope * mean_n)
+
+
+def fixed_install_ms(timings: InstallFit | Sequence[tuple[int, int, float]]) -> float | None:
     """Milliseconds of applying route tables that do not depend on the number of layers: the
-    least-squares intercept of the ``(group, layers, ms)`` timings against their layer counts."""
-    points = [(n, ms) for _, n, ms in timings]
-    if len({n for n, _ in points}) < 2:
-        return None
-    mean_n = sum(n for n, _ in points) / len(points)
-    mean_ms = sum(ms for _, ms in points) / len(points)
-    slope = sum((n - mean_n) * (ms - mean_ms) for n, ms in points) / sum(
-        (n - mean_n) ** 2 for n, _ in points
-    )
-    return max(0.0, mean_ms - slope * mean_n)
+    least-squares intercept of the ``(group, layers, ms)`` timings (or their fit) against their
+    layer counts."""
+    if not isinstance(timings, InstallFit):
+        timings = InstallFit((n, ms) for _, n, ms in timings)
+    return timings.intercept()
 
 
 class CostGrowth(NamedTuple):
@@ -516,8 +573,8 @@ class EvaluationScheduler:
         call: int,
         gather_call: int,
         next_window_calls: int,
-        stats_copy_ms: Sequence[float],
-        install_timings: Sequence[tuple[int, int, float]],
+        stats_copy_ms: ValueCounts | Sequence[float],
+        install_timings: InstallFit | Sequence[tuple[int, int, float]],
         growth: CostGrowth | None,
         steps_left: float | None,
     ) -> EvaluationPlan:
@@ -530,14 +587,16 @@ class EvaluationScheduler:
         """
         calls_since_gather = int(call) - int(gather_call)
         min_interval = 1 + int(next_window_calls) + calls_since_gather
-        copies = [float(x) for x in stats_copy_ms]
+        copies = stats_copy_ms
+        if not isinstance(copies, ValueCounts):
+            copies = ValueCounts(copies)
         if growth is not None and growth.rate is not None:
             if growth.rate > self.min_resolvable_rate(growth.layers, growth.interval):
                 self._last_positive_rate = growth.rate
         rate = None if growth is None else self._last_positive_rate
         interval = min_interval
-        if copies and rate is not None:
-            fixed = statistics.median(copies) + (fixed_install_ms(install_timings) or 0.0)
+        if copies.total and rate is not None:
+            fixed = copies.median() + (fixed_install_ms(install_timings) or 0.0)
             interval = max(min_interval, math.ceil(math.sqrt(2.0 * fixed / rate)))
         if steps_left is not None:
             interval = min(interval, max(min_interval, int(math.ceil(steps_left))))
