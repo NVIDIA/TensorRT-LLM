@@ -31,12 +31,11 @@ finish before releasing shared KV; Q scales require WAR and visibility barriers.
 K2 emits four thresholded candidate banks without materializing dense logits.
 """
 
-from .fp4_safe_filter import FP4PrefillMQALogitsKernel as _BaseKernel
 from .fp4_safe_filter import (
+    _RND_RN,
     Float4E2M1FN,
     Float8E8M0FNU,
     IndexerPipelineTmaAsync,
-    _RND_RN,
     _subview,
     block_samples,
     cpasync,
@@ -67,6 +66,7 @@ from .fp4_safe_filter import (
     utccp_interleaved_qsf,
     utccp_required_smem_warp_transpose,
 )
+from .fp4_safe_filter import FP4PrefillMQALogitsKernel as _BaseKernel
 
 
 class FP4PrefillMQALogitsKernel(_BaseKernel):
@@ -1962,6 +1962,10 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                 has_work = next_q_block_idx < num_q_blocks
             if cutlass.const_expr(self.num_heads != 32):
                 tmem.relinquish_alloc_permit()
+            # Every math warp has issued and waited for its last tcgen05.ld before math
+            # warp 0 frees the columns (the per-stage empty arrives go to the UMMA warp
+            # only, which does not free).
+            subset_barrier(barrier_id=3, number_of_threads=self.num_math_threads)
             tmem.free(tmem_ptr)
 
         else:
