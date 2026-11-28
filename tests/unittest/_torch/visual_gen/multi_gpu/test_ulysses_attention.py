@@ -24,9 +24,11 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from ._worker_pool import run_distributed
@@ -44,10 +46,13 @@ with _disable_mpi():
     from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention, VanillaAttention
+    from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
     from tensorrt_llm._torch.visual_gen.attention.backends.interface import (
         AttentionBackend,
         AttentionTensorLayout,
     )
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import release_ulysses_exchanges
+    from tensorrt_llm._torch.visual_gen.parallel.ce_transport import _peer_atomics_error
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
@@ -64,6 +69,31 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     run_distributed(
         world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
+
+
+def _run_ce_test(test_fn: Callable, world_size: int = 2) -> None:
+    ranks = range(world_size)
+    if (
+        torch.cuda.device_count() < world_size
+        or any(torch.cuda.get_device_capability(rank) not in ((10, 0), (10, 3)) for rank in ranks)
+        or any(
+            not torch.cuda.can_device_access_peer(src, dst)
+            for src in ranks
+            for dst in ranks
+            if src != dst
+        )
+    ):
+        pytest.skip(
+            f"Copy-engine Ulysses requires {world_size} SM100 or SM103 GPUs with peer access"
+        )
+    member_ids = [str(torch.cuda.get_device_properties(rank).uuid) for rank in ranks]
+    for rank in ranks:
+        with torch.cuda.device(rank):
+            error = _peer_atomics_error(member_ids)
+        if error.startswith("native peer atomics unavailable"):
+            pytest.skip(f"GPU {rank}: {error}")
+        assert not error, error
+    run_test_in_distributed(world_size=world_size, test_fn=test_fn)
 
 
 def test_forward_async_redistributes_vsa_gates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,6 +354,176 @@ def _logic_ulysses_vs_standard_multi_gpu(rank, world_size):
         atol=1e-4,
         msg=f"Rank {rank}: Ulysses multi-GPU output differs from standard attention",
     )
+
+
+@torch.inference_mode()
+def _logic_head_chunked_exchange(rank: int, world_size: int) -> None:
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
+    from tensorrt_llm._torch.visual_gen.parallel import _wait_many
+
+    # At B=2 and 256 global tokens, two blocks per head fit this many heads in one wave.
+    heads_per_wave = torch.cuda.get_device_properties(rank).multi_processor_count // 2
+    groups = (1, heads_per_wave)
+    local_heads = sum(groups)
+    head_dim = 64
+    inner = VanillaAttention(num_heads=local_heads, head_dim=head_dim)
+    attention = UlyssesAttention(inner_backend=inner, process_group=dist.group.WORLD)
+    torch.manual_seed(42 + rank)
+    inputs = [
+        torch.randn(
+            2,
+            256 // world_size,
+            3,
+            world_size * local_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ).unbind(dim=2)
+        for _ in range(2)
+    ]
+    mask = torch.ones(2, 256, dtype=torch.bool, device="cuda")
+    mask[:, -17:] = False
+    kwargs = dict(key_padding_mask=mask, valid_seq_len=239, discard_padded_queries=True)
+    expected = [attention._forward_unfused(*qkv, **kwargs) for qkv in inputs]
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with patch.object(
+            F, "scaled_dot_product_attention", wraps=F.scaled_dot_product_attention
+        ) as sdpa:
+            # Keep the first output live while the second call reuses the exchange buffers.
+            actual = [attention(*qkv, **kwargs) for qkv in inputs]
+            with patch.object(
+                _wait_many, "wait_signal_words", wraps=_wait_many.wait_signal_words
+            ) as batches:
+                with resolved_extra_keys_scope({}), torch.cuda.graph(graph):
+                    captured_output = attention(*inputs[0], **kwargs)
+        assert [call.args[0].shape[1] for call in sdpa.call_args_list] == list(groups) * 3
+        # A single source still uses the native wait. All output groups share one final wait.
+        peers = world_size - 1
+        input_waits = [peers] * len(groups) if peers > 1 else []
+        assert [int((call.args[1] >= 0).sum()) for call in batches.call_args_list] == [
+            *input_waits,
+            peers * len(groups),
+        ]
+        graph.replay()
+        actual.append(captured_output.clone())
+        for static, replacement in zip(*inputs, strict=True):
+            static.copy_(replacement)
+        graph.replay()
+        actual.append(captured_output)
+        for output, reference in zip(actual, expected * 2, strict=True):
+            torch.testing.assert_close(output, reference)
+
+        # A capture outside the VisualGen runner may be replayed concurrently.
+        unmanaged = torch.cuda.CUDAGraph()
+        with patch.object(inner, "forward_head_group", wraps=inner.forward_head_group) as fmha:
+            with torch.cuda.graph(unmanaged):
+                independent_output = attention(*inputs[1], **kwargs)
+        assert not fmha.called
+        unmanaged.replay()
+        torch.testing.assert_close(independent_output, expected[1])
+        del unmanaged
+
+        cudnn = CuDNNAttention(num_heads=local_heads, head_dim=head_dim, dtype=torch.bfloat16)
+        attention = UlyssesAttention(
+            inner_backend=cudnn, process_group=dist.group.WORLD, ulysses_head_plan="2,rest"
+        )
+        reference = attention._forward_unfused(*inputs[1])
+        with patch.object(cudnn, "forward_head_group", wraps=cudnn.forward_head_group) as fmha:
+            output = attention(*inputs[1])
+        assert [call.kwargs["q"].shape[2] for call in fmha.call_args_list] == [2, local_heads - 2]
+        torch.testing.assert_close(output, reference)
+        attention = UlyssesAttention(
+            inner_backend=cudnn,
+            process_group=dist.group.WORLD,
+            ulysses_head_plan=str(local_heads + 1),
+        )
+        # A plan for another layer must leave native-only causal attention usable.
+        causal = dict(attention_mask=PredefinedAttentionMask.CAUSAL)
+        torch.testing.assert_close(
+            attention(*inputs[1], **causal), attention._forward_unfused(*inputs[1], **causal)
+        )
+        with pytest.raises(ValueError, match="sum to"):
+            attention(*inputs[1])
+    finally:
+        del graph
+        release_ulysses_exchanges(dist.group.WORLD)
+
+
+@torch.inference_mode()
+def _logic_stream_handoff_and_retry(rank: int, world_size: int) -> None:
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
+
+    inner = VanillaAttention(num_heads=2, head_dim=64)
+    attention = UlyssesAttention(inner, dist.group.WORLD, ulysses_head_plan="per_head")
+    torch.manual_seed(105 + rank)
+    inputs = [
+        torch.randn(1, 128, 3, 2 * world_size, 64, device="cuda", dtype=torch.bfloat16).unbind(2)
+        for _ in range(2)
+    ]
+    refs = [attention._forward_unfused(*qkv) for qkv in inputs]
+    try:
+        # Allocate and warm the pool before testing a stream switch without a host barrier.
+        attention(*inputs[0])
+        producer = torch.cuda.current_stream()
+        streams = [torch.cuda.Stream() for _ in inputs]
+        outputs = []
+        for stream, qkv in zip(streams, inputs, strict=True):
+            stream.wait_stream(producer)
+            with torch.cuda.stream(stream):
+                outputs.append(attention(*qkv))
+        for stream in streams:
+            producer.wait_stream(stream)
+        for actual, ref in zip(outputs, refs, strict=True):
+            torch.testing.assert_close(actual, ref)
+        graph = torch.cuda.CUDAGraph()
+        with resolved_extra_keys_scope({}), torch.cuda.graph(graph):
+            captured = attention(*inputs[0])
+        # The next request can replay immediately after an all-rank failure, bypassing Python.
+        with patch.object(inner, "forward_head_group", side_effect=RuntimeError("injected")):
+            with pytest.raises(RuntimeError, match="injected"):
+                attention(*inputs[0])
+        for fixed, replacement in zip(*inputs, strict=True):
+            fixed.copy_(replacement)
+        graph.replay()
+        torch.testing.assert_close(captured, refs[1])
+        del graph
+        torch.testing.assert_close(attention(*inputs[1]), refs[1])
+    finally:
+        release_ulysses_exchanges(dist.group.WORLD)
+
+
+@torch.inference_mode()
+def _logic_whole_group_dynamic_fp8(rank: int, world_size: int) -> None:
+    from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    inner = CuTeDSLAttention(
+        num_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        quant_attention_config=QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8"),
+    )
+    attention = UlyssesAttention(inner, dist.group.WORLD, ulysses_head_plan="whole")
+    torch.manual_seed(92 + rank)
+    qkv = [
+        torch.randn(1, 64, world_size * 2, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    # Make the amax differ between the two heads on each destination and between senders.
+    for x in qkv:
+        x[:, :, ::2].mul_(16 * (rank + 1))
+    try:
+        with patch.object(attention, "_supports_head_groups", return_value=False):
+            reference = attention(*qkv)
+        with patch.object(inner, "forward_head_group", wraps=inner.forward_head_group) as fmha:
+            actual = attention(*qkv)
+        assert fmha.call_count == 1
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        split = UlyssesAttention(inner, dist.group.WORLD, ulysses_head_plan="per_head")
+        assert not split._supports_head_groups(*qkv, {})
+    finally:
+        release_ulysses_exchanges(dist.group.WORLD)
 
 
 def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
@@ -874,6 +1074,16 @@ class TestUlyssesAttention:
         run_test_in_distributed(
             world_size=2, test_fn=_logic_ulysses_vs_standard_multi_gpu, use_cuda=True
         )
+
+    @pytest.mark.parametrize("world_size", [2, 4])
+    def test_head_chunked_exchange(self, world_size: int) -> None:
+        _run_ce_test(_logic_head_chunked_exchange, world_size=world_size)
+
+    def test_stream_handoff_and_retry(self) -> None:
+        _run_ce_test(_logic_stream_handoff_and_retry)
+
+    def test_whole_group_dynamic_fp8(self) -> None:
+        _run_ce_test(_logic_whole_group_dynamic_fp8, world_size=4)
 
     def test_ulysses_with_key_padding_mask_parity(self):
         """Padded Q=K=V + key_padding_mask: valid Q rows match unpadded SDPA.

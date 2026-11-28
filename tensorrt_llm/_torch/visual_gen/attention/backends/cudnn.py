@@ -736,7 +736,9 @@ class CuDNNAttention(AttentionBackend):
                     pass
             return scales
 
-    def _validate_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+    def _validate_inputs(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, head_group: bool = False
+    ) -> None:
         for name, tensor in (("q", q), ("k", k), ("v", v)):
             if tensor.dim() != 4:
                 raise ValueError(
@@ -753,7 +755,7 @@ class CuDNNAttention(AttentionBackend):
                 f"cuDNN backend was configured with head_dim={self.head_dim}, "
                 f"but received head_dim={q.shape[3]}."
             )
-        if q.shape[2] != self.num_heads:
+        if q.shape[2] != self.num_heads and not (head_group and 0 < q.shape[2] < self.num_heads):
             raise ValueError(
                 f"cuDNN backend was configured with num_heads={self.num_heads}, "
                 f"but received num_heads={q.shape[2]}."
@@ -780,8 +782,10 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         is_causal: bool,
         with_lse: bool,
+        *,
+        head_group: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        self._validate_inputs(q, k, v)
+        self._validate_inputs(q, k, v, head_group=head_group)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
@@ -916,6 +920,10 @@ class CuDNNAttention(AttentionBackend):
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
+        return output
+
+    def forward_head_group(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs):
+        output, _ = self._run(q, k, v, is_causal=False, with_lse=False, head_group=True)
         return output
 
     def forward_with_lse(

@@ -317,6 +317,7 @@ class Attention(nn.Module):
             enable_sequence_parallel=enable_sequence_parallel,
             use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
+            ulysses_head_plan=config.parallel.ulysses_head_plan,
         )
 
     @staticmethod

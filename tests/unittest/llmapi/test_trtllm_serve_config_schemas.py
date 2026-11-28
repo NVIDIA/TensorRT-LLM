@@ -294,6 +294,12 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"watermark_config": {"key": 1, "algorithm": "synthid"}}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"ulysses_head_plan": "2, 3, 2"}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"parallel_config": {"ulysses_head_plan": "rest,rest"}},
+            False,
+        ),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (
             generator.VISUAL_GEN_SCHEMA,

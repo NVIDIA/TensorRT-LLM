@@ -23,8 +23,7 @@ identically on every rank and (c) allocated once, outside CUDA-graph capture.
 ``torch.distributed._symmetric_memory`` gives exactly that: ``empty`` + ``rendezvous`` return a
 handle whose ``get_buffer(peer, ...)`` is a tensor view of the peer's copy of the allocation and
 whose signal pad carries the ``put_signal`` / ``wait_signal`` flags that order a consumer's reads
-after a producer's copies. Nothing in the tree uses the pool yet: the first follow-up is the
-copy-engine all-gather of VisualGen's token-sharded tensor parallelism. Each
+after a producer's copies. CeTransport uses these flags to order peer copies and reads. Each
 :class:`SymmMemPool` is one allocation; a group may carry several (one per protocol), nothing
 ties a group to one.
 
@@ -35,8 +34,9 @@ A :class:`PoolLayout` carves the allocation into ``slots`` slots of ``world_size
 rank ``r``: it holds the bytes rank ``r`` pushed into that slot on every rank. A producer writes
 its own region inside a peer's buffer (:meth:`SymmMemPool.peer_region`); a consumer reads source
 ``src``'s region of its local buffer (:meth:`SymmMemPool.region`). What the bytes mean (payload,
-scales, ...) is the caller's layout, expressed as ``(offset, nbytes)`` inside a region. Several
-slots let boundary ``b + 1`` be pushed while slot ``b`` is still being read.
+scales, ...) is the caller's layout, expressed as ``(offset, nbytes)`` inside a region. For
+rank-interleaved writes, :meth:`SymmMemPool.peer_slot` exposes the whole slot. The caller must
+assign disjoint addresses to senders. Several slots let a new boundary start during a read.
 
 Addressing
 ----------
@@ -141,6 +141,7 @@ from types import ModuleType
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
@@ -148,6 +149,7 @@ __all__ = [
     "DEFAULT_ALIGN",
     "DEFAULT_TIMEOUT_MS",
     "PoolLayout",
+    "SymmMemAllocationError",
     "SymmMemPool",
     "probe_symmetric_memory",
 ]
@@ -165,6 +167,7 @@ disables the deadline."""
 
 _SIGNAL_BYTES = 4  # one uint32 flag per (channel, rank) on the signal pad
 _MARKER_BYTES = 8  # one int64 marker per rank for the addressing check
+_MAX_WAIT_DESCRIPTORS = 128  # Keep graph-visible addresses stable and bound storage per allocation.
 
 
 def _symm_mem() -> ModuleType:
@@ -384,6 +387,10 @@ def _local_preconditions(group: dist.ProcessGroup, device: torch.device) -> list
 # =============================================================================
 
 
+class SymmMemAllocationError(RuntimeError):
+    """Every rank agreed that the requested allocation failed and released it."""
+
+
 class SymmMemPool:
     """A symmetric-memory allocation shared by the ranks of a process group, carved by a
     :class:`PoolLayout`.
@@ -435,6 +442,8 @@ class SymmMemPool:
         self._base_offset: int = 0  # bytes from the block's data buffer start to the pool tensor
         self._pad_nbytes: int = 0  # the signal pad size the current allocation was made with
         self._peer_buffers: dict[int, torch.Tensor] = {}
+        self._wait_indices: dict[tuple[tuple[int, int], ...], torch.Tensor] = {}
+        self._local_signal_pad: torch.Tensor | None = None
 
     # --- state ------------------------------------------------------------------------------
 
@@ -529,13 +538,11 @@ class SymmMemPool:
             Whether a new allocation was made.
 
         Raises:
-            RuntimeError: Under CUDA-graph capture, on an unsupported group or device, when the
-                ranks hold the pool in different states, and with the agreed reason when the
-                allocation fails on any rank (``symm_mem.empty``, the rendezvous, a signal pad
-                that is too small or whose size differs across ranks, the addressing check).
-                Whatever a group collective raises
-                after the rendezvous propagates as well, with the allocation dropped without a
-                fence.
+            SymmMemAllocationError: The group agreed on an allocation failure (buffer,
+                rendezvous, signal pad or addressing check).
+            RuntimeError: Under CUDA-graph capture, on an unsupported group or device, or when
+                the ranks hold the pool in different states. A group collective error also
+                propagates.
             ValueError: On a non-positive request or when the ranks disagree on the alignment.
         """
         if _is_capturing():
@@ -589,7 +596,7 @@ class SymmMemPool:
             dist.barrier(group=self.group)
         ok, reason = self._allocate(agreed, min_channels)
         if not ok:
-            raise RuntimeError(f"SymmMemPool.reserve: {reason}")
+            raise SymmMemAllocationError(f"SymmMemPool.reserve: {reason}")
         logger.info(
             f"SymmMemPool[{self.group_name}]: reserved {agreed.slots} slot(s) x "
             f"{agreed.world_size} regions x {agreed.region_nbytes} B = "
@@ -820,6 +827,18 @@ class SymmMemPool:
             return self._buf[start:stop]
         return self._peer_buffer(peer)[start:stop]
 
+    def peer_slot(self, peer: int, slot: int) -> torch.Tensor:
+        """A whole slot on ``peer`` for collectives with rank-interleaved writes.
+
+        The caller assigns disjoint byte ranges to senders and synchronizes all reads and
+        writes. The view has the same lifetime and base offset as ``peer_region``.
+        """
+        self._require_reserved("peer_slot")
+        self._check_peer(peer, "peer_slot")
+        start = self._layout.region_start(slot, 0)
+        buf = self._buf if peer == self.rank else self._peer_buffer(peer)
+        return buf.narrow(0, start, self.slot_nbytes)
+
     def _peer_buffer(self, peer: int) -> torch.Tensor:
         view = self._peer_buffers.get(peer)
         if view is None:
@@ -845,6 +864,44 @@ class SymmMemPool:
         self._check_peer(src, "wait")
         self._check_channel(channel, "wait")
         self._handle.wait_signal(src, channel, self.timeout_ms)
+
+    def try_wait_many(self, signals: tuple[tuple[int, int], ...]) -> bool:
+        """Consume distinct flags in one kernel, or return False for an uncached set in capture.
+
+        The caller warms the kernel first. Eager calls prepare descriptors on the ordered
+        consumer stream. The first cached descriptors stay live until pool release so graphs
+        can reuse their addresses. Additional flag sets use temporary descriptors eagerly.
+        """
+        self._require_reserved("try_wait_many")
+        if not signals:
+            return True
+        indices = self._wait_indices.get(signals)
+        if indices is None:
+            if len(set(signals)) != len(signals):
+                raise ValueError("SymmMemPool.try_wait_many requires distinct signals.")
+            words = []
+            for src, channel in signals:
+                self._check_peer(src, "try_wait_many")
+                self._check_channel(channel, "try_wait_many")
+                # CUDA symmetric memory addresses its local uint32 pad by [channel, source].
+                words.append(channel * self.world_size + src)
+            if _is_capturing():
+                return False
+            words.extend([-1] * (-len(words) % 32))
+            host = torch.tensor(words, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned())
+            indices = host.to(self.device, non_blocking=True)
+            if self._local_signal_pad is None:
+                self._local_signal_pad = self._handle.get_signal_pad(
+                    self.rank, (self._pad_nbytes // _SIGNAL_BYTES,), torch.int32
+                )
+            if len(self._wait_indices) < _MAX_WAIT_DESCRIPTORS:
+                self._wait_indices[signals] = indices
+
+        from ._wait_many import wait_signal_words
+
+        assert self._local_signal_pad is not None
+        wait_signal_words(self._local_signal_pad, indices, self.timeout_ms)
+        return True
 
     # --- teardown ---------------------------------------------------------------------------
 
@@ -887,6 +944,8 @@ class SymmMemPool:
                         "pool was released; freeing without the fence."
                     )
         finally:
+            self._wait_indices.clear()
+            self._local_signal_pad = None
             self._peer_buffers.clear()
             self._handle = None
             self._buf = None

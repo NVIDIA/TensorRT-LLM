@@ -465,6 +465,14 @@
           "title": "Tp Size",
           "type": "integer"
         },
+        "ulysses_head_plan": {
+          "default": "auto",
+          "description": "Head groups for eligible copy-engine Ulysses attention. 'auto' chooses from the shape and GPU. Use 'whole', 'per_head', or ordered widths such as '2,3,2' summing to the head count per rank. A single 'rest' uses the remaining heads, as in '1,rest'. Unsupported paths keep their native execution.",
+          "pattern": "^\\s*(?:auto|whole|per_head|0*[1-9][0-9]*(?:\\s*,\\s*0*[1-9][0-9]*)*|(?:0*[1-9][0-9]*(?:\\s*,\\s*0*[1-9][0-9]*)*\\s*,\\s*)?rest(?:\\s*,\\s*0*[1-9][0-9]*(?:\\s*,\\s*0*[1-9][0-9]*)*)?)\\s*$",
+          "status": "prototype",
+          "title": "Ulysses Head Plan",
+          "type": "string"
+        },
         "ulysses_size": {
           "default": 1,
           "description": "Ulysses head-sharding degree. Heads are sharded across ulysses_size GPUs.",

@@ -135,6 +135,10 @@ class AttentionBackend(ABC):
     @abstractmethod
     def preferred_layout(self) -> AttentionTensorLayout: ...
 
+    def forward_head_group(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs):
+        """Run dense attention on a subset of local heads in this backend's preferred layout."""
+        return self.forward(q=q, k=k, v=v, **kwargs)
+
     def forward_with_lse(
         self,
         q: torch.Tensor,

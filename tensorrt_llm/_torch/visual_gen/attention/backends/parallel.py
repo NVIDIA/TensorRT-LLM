@@ -32,10 +32,15 @@ if TYPE_CHECKING:
     from ...mapping import VisualGenMapping
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
+from tensorrt_llm.visual_gen.args import _normalize_ulysses_head_plan
 
 from ....attention.backends.interface import PredefinedAttentionMask
+from .cudnn import CuDNNAttention
+from .cute_dsl import CuTeDSLAttention
 from .flash_attn4 import _install_cutlass_dsl_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
+from .ulysses_ce_exchange import HeadChunkedUlysses
+from .vanilla import VanillaAttention
 
 _flash_attn_combine_import_error = None
 try:
@@ -52,6 +57,17 @@ _REPLICATED_KV_KWARGS = (
     "replicated_k_lengths",
     "global_generated_seq_len",
 )
+
+# Layers using the same group, GPU and plan share the pool and signal channels.
+_ce_exchanges: dict[tuple[dist.ProcessGroup, torch.device, str], HeadChunkedUlysses] = {}
+
+
+def release_ulysses_exchanges(group: dist.ProcessGroup | None = None) -> None:
+    """Collectively release an exchange, or all exchanges at worker teardown."""
+    for key, exchange in list(_ce_exchanges.items()):
+        if group is None or group is key[0]:
+            exchange.close()
+            del _ce_exchanges[key]
 
 
 def _pop_replicated_kv(kwargs):
@@ -382,7 +398,11 @@ class UlyssesAttention(AttentionBackend):
         Step 3: All-to-All → [B, S/P, H, D] (restore sequence sharding)
         Output: [B, S/P, H, D] (sequence sharded)
 
-    Three modes:
+    Exchange modes:
+    - Head-chunked: on a supported single-node CUDA group, overlap the input and output
+      exchanges of neighboring head groups with dense attention. Selected automatically for
+      compatible BF16 inputs in eager mode and warmed VisualGen-managed CUDA graphs.
+      Layers share one scratch slot. Eager calls transfer slot ownership on stream changes.
     - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives).
     - Inner-backend fused QKV: selected via ``inner_backend.support_fused_qkv()``.
       Stacks Q/K/V into [B, S/P, 3, H, D], uses 1 fused 5D all-to-all, then
@@ -404,6 +424,7 @@ class UlyssesAttention(AttentionBackend):
         inner_backend: AttentionBackend,
         process_group: torch.distributed.ProcessGroup,
         async_ulysses: bool = False,
+        ulysses_head_plan: str = "auto",
     ):
         self.inner_backend = inner_backend
         self.process_group = process_group
@@ -413,10 +434,16 @@ class UlyssesAttention(AttentionBackend):
 
         self.head_dim = inner_backend.head_dim
         self.sharded_num_heads = inner_backend.num_heads
+        self._ce_head_plan = _normalize_ulysses_head_plan(ulysses_head_plan)
         self.sharded_num_kv_heads = getattr(inner_backend, "num_kv_heads", self.sharded_num_heads)
 
         self.world_size = torch.distributed.get_world_size(group=process_group)
         self._ulysses_rank = torch.distributed.get_rank(group=process_group)
+        # PyTorch's CUDA symmetric-memory rendezvous counts allocations across groups.
+        # Subgroup-only growth can desynchronize a later world-group rendezvous.
+        self._ce_full_group = self.world_size == dist.get_world_size(group=None)
+        self._ce_warmed_shapes: set[tuple[torch.Size, bool]] = set()
+        self._ce_last_native_shape: torch.Size | None = None
 
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
@@ -483,6 +510,25 @@ class UlyssesAttention(AttentionBackend):
         # grouped-query models take the per-tensor path, and so does the K/V cache
         # path, whose backends take q, k, v separately.
         kv = kwargs.get("kv")
+        if (
+            not torch.compiler.is_compiling()
+            and q.shape != self._ce_last_native_shape
+            and self._supports_head_groups(q, k, v, kwargs)
+        ):
+            key = (self.process_group, q.device, self._ce_head_plan)
+            exchange = _ce_exchanges.get(key)
+            capturing = torch.cuda.is_current_stream_capturing()
+            if exchange is None and not capturing:
+                exchange = _ce_exchanges[key] = HeadChunkedUlysses(*key)
+            signature = (q.shape, kwargs.get("key_padding_mask") is not None)
+            if exchange is not None and (not capturing or signature in self._ce_warmed_shapes):
+                output = exchange.forward(q, k, v, self.inner_backend, **kwargs)
+                if output is not None:
+                    if not capturing:
+                        self._ce_warmed_shapes.add(signature)
+                    return output
+                if not capturing:
+                    self._ce_last_native_shape = q.shape
         if self.inner_backend.support_fused_qkv() and q.shape[2] == k.shape[2] and kv is None:
             out = self._forward_fused(q, k, v, **kwargs)
         elif kv is None and self._supports_packed_self_attention(q, k, v, kwargs):
@@ -490,6 +536,71 @@ class UlyssesAttention(AttentionBackend):
         else:
             out = self._forward_unfused(q, k, v, **kwargs)
         return out
+
+    def _supports_head_groups(self, q, k, v, kwargs) -> bool:
+        if (
+            self._async_side_stream is not None
+            or self.process_group is None
+            or not self._ce_full_group
+            or self.world_size < 2
+            or self.sharded_num_heads < 2
+            or self.sharded_num_heads != self.sharded_num_kv_heads
+            or not q.is_cuda
+            or torch.is_grad_enabled()
+            or q.shape != k.shape
+            or q.shape != v.shape
+            or q.shape[2:] != (self.num_heads, self.head_dim)
+            or q.shape[0] == 0
+            or q.shape[1] == 0
+            or any(t.dtype != torch.bfloat16 or t.device != q.device for t in (q, k, v))
+        ):
+            return False
+        # Gates, cached/replicated KV and per-head metadata need their own redistribution.
+        scales = ("static_q_scale", "static_k_scale", "static_v_scale")
+        allowed = ("batch_size", "seq_len", "seq_len_kv", "attention_mask", "timestep", *scales)
+        backend = self.inner_backend
+        if type(backend) is VanillaAttention:
+            # MiniMax-H3 supplies a global [B,S] key mask, broadcast over all heads.
+            allowed += ("key_padding_mask", "valid_seq_len", "discard_padded_queries")
+            mask = kwargs.get("key_padding_mask")
+            if mask is not None and (
+                mask.shape != (q.shape[0], q.shape[1] * self.world_size)
+                or mask.device != q.device
+                or mask.dtype != torch.bool
+            ):
+                return False
+        if any(key not in allowed and value is not None for key, value in kwargs.items()):
+            return False
+        if (
+            kwargs.get("attention_mask", PredefinedAttentionMask.FULL)
+            != PredefinedAttentionMask.FULL
+        ):
+            return False
+        if type(backend) is VanillaAttention:
+            return True
+        if type(backend) is CuDNNAttention:
+            return backend.quant_dtype is None and backend.dtype == torch.bfloat16
+        if type(backend) is not CuTeDSLAttention or backend.sparse_params is not None:
+            return False
+        if backend.skip_softmax_threshold_scale is not None:
+            return False
+        quant = backend.quant_attention_config
+        # With one group, CuTe sees exactly the same per-rank tensor (and dynamic amax)
+        # as the NCCL path. Splitting heads requires fixed per-tensor Q/K/V scales.
+        whole = self._ce_head_plan in ("whole", "rest", str(self.sharded_num_heads))
+        return quant is None or (
+            quant.qk_dtype == quant.v_dtype == "fp8"
+            and all(
+                (whole and scale is None)
+                or (
+                    isinstance(scale, torch.Tensor)
+                    and scale.numel() == 1
+                    and scale.device == q.device
+                    and scale.dtype == torch.float32
+                )
+                for scale in (kwargs.get(s) for s in scales)
+            )
+        )
 
     def _supports_packed_self_attention(
         self,
@@ -1425,6 +1536,7 @@ def wrap_parallel_attention(
     enable_sequence_parallel: bool = True,
     use_ulysses: bool = True,
     async_ulysses: bool = False,
+    ulysses_head_plan: str = "auto",
     ulysses_group: Optional[dist.ProcessGroup] = None,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
@@ -1468,11 +1580,13 @@ def wrap_parallel_attention(
                 attn,
                 process_group=ulysses_group,
                 async_ulysses=async_ulysses,
+                ulysses_head_plan=ulysses_head_plan,
             )
     elif ulysses_size > 1 and use_ulysses:
         attn = UlyssesAttention(
             attn,
             process_group=vgm.ulysses_group,
             async_ulysses=async_ulysses,
+            ulysses_head_plan=ulysses_head_plan,
         )
     return attn

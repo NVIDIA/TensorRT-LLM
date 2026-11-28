@@ -27,6 +27,11 @@ _RESOLVED_EXTRA_KEYS: contextvars.ContextVar[Optional[Dict[str, Any]]] = context
 )
 
 
+def in_cuda_graph_runner_scope() -> bool:
+    """Whether the VisualGen runner owns this warmup or capture."""
+    return _RESOLVED_EXTRA_KEYS.get() is not None
+
+
 def resolved_extra_key(name: str) -> Any:
     """Return the extra-key value `name` resolved for the call being captured, else None.
 

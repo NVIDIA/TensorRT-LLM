@@ -20,11 +20,12 @@ cross-cutting sub-configs it composes. All fields carry
 subject to breaking changes.
 """
 
+import re
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import yaml
-from pydantic import field_validator, model_validator
+from pydantic import AfterValidator, field_validator, model_validator
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
@@ -418,6 +419,24 @@ class VAEConfig(StrictBaseModel):
     )
 
 
+_HEAD_WIDTH = r"0*[1-9][0-9]*"
+_HEAD_WIDTH_LIST = rf"{_HEAD_WIDTH}(?:\s*,\s*{_HEAD_WIDTH})*"
+# An explicit plan contains positive widths, with at most one "rest" between them.
+_HEAD_PLAN = re.compile(
+    rf"^\s*(?:auto|whole|per_head|"
+    rf"{_HEAD_WIDTH_LIST}|(?:{_HEAD_WIDTH_LIST}\s*,\s*)?rest(?:\s*,\s*{_HEAD_WIDTH_LIST})?)\s*$"
+)
+
+
+def _normalize_ulysses_head_plan(value: str) -> str:
+    """Normalize widths before the model's local head count is known."""
+    if not _HEAD_PLAN.fullmatch(value):
+        raise ValueError(
+            "Expected a Ulysses plan name or positive head widths with at most one 'rest'."
+        )
+    return ",".join(part.strip().lstrip("0") for part in value.split(","))
+
+
 class ParallelConfig(StrictBaseModel):
     """Configuration for distributed parallelism across DiT-shaped models.
 
@@ -452,6 +471,17 @@ class ParallelConfig(StrictBaseModel):
         ge=1,
         status="prototype",
         description=("Ulysses head-sharding degree. Heads are sharded across ulysses_size GPUs."),
+    )
+    ulysses_head_plan: Annotated[str, AfterValidator(_normalize_ulysses_head_plan)] = Field(
+        "auto",
+        status="prototype",
+        json_schema_extra={"pattern": _HEAD_PLAN.pattern},
+        description=(
+            "Head groups for eligible copy-engine Ulysses attention. 'auto' chooses from the "
+            "shape and GPU. Use 'whole', 'per_head', or ordered "
+            "widths such as '2,3,2' summing to the head count per rank. A single 'rest' uses "
+            "the remaining heads, as in '1,rest'. Unsupported paths keep their native execution."
+        ),
     )
     async_ulysses: bool = Field(
         False,

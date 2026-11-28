@@ -227,6 +227,7 @@ class LTX2Attention(Attention):
                 enable_sequence_parallel=enable_sp,
                 use_ulysses=True,
                 async_ulysses=self._use_async_ulysses,
+                ulysses_head_plan=config.parallel.ulysses_head_plan,
                 ulysses_group=stage2_ulysses_group,
             )
 

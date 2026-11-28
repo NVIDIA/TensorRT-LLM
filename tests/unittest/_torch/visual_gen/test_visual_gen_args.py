@@ -737,11 +737,12 @@ class TestVisualGenArgsFromYaml:
     def test_from_yaml_basic(self, tmp_path):
         yaml_path = tmp_path / "config.yml"
         yaml_path.write_text(
-            "model: /tmp/model\nparallel_config:\n  cfg_size: 2\n  ulysses_size: 1\n"
+            'model: /tmp/model\nparallel_config:\n  cfg_size: 2\n  ulysses_size: 2\n  ulysses_head_plan: "2, 3, 2"\n'
         )
         args = VisualGenArgs.from_yaml(yaml_path)
         assert args.model == "/tmp/model"
         assert args.parallel_config.cfg_size == 2
+        assert args.parallel_config.ulysses_head_plan == "2,3,2"
 
     def test_from_yaml_with_overrides(self, tmp_path):
         yaml_path = tmp_path / "config.yml"
@@ -810,6 +811,32 @@ class TestParallelConfigValidation:
     def test_seq_parallel_size_ulysses(self):
         pc = ParallelConfig(ulysses_size=4)
         assert pc.seq_parallel_size == 4
+        assert pc.ulysses_head_plan == "auto"
+
+    @pytest.mark.parametrize(
+        ("plan", "groups"),
+        [
+            ("auto", (1, 5, 1)),
+            ("whole", (7,)),
+            ("per_head", (1,) * 7),
+            ("1,rest", (1, 6)),
+            ("2, 3, 2", (2, 3, 2)),
+        ],
+    )
+    def test_ulysses_head_plan(self, plan, groups):
+        from tensorrt_llm._torch.visual_gen.attention.backends.ulysses_ce_exchange import (
+            plan_head_groups,
+        )
+
+        normalized = ParallelConfig(ulysses_head_plan=plan).ulysses_head_plan
+        assert plan_head_groups(7, 37800, 1, 148, normalized) == groups
+
+    @pytest.mark.parametrize(
+        "plan", ["unknown", "first_small", "ends_small", "0,rest", "rest,rest", "1,,2"]
+    )
+    def test_invalid_ulysses_head_plan(self, plan):
+        with pytest.raises(ValidationError, match="ulysses_head_plan"):
+            ParallelConfig(ulysses_size=2, ulysses_head_plan=plan)
 
     def test_attn2d_default_is_disabled(self):
         pc = ParallelConfig()
