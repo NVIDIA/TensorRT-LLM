@@ -83,6 +83,36 @@ _RUNTIME_MEMORY_TYPES = tuple(
                            ExecutorMemoryType.INIT_EXTRA_RESOURCES))
 
 
+def _release_unsubmitted_exports(
+        multimodal_params: Optional[MultimodalParams],
+        handoff: Optional[DisaggregatedParams]) -> None:
+    """Release the exports of a request that fails before the executor gets it.
+
+    Pass the preprocessed `multimodal_params` once preprocessing has returned,
+    otherwise the raw `handoff`; it then holds the only reference to each handle.
+    """
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    if multimodal_params is not None:
+        try:
+            multimodal_params.release_handles()
+        except Exception as error:
+            logger.error(
+                f"Failed to release unsubmitted request exports: {error}")
+        return
+    if handoff is None:
+        return
+    for handle in (*(handoff.multimodal_embedding_handles or ()),
+                   handoff.mrope_position_ids_handle,
+                   handoff.mrope_position_deltas_handle):
+        if handle is None:
+            continue
+        try:
+            SharedTensorContainer.release_dict(handle)
+        except Exception as error:
+            logger.error(
+                f"Failed to release an unsubmitted request export: {error}")
+
+
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
 
@@ -865,73 +895,83 @@ class BaseLLM:
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
         """
-        if self._encode_only:
-            raise RuntimeError(
-                "generate_async() is not available when encode_only=True. "
-                "Use llm.encode() for encoder-only models.")
+        preprocessed = isinstance(inputs, PreprocessedInputs)
+        multimodal_params = inputs.multimodal_params if preprocessed else None
+        try:
+            if self._encode_only:
+                raise RuntimeError(
+                    "generate_async() is not available when encode_only=True. "
+                    "Use llm.encode() for encoder-only models.")
 
-        # Check if the worker is shutting down
-        if self._executor is None or self._executor.is_shutdown():
-            raise RuntimeError("LLM is shutting down")
+            # Check if the worker is shutting down
+            if self._executor is None or self._executor.is_shutdown():
+                raise RuntimeError("LLM is shutting down")
 
-        sampling_params = self._prepare_sampling_params(sampling_params)
+            sampling_params = self._prepare_sampling_params(sampling_params)
 
-        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
-        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
-        is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
-        is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+            # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+            # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+            is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
+            is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
 
-        if is_ctx_only:
-            sampling_params.max_tokens = 1
-            self._configure_bart_decoder_prefix(sampling_params)
+            if is_ctx_only:
+                sampling_params.max_tokens = 1
+                self._configure_bart_decoder_prefix(sampling_params)
 
-        if isinstance(inputs, PreprocessedInputs):
-            prompt_token_ids = inputs.prompt_token_ids
-            prompt = None
-            multimodal_params = inputs.multimodal_params
-            preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
-            if preprocessed_encoder_input_token_ids is not None:
-                preprocessed_encoder_input_token_ids = self._normalize_token_ids(
-                    preprocessed_encoder_input_token_ids,
-                    "inputs.encoder_input_token_ids")
-            encoder_input_token_ids = preprocessed_encoder_input_token_ids
-            if (encoder_input_token_ids is not None
-                    and self._is_encoder_decoder_model()):
-                prompt_token_ids = self._get_decoder_prompt_token_ids(
-                    sampling_params)
-        else:
-            (prompt_token_ids, prompt, multimodal_params,
-             encoder_input_token_ids) = self._preprocess(
-                 inputs,
-                 sampling_params,
-                 disaggregated_params,
-             )
+            if isinstance(inputs, PreprocessedInputs):
+                prompt_token_ids = inputs.prompt_token_ids
+                prompt = None
+                multimodal_params = inputs.multimodal_params
+                preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
+                if preprocessed_encoder_input_token_ids is not None:
+                    preprocessed_encoder_input_token_ids = self._normalize_token_ids(
+                        preprocessed_encoder_input_token_ids,
+                        "inputs.encoder_input_token_ids")
+                encoder_input_token_ids = preprocessed_encoder_input_token_ids
+                if (encoder_input_token_ids is not None
+                        and self._is_encoder_decoder_model()):
+                    prompt_token_ids = self._get_decoder_prompt_token_ids(
+                        sampling_params)
+            else:
+                (prompt_token_ids, prompt, multimodal_params,
+                 encoder_input_token_ids) = self._preprocess(
+                     inputs,
+                     sampling_params,
+                     disaggregated_params,
+                 )
+                preprocessed = True
 
-        if (not self.args.mm_encoder_only and disaggregated_params is not None
-                and disaggregated_params.multimodal_input_layout is not None):
-            disaggregated_params = replace(disaggregated_params,
-                                           multimodal_input_layout=None)
+            if (not self.args.mm_encoder_only
+                    and disaggregated_params is not None and
+                    disaggregated_params.multimodal_input_layout is not None):
+                disaggregated_params = replace(disaggregated_params,
+                                               multimodal_input_layout=None)
 
-        if (self.args.mm_encoder_only
-                and multimodal_params is not None and isinstance(
-                    self.input_processor, BaseMultimodalInputProcessor)):
-            encoder_layout = self.input_processor.get_disagg_prefill_inputs(
-                prompt_token_ids, multimodal_params)
-            if encoder_layout is not None:
-                disaggregated_params = replace(
-                    disaggregated_params or
-                    DisaggregatedParams(request_type="context_and_generation"),
-                    multimodal_input_layout=encoder_layout)
+            if (self.args.mm_encoder_only
+                    and multimodal_params is not None and isinstance(
+                        self.input_processor, BaseMultimodalInputProcessor)):
+                encoder_layout = self.input_processor.get_disagg_prefill_inputs(
+                    prompt_token_ids, multimodal_params)
+                if encoder_layout is not None:
+                    disaggregated_params = replace(
+                        disaggregated_params or DisaggregatedParams(
+                            request_type="context_and_generation"),
+                        multimodal_input_layout=encoder_layout)
 
-        arrival_time = steady_clock_now(
-        ) if self.args.return_perf_metrics else None
+            arrival_time = steady_clock_now(
+            ) if self.args.return_perf_metrics else None
 
-        self._check_arguments(len(prompt_token_ids),
-                              sampling_params,
-                              is_gen_only=is_gen_only)
-        if _postproc_params:
-            _postproc_params.postproc_args.num_prompt_tokens = len(
-                prompt_token_ids)
+            self._check_arguments(len(prompt_token_ids),
+                                  sampling_params,
+                                  is_gen_only=is_gen_only)
+            if _postproc_params:
+                _postproc_params.postproc_args.num_prompt_tokens = len(
+                    prompt_token_ids)
+        except BaseException:
+            _release_unsubmitted_exports(
+                multimodal_params,
+                None if preprocessed else disaggregated_params)
+            raise
         result = self._executor.generate_async(
             prompt_token_ids,
             sampling_params=sampling_params,
@@ -1212,13 +1252,17 @@ class BaseLLM:
             tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be
                 passed directly to :meth:`generate_async` as `inputs`.
         """
-        sampling_params = self._prepare_sampling_params(sampling_params)
-        (prompt_token_ids, _prompt, multimodal_params,
-         encoder_input_token_ids) = self._preprocess(
-             inputs,
-             sampling_params,
-             disaggregated_params,
-         )
+        try:
+            sampling_params = self._prepare_sampling_params(sampling_params)
+            (prompt_token_ids, _prompt, multimodal_params,
+             encoder_input_token_ids) = self._preprocess(
+                 inputs,
+                 sampling_params,
+                 disaggregated_params,
+             )
+        except BaseException:
+            _release_unsubmitted_exports(None, disaggregated_params)
+            raise
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,
