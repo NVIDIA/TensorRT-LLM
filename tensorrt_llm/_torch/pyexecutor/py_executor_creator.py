@@ -1515,6 +1515,8 @@ def _create_py_executor(
         log_memory_usage("after loading weights")
 
     estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+    if estimating_kv_cache:
+        Distributed.pause_startup_record()
 
     # Resources each executor owns are named for the final executor only.
     monitor_startup.set_sizing_pass(estimating_kv_cache)
@@ -1638,6 +1640,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
+            Distributed.resume_startup_record()
             monitor_startup.set_sizing_pass(False)
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):

@@ -84,9 +84,10 @@ def _cleanup_group(pgid: int, grace: int, signum: int) -> None:
     _signal_group(pgid, signal.SIGKILL)
 
 
-def _arm_parent_death_signal() -> None:
+def _arm_parent_death_signal() -> bool:
+    """Return whether the parent-death signal is armed."""
     if not sys.platform.startswith("linux"):
-        return
+        return False
     libc = ctypes.CDLL(None, use_errno=True)
     prctl = libc.prctl
     prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
@@ -99,6 +100,8 @@ def _arm_parent_death_signal() -> None:
             file=sys.stderr,
             flush=True,
         )
+        return False
+    return True
 
 
 def _exec_payload(command: list[str], gate_read: int, gate_write: int, role: str) -> None:

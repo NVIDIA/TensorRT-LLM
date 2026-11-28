@@ -390,6 +390,7 @@ class ADPRouter(ABC):
         include_kv_cache_load: bool = False,
         num_pending_new_requests: int = 0,
         iter_stats_enabled: bool = False,
+        has_pending_context_retirement: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -419,6 +420,8 @@ class ADPRouter(ABC):
             iter_stats_enabled: Whether iteration stats are collected. It must be
                 identical on every rank (config-derived, not "a payload is
                 pending"), because it picks the collective.
+            has_pending_context_retirement: Whether a context request on this
+                rank awaits the retirement of its KV send.
         """
         local_state = self._build_local_rank_state(
             active_requests,
@@ -428,17 +431,19 @@ class ADPRouter(ABC):
             forward_work,
             num_connector_transfers,
             connector_poll_failed,
+            has_pending_context_retirement,
         )
         serialized = local_state.serialize(include_kv_cache_load)
         if iter_stats_enabled:
             # The iteration payload carries a float hit rate and a KV snapshot
             # that only some ranks hold, so its width and types differ between
             # ranks; only the object gather carries that.
-            return [RankState.deserialize(data=resp) for resp in self.dist.tp_allgather(serialized)]
+            responses = self.dist.tp_allgather(serialized, active_only=True)
+            return [RankState.deserialize(data=resp) for resp in responses]
         # Without iteration stats the serialized RankState is a fixed-size flat
         # int list: one int64 gather instead of an object allgather's size
         # exchange plus pickling, on the per-iteration hot path.
-        responses = self.dist.tp_allgather_int64(serialized)
+        responses = self.dist.tp_allgather_int64(serialized, active_only=True)
         return [RankState.deserialize(data=resp.tolist()) for resp in responses]
 
     def gather_all_rank_states_with_extras(
@@ -449,6 +454,7 @@ class ADPRouter(ABC):
         iter_stats_payload: RankIterStatsPayload | None = None,
         include_kv_cache_load: bool = False,
         num_pending_new_requests: int = 0,
+        has_pending_context_retirement: bool = False,
     ) -> tuple[list[RankState], list[list[int]]]:
         """``gather_all_rank_states`` with extra per-rank ints on the same allgather.
 
@@ -461,7 +467,11 @@ class ADPRouter(ABC):
         The router's own state construction and routing logic are untouched.
         """
         local_state = self._build_local_rank_state(
-            active_requests, None, iter_stats_payload, num_pending_new_requests
+            active_requests,
+            None,
+            iter_stats_payload,
+            num_pending_new_requests,
+            has_pending_context_retirement=has_pending_context_retirement,
         )
         state_ints = local_state.serialize(include_kv_cache_load)
         width = len(state_ints)
@@ -479,6 +489,7 @@ class ADPRouter(ABC):
         forward_work: tuple[int, int] | None = None,
         num_connector_transfers: int = 0,
         connector_poll_failed: bool = False,
+        has_pending_context_retirement: bool = False,
     ) -> RankState:
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -494,6 +505,7 @@ class ADPRouter(ABC):
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
         local_state.num_connector_transfers = num_connector_transfers
         local_state.connector_poll_failed = connector_poll_failed
+        local_state.has_pending_context_retirement = has_pending_context_retirement
         if self.dist.has_cp_helix:
             self._use_max_load_across_cp(local_state)
         return local_state
@@ -508,11 +520,11 @@ class ADPRouter(ABC):
             iter_stats_payload: Pending iteration stats payload, if any.
 
         Returns:
-            One state per DP rank, holding its rank and iteration stats and no load.
+            One state per active DP rank, holding its rank and iteration stats and no load.
         """
         local_state = RankState(rank=self.dist.tp_rank)
         local_state.copy_iter_stats_from(iter_stats_payload)
-        responses = self.dist.tp_allgather(local_state.serialize())
+        responses = self.dist.tp_allgather(local_state.serialize(), active_only=True)
         return [RankState.deserialize(data=resp) for resp in responses]
 
     def _use_max_load_across_cp(self, local_state: RankState) -> None:
@@ -559,15 +571,32 @@ class ADPRouter(ABC):
             The requests to admit, and the ranks planned for them (request id ->
             rank) to pass to ``route_requests``; empty when no ranks are planned.
         """
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        if len(all_rank_states) < self.dist.tp_size:
+            # A rank left out of the gather has no free slot, so a request only it may take
+            # stays queued.
+            all_ranks_num_active_requests = self._values_by_rank(
+                all_rank_states, all_ranks_num_active_requests, absent=max_num_active_requests
+            )
         requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=True,
             max_num_active_requests=max_num_active_requests,
-            all_ranks_num_active_requests=[s.num_active_requests for s in all_rank_states],
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
             router=self,
         )
         return requests, {}
+
+    def _values_by_rank(
+        self, all_rank_states: list[RankState], values: list[int], absent: int = 0
+    ) -> list[int]:
+        """Return the values of the ranks in an active-only gather indexed by rank, with
+        ``absent`` for the ranks it left out."""
+        by_rank = [absent] * self.dist.tp_size
+        for state, value in zip(all_rank_states, values):
+            by_rank[state.rank] = value
+        return by_rank
 
     @staticmethod
     def _assign_explicit_dp_ranks(
@@ -590,6 +619,8 @@ class ADPRouter(ABC):
             if (
                 target_dp_rank is not None
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+                # A failed target rank is not in this step's gather.
+                and target_dp_rank in all_ranks_new_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
                 all_ranks_new_requests[target_dp_rank].append(req_item)
@@ -780,6 +811,13 @@ class DefaultADPRouter(ADPRouter):
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+        if tp_size < self.dist.tp_size:
+            all_ranks_num_active_requests = self._values_by_rank(
+                all_rank_states, all_ranks_num_active_requests
+            )
+            all_ranks_num_active_tokens = self._values_by_rank(
+                all_rank_states, all_ranks_num_active_tokens
+            )
 
         if placement:
             # Admitted by KV-balanced admission: place them as planned.
@@ -856,8 +894,13 @@ class DefaultADPRouter(ADPRouter):
             return all_ranks_new_requests
 
         all_ranks_new_requests_heap = [
-            HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
-            for tp_rank, val in enumerate(all_ranks_num_active_requests)
+            HeapVal(
+                all_ranks_num_active_tokens[tp_rank],
+                all_ranks_num_active_requests[tp_rank],
+                tp_rank,
+                [],
+            )
+            for tp_rank in all_ranks_new_requests
         ]
 
         all_ranks_new_requests_heap = [
@@ -964,6 +1007,7 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         num_active_tokens = sum(_active_tokens(req) for req in active_requests)
         n_active_for_state = len(active_requests)
+        num_in_transfer_requests = 0
 
         # Fold in requests mid KV-transfer to GEN; they are removed from
         # active_requests but still counted as per-rank load. Gated behind
@@ -973,12 +1017,14 @@ class KVCacheAwareADPRouter(ADPRouter):
         if self.account_for_in_transfer and self.async_transfer_manager is not None:
             in_transfer = self.async_transfer_manager.requests_in_transfer()
             num_active_tokens += sum(_active_tokens(r) for r in in_transfer.values())
-            n_active_for_state += len(in_transfer)
+            num_in_transfer_requests = len(in_transfer)
+            n_active_for_state += num_in_transfer_requests
 
         return RankState(
             rank=self.dist.tp_rank,
             num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
+            num_in_transfer_requests=num_in_transfer_requests,
         )
 
     def gather_prefix_matches(

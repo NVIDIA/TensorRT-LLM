@@ -114,6 +114,8 @@ class DisaggTransferCoordinator:
         defer_unready_gen_receives: bool = False,
     ) -> None:
         self._transceiver = transceiver
+        # The transceiver selects its ownership profile when it is built.
+        self._logical_context_cancellation_enabled = self.supports_logical_context_cancellation()
         self._transfers = transfer_manager
         self._kv_cache_manager = kv_cache_manager
         self._draft_kv_cache_manager = draft_kv_cache_manager
@@ -1151,6 +1153,16 @@ class DisaggTransferCoordinator:
         """
         supports = getattr(self._transceiver, "supports_logical_context_cancellation", None)
         return callable(supports) and supports(request) is True
+
+    @property
+    def logical_context_cancellation_enabled(self) -> bool:
+        """Whether any request can take logical context cancellation.
+
+        The runtime capability of ``supports_logical_context_cancellation``,
+        read once when the coordinator is built, so that per-iteration checks
+        need no transceiver call.
+        """
+        return self._logical_context_cancellation_enabled
 
     def request_logical_context_cancellation(self, request: LlmRequest) -> bool:
         """Accept a qualified context cancellation without freeing its KV.
