@@ -167,6 +167,10 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires numIoThreads > 0");
     }
+    if (writeBehindBytes > 0 && numIoThreads == 0)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: writeBehindBytes requires numIoThreads > 0");
+    }
     if (!(protectedCopyFraction >= 0.0F && protectedCopyFraction <= 1.0F)) // also rejects NaN
     {
         throw std::invalid_argument("DiskCacheTierConfig: protectedCopyFraction must be between 0 and 1");
@@ -338,6 +342,26 @@ void KVCacheManagerConfig::validate() const
 
     poolRebalance.validate();
     hostMemBacking.validate();
+    if (hostCopyThreads < 1 || hostCopyThreads > kMaxHostCopyThreads)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: hostCopyThreads must be between 1 and " + std::to_string(kMaxHostCopyThreads));
+    }
+    if (copyStreamBusySkip < 0 || copyStreamBusySkip > kMaxCopyStreamBusySkip)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: copyStreamBusySkip must be between 0 and " + std::to_string(kMaxCopyStreamBusySkip));
+    }
+    if (pageStagingMiB < 1 || pageStagingMiB > kMaxPageStagingMiB)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: pageStagingMiB must be between 1 and " + std::to_string(kMaxPageStagingMiB));
+    }
+    if (pageStagingDepth < 1 || pageStagingDepth > kMaxPageStagingDepth)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: pageStagingDepth must be between 1 and " + std::to_string(kMaxPageStagingDepth));
+    }
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

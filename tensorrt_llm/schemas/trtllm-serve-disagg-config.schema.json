@@ -2360,6 +2360,136 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "defer_context_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_context_only_release"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "deferred_release_thread": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "deferred_release_thread"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "context_claim_ahead": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "context_claim_ahead"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "context_prefetch_blocks": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "context_prefetch_blocks"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
         }
       ],
       "properties": {
@@ -5764,6 +5894,192 @@
         {
           "if": {
             "properties": {
+              "defer_context_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_context_only_release"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "deferred_release_thread": {
+                "const": true
+              }
+            },
+            "required": [
+              "deferred_release_thread"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_claim_ahead": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_claim_ahead"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_prefetch_blocks": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_prefetch_blocks"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "deferred_release_thread": {
+                "const": true
+              }
+            },
+            "required": [
+              "deferred_release_thread"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "defer_generation_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_generation_only_release"
+                ]
+              },
+              {
+                "properties": {
+                  "defer_context_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_context_only_release"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_claim_ahead": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_claim_ahead"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enable_block_reuse": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_prefetch_blocks": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_prefetch_blocks"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enable_block_reuse": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_staging_depth": {
+                "minimum": 2,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "page_staging_depth"
+            ]
+          },
+          "then": {
+            "properties": {
+              "copy_stream_busy_skip": {
+                "maximum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
               "remote_cache_config": {
                 "properties": {
                   "level": {
@@ -5837,11 +6153,36 @@
           "description": "Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset.",
           "title": "Cold Tier Offload Min Priority"
         },
+        "context_claim_ahead": {
+          "default": 0,
+          "description": "Create and resume the KV cache (reuse match and page restore) of up to this many waiting first context chunks on a background thread, inside the forward call of a context-only batch; the next scheduling pass adopts the cache instead of creating it. A claim not adopted within four passes, or whose pages the scheduler needs, is released. 0 disables it. Requires KV cache manager v2 with block reuse, and the overlap scheduler without pipeline parallelism.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Context Claim Ahead",
+          "type": "integer"
+        },
+        "context_prefetch_blocks": {
+          "default": 0,
+          "description": "Bring the reusable prefix of each new first context chunk to the GPU tier on a background thread, inside the forward call of a context-only batch, while at most this many prefetched blocks wait for their request's KV cache. A request whose prefix sits in a lower tier then resumes without waiting for those copies. 0 disables it. Requires KV cache manager v2 with block reuse, and the overlap scheduler without pipeline parallelism.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Context Prefetch Blocks",
+          "type": "integer"
+        },
         "copy_on_partial_reuse": {
           "default": true,
           "description": "Whether partially matched blocks that are in use can be reused after copying them.",
           "title": "Copy On Partial Reuse",
           "type": "boolean"
+        },
+        "copy_stream_busy_skip": {
+          "default": 0,
+          "description": "Pooled CUDA streams that a KV cache block copy skips while they still have work pending (0: it takes the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted, so without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets it for the life of the process. Only used by KV cache manager v2. Refused together with `page_staging_depth` above 1: that pair ran a context server out of GPU memory after about 30 minutes.",
+          "maximum": 4096,
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Copy Stream Busy Skip",
+          "type": "integer"
         },
         "cross_kv_cache_fraction": {
           "anyOf": [
@@ -5856,11 +6197,25 @@
           "description": "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise.",
           "title": "Cross Kv Cache Fraction"
         },
+        "defer_context_only_release": {
+          "default": false,
+          "description": "Release the KV cache of a finished context-only request (disaggregated context server) late, as defer_generation_only_release does for generation-only requests. Its blocks were committed for reuse while it ran, so later requests can match them before the release. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
+          "status": "prototype",
+          "title": "Defer Context Only Release",
+          "type": "boolean"
+        },
         "defer_generation_only_release": {
           "default": false,
           "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later, or as soon as the scheduler runs out of pages, before it suspends or recompute-pauses a running request. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
           "status": "prototype",
           "title": "Defer Generation Only Release",
+          "type": "boolean"
+        },
+        "deferred_release_thread": {
+          "default": false,
+          "description": "Run the deferred releases of defer_generation_only_release and defer_context_only_release on a background thread instead of the executor thread: a release starts only while the executor waits for the previous step's GPU work, or inside the forward call of a context-only batch, which captures no CUDA graph. The scheduler and the idle path still release on the executor thread when they need the pages. Requires one of the two options.",
+          "status": "prototype",
+          "title": "Deferred Release Thread",
           "type": "boolean"
         },
         "disk_cache_path": {
@@ -5921,6 +6276,14 @@
           "status": "prototype",
           "title": "Disk Protected Copy Fraction",
           "type": "number"
+        },
+        "disk_write_behind_mib": {
+          "default": 0,
+          "description": "Host memory, in MiB, for write-behind of host-to-disk KV cache writes (0: off). A block's write completes once its bytes are copied there, so the host memory it came from can be reused without waiting for the disk; a disk I/O thread writes the file afterwards, and reads of the block are served from that memory until then. Writes that do not fit run as before. Requires `disk_io_threads` > 0. Process-wide, like the disk I/O pool. Only used by KV cache manager v2 with a disk cache.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Disk Write Behind Mib",
+          "type": "integer"
         },
         "disk_write_through": {
           "default": false,
@@ -6017,6 +6380,15 @@
           "title": "Host Cache Bind To Gpu Numa Node",
           "type": "boolean"
         },
+        "host_cache_free_reserve_fraction": {
+          "default": 0.0,
+          "description": "Share of the host cache tier, 0 to 0.25, that evictions to the disk cache keep free ahead of need. A host block freed by an eviction is usable only once it has been copied to disk, so on a full host tier every block evicted from GPU, and the restore waiting for the GPU block it frees, waits for a disk write. With a reserve, evictions run that far ahead of need. 0 evicts only what is needed. Requires a disk cache. Only used by KV cache manager v2.",
+          "maximum": 0.25,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Host Cache Free Reserve Fraction",
+          "type": "number"
+        },
         "host_cache_size": {
           "anyOf": [
             {
@@ -6029,6 +6401,15 @@
           "default": null,
           "description": "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used.",
           "title": "Host Cache Size"
+        },
+        "host_copy_threads": {
+          "default": 1,
+          "description": "Threads, the CUDA callback thread included, that one host-side KV cache copy (host to host between host-memory cache levels, disk to disk, and host to/from disk when `disk_io_threads` is 0) spreads its blocks over. GPU-to-host offloads and host-to-GPU restores run on the GPU and do not use it. CUDA runs host callbacks one at a time, so with 1 every later host callback, and every copy queued behind one, waits for the whole copy. The copy still completes only once every block is copied. Process-wide: the first KV cache manager that sets a value above 1 sets it for the life of the process. Only used by KV cache manager v2.",
+          "exclusiveMinimum": 0,
+          "maximum": 64,
+          "status": "prototype",
+          "title": "Host Copy Threads",
+          "type": "integer"
         },
         "iteration_stats_interval": {
           "default": 1,
@@ -6188,6 +6569,24 @@
           "status": "prototype",
           "title": "Mixed Precision Reuse",
           "type": "string"
+        },
+        "page_staging_depth": {
+          "default": 1,
+          "description": "Stretches of the page staging buffer (`page_staging_mib`) that one move of KV cache blocks between GPU and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA streams, so up to N of its disk reads or writes run at once and other moves still find room in the buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2. Refused together with `copy_stream_busy_skip` above 0: that pair ran a context server out of GPU memory after about 30 minutes.",
+          "exclusiveMinimum": 0,
+          "maximum": 16,
+          "status": "prototype",
+          "title": "Page Staging Depth",
+          "type": "integer"
+        },
+        "page_staging_mib": {
+          "default": 64,
+          "description": "Size in MiB of the pinned host buffer that KV cache blocks moving between GPU and the disk cache (or a remote cache level) pass through. A move takes one stretch of the buffer at a time and waits for the earlier move that used the same stretch, so a burst of restores from disk larger than the buffer runs one buffer-full at a time. The buffer is never smaller than three of the largest cold blocks. Per KV cache manager. Only used by KV cache manager v2.",
+          "exclusiveMinimum": 0,
+          "maximum": 65536,
+          "status": "prototype",
+          "title": "Page Staging Mib",
+          "type": "integer"
         },
         "pool_ratio": {
           "anyOf": [
@@ -10036,6 +10435,27 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_claim_hold": {
+          "default": false,
+          "description": "With kv_cache_config.context_claim_ahead > 0, long-prefill demotion (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0, chunked prefill) and the FCFS context order (KV cache manager V2): a first context chunk goes behind the demoted long prefills of the scheduling pass that first sees it, once, so that when the token budget is taken it waits one pass and the host helper claims its cache under the next forward instead of the executor thread claiming it inline. The scheduler also picks what the helper claims: the waiting first chunks the next pass is expected to admit, not every waiting one in arrival order. Set it on context servers. Changes the context order by at most one pass; outputs are unchanged.",
+          "status": "prototype",
+          "title": "Context Claim Hold",
+          "type": "boolean"
+        },
+        "context_demote_no_walk": {
+          "default": false,
+          "description": "With context_demote_probe on: a waiting request whose conversation's earlier prompt (kept by the scheduler for requests it scheduled, up to the depth their prefill left reusable) proves it short is classified without the probe's radix walk over its whole prompt. A record that leaves the request long, or no record, falls back to the probe; when the recorded blocks are no longer cached the request is not demoted. Needs the FCFS context order. Changes the context order only.",
+          "status": "prototype",
+          "title": "Context Demote No Walk",
+          "type": "boolean"
+        },
+        "context_demote_probe": {
+          "default": false,
+          "description": "With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0, chunked prefill, KV cache manager V2): a context request that has no router estimate of its uncached prefill, as on a worker without the attention-DP conversation router, is measured by the scheduler's reuse probe, once while it waits, and demoted when more than the threshold is uncached. Off: such a request is never demoted. Changes the context order only.",
+          "status": "prototype",
+          "title": "Context Demote Probe",
+          "type": "boolean"
+        },
         "context_scheduling_policy": {
           "$ref": "#/$defs/ContextSchedulingPolicy",
           "default": "fcfs",
@@ -10073,6 +10493,20 @@
           "default": true,
           "description": "Use KV prefix-reuse estimates for scheduler admission, duplicate-request deferral, and token-budget decisions. This is orthogonal to kv_cache_config.enable_block_reuse.",
           "title": "Enable Prefix Aware Scheduling",
+          "type": "boolean"
+        },
+        "gen_handoff_seat": {
+          "default": false,
+          "description": "On a disaggregated generation server (KV cache manager V2, no attention DP, max_batch_size >= 2): a forward runs at most max_batch_size - 1 requests, so the last seat only takes the next request's KV transfer, which then runs beside the decoding requests instead of holding one of their places. Decoding requests are scheduled ahead of received ones. Set it on generation servers only: a context server would lose a forward place. Changes batch composition only.",
+          "status": "prototype",
+          "title": "Gen Handoff Seat",
+          "type": "boolean"
+        },
+        "gen_init_pause_after_release": {
+          "default": false,
+          "description": "On a disaggregated generation server with the KV cache manager V2 scheduler: a scheduling pass right after this rank released a finished generation request admits no generation-init request (each admission allocates the request's KV cache). With max_gen_init_admissions_per_pass=1, a step then makes at most one KV allocation or release of a whole request, which every attention-DP rank waits for. Delays the start of a KV transfer by one pass at most; outputs are unchanged.",
+          "status": "prototype",
+          "title": "Gen Init Pause After Release",
           "type": "boolean"
         },
         "gen_preemption": {
@@ -10907,6 +11341,136 @@
             },
             "required": [
               "defer_generation_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "defer_context_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_context_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "deferred_release_thread": {
+                "const": true
+              }
+            },
+            "required": [
+              "deferred_release_thread"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "context_claim_ahead": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_claim_ahead"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "context_prefetch_blocks": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_prefetch_blocks"
             ],
             "type": "object"
           }

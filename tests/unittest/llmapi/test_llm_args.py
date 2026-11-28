@@ -2191,6 +2191,40 @@ def test_KvCacheConfig_defer_generation_only_release():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("field,on", [
+    ("defer_context_only_release", True),
+    ("context_claim_ahead", 6),
+    ("context_prefetch_blocks", 24000),
+])
+def test_KvCacheConfig_host_helper_fields_need_v2(field, on):
+    assert getattr(KvCacheConfig(), field) in (False, 0)
+    assert getattr(KvCacheConfig(**{field: on}), field) == on
+    with pytest.raises(ValidationError, match=f"{field} requires"):
+        KvCacheConfig(**{field: on, "use_kv_cache_manager_v2": False})
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_deferred_release_thread_needs_a_deferral():
+    assert KvCacheConfig().deferred_release_thread is False
+    for defer in ("defer_generation_only_release",
+                  "defer_context_only_release"):
+        assert KvCacheConfig(deferred_release_thread=True, **{
+            defer: True
+        }).deferred_release_thread
+    with pytest.raises(ValidationError, match="needs defer_generation_only"):
+        KvCacheConfig(deferred_release_thread=True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("field",
+                         ["context_claim_ahead", "context_prefetch_blocks"])
+def test_KvCacheConfig_context_helpers_need_block_reuse(field):
+    with pytest.raises(ValidationError, match="requires enable_block_reuse"):
+        KvCacheConfig(**{field: 8, "enable_block_reuse": False})
+    KvCacheConfig(**{field: 0, "enable_block_reuse": False})
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_offload_priority_compatibility():
     assert KvCacheConfig().cold_tier_offload_min_priority is None
     for field in ("cold_tier_offload_min_priority",
@@ -2951,6 +2985,206 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disk_write_behind(tmp_path):
+    assert KvCacheConfig().disk_write_behind_mib == 0
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=16,
+                           disk_write_behind_mib=4096)
+    assert config.disk_write_behind_mib == 4096
+    # Staged pages are written by the I/O pool, so write-behind needs it.
+    with pytest.raises(ValidationError,
+                       match="disk_write_behind_mib requires disk_io_threads"):
+        KvCacheConfig(**disk, disk_write_behind_mib=4096)
+    with pytest.raises(ValidationError,
+                       match="disk_write_behind_mib requires disk_cache_size"):
+        KvCacheConfig(disk_io_threads=4, disk_write_behind_mib=4096)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**disk, disk_io_threads=4, disk_write_behind_mib=-1)
+
+
+def _kvcm2_manager_config(**kwargs):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (AttentionLayerConfig,
+                                                          BufferConfig,
+                                                          GpuCacheTierConfig,
+                                                          KVCacheManagerConfig)
+
+    return KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=32 << 20)],
+        layers=[
+            AttentionLayerConfig(layer_id=0,
+                                 buffers=[BufferConfig("key", 8192)])
+        ],
+        **kwargs)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_host_copy_threads(tmp_path):
+    assert KvCacheConfig().host_copy_threads == 1
+    # Host-to-host copies need no disk tier, so neither does the option.
+    assert KvCacheConfig(host_copy_threads=16).host_copy_threads == 16
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    # Composes with the async disk I/O pool and write-behind.
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=16,
+                           disk_write_behind_mib=4096,
+                           host_copy_threads=16)
+    assert config.host_copy_threads == 16
+    KvCacheConfig(host_copy_threads=64)
+    for value in (0, -1, 65):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(host_copy_threads=value)
+    with pytest.raises(
+            ValidationError,
+            match="host_copy_threads requires use_kv_cache_manager_v2"):
+        KvCacheConfig(host_copy_threads=4, use_kv_cache_manager_v2=False)
+    KvCacheConfig(host_copy_threads=1, use_kv_cache_manager_v2=False)
+
+    assert _kvcm2_manager_config().host_copy_threads == 1
+    assert _kvcm2_manager_config(host_copy_threads=64).host_copy_threads == 64
+    for value in (0, 65):
+        with pytest.raises(ValueError,
+                           match="hostCopyThreads must be between 1 and 64"):
+            _kvcm2_manager_config(host_copy_threads=value)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_copy_stream_busy_skip():
+    assert KvCacheConfig().copy_stream_busy_skip == 0
+    assert KvCacheConfig(
+        copy_stream_busy_skip=4096).copy_stream_busy_skip == 4096
+    for value in (-1, 4097):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(copy_stream_busy_skip=value)
+    with pytest.raises(
+            ValidationError,
+            match="copy_stream_busy_skip requires use_kv_cache_manager_v2"):
+        KvCacheConfig(copy_stream_busy_skip=64, use_kv_cache_manager_v2=False)
+
+    assert _kvcm2_manager_config().copy_stream_busy_skip == 0
+    assert _kvcm2_manager_config(
+        copy_stream_busy_skip=4096).copy_stream_busy_skip == 4096
+    for value in (-1, 4097):
+        with pytest.raises(
+                ValueError,
+                match="copyStreamBusySkip must be between 0 and 4096"):
+            _kvcm2_manager_config(copy_stream_busy_skip=value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("field, value", [("host_copy_threads", 4),
+                                          ("copy_stream_busy_skip", 64),
+                                          ("page_staging_mib", 128)])
+@pytest.mark.parametrize("use_v2", [True, "auto"])
+def test_copy_path_options_need_the_resolved_v2_manager(field, value, use_v2):
+    """Reject V2-only copy-path options once the creator resolves to V1.
+
+    A KvCacheConfig that requests V2 (or "auto") passes these at parse time; once model
+    loading has picked V1 they would be ignored, so the creator rejects them.
+    """
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.mapping import Mapping
+
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2,
+                                    **{field: value})
+    llm_args = SimpleNamespace(disable_overlap_scheduler=False)
+
+    def creator(is_v2):
+        return SimpleNamespace(_kv_cache_config=kv_cache_config,
+                               _is_kv_cache_manager_v2=is_v2,
+                               _kv_cache_manager_cls=type(
+                                   "KVCacheManager", (), {}),
+                               _is_disagg=False)
+
+    KvCacheCreator._reject_unused_v2_only_fields(creator(True), Mapping(),
+                                                 llm_args)
+    with pytest.raises(
+            ValueError,
+            match=f"kv_cache_config.{field} requires KVCacheManagerV2"):
+        KvCacheCreator._reject_unused_v2_only_fields(creator(False), Mapping(),
+                                                     llm_args)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_host_cache_free_reserve(tmp_path):
+    assert KvCacheConfig().host_cache_free_reserve_fraction == 0.0
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    config = KvCacheConfig(**disk, host_cache_free_reserve_fraction=0.02)
+    assert config.host_cache_free_reserve_fraction == 0.02
+    KvCacheConfig(**disk, host_cache_free_reserve_fraction=0.25)
+    for fraction in (-0.01, 0.26):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, host_cache_free_reserve_fraction=fraction)
+    # The reserve frees host blocks by evicting them to disk, so it needs a disk cache.
+    with pytest.raises(
+            ValidationError,
+            match="host_cache_free_reserve_fraction requires disk_cache_size"):
+        KvCacheConfig(host_cache_free_reserve_fraction=0.02)
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import HostCacheTierConfig
+
+    tier = HostCacheTierConfig(4 << 20)
+    assert tier.free_reserve_fraction == 0.0
+    HostCacheTierConfig(4 << 20, free_reserve_fraction=0.25).validate()
+    for fraction in (-0.5, 0.3, float("nan")):
+        with pytest.raises(
+                ValueError,
+                match="freeReserveFraction must be between 0 and 0.25"):
+            HostCacheTierConfig(4 << 20,
+                                free_reserve_fraction=fraction).validate()
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_page_staging(tmp_path):
+    # The defaults are the ring KV cache manager v2 always had: 64 MiB, one stretch in flight per move.
+    assert KvCacheConfig().page_staging_mib == 64
+    assert KvCacheConfig().page_staging_depth == 1
+    # The ring also serves remote cache levels, so its size needs no disk cache.
+    assert KvCacheConfig(page_staging_mib=1024).page_staging_mib == 1024
+    KvCacheConfig(page_staging_mib=65536)
+    for mib in (0, 65537):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(page_staging_mib=mib)
+    with pytest.raises(
+            ValidationError,
+            match="page_staging_mib requires use_kv_cache_manager_v2"):
+        KvCacheConfig(page_staging_mib=1024, use_kv_cache_manager_v2=False)
+    # The depth acts only on moves between GPU and disk.
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    assert KvCacheConfig(**disk, page_staging_depth=4).page_staging_depth == 4
+    KvCacheConfig(**disk, page_staging_depth=16)
+    for depth in (0, 17):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, page_staging_depth=depth)
+    with pytest.raises(ValidationError,
+                       match="page_staging_depth requires disk_cache_size"):
+        KvCacheConfig(page_staging_depth=4)
+    # Several stretches in flight with busy-stream skipping ran a context server out of GPU memory.
+    with pytest.raises(
+            ValidationError,
+            match=
+            "page_staging_depth > 1 cannot be combined with copy_stream_busy_skip > 0"
+    ):
+        KvCacheConfig(**disk, page_staging_depth=4, copy_stream_busy_skip=64)
+    KvCacheConfig(**disk, page_staging_depth=1, copy_stream_busy_skip=64)
+    KvCacheConfig(**disk, page_staging_depth=4, copy_stream_busy_skip=0)
+
+    config = _kvcm2_manager_config()
+    assert (config.page_staging_mib, config.page_staging_depth) == (64, 1)
+    config = _kvcm2_manager_config(page_staging_mib=1024, page_staging_depth=4)
+    assert (config.page_staging_mib, config.page_staging_depth) == (1024, 4)
+    for value in (0, 65537):
+        with pytest.raises(ValueError,
+                           match="pageStagingMiB must be between 1 and 65536"):
+            _kvcm2_manager_config(page_staging_mib=value)
+    for value in (0, 17):
+        with pytest.raises(ValueError,
+                           match="pageStagingDepth must be between 1 and 16"):
+            _kvcm2_manager_config(page_staging_depth=value)
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):
@@ -3438,9 +3672,23 @@ def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
 }, {
     "disable_overlap_scheduler": True
 }])
-def test_defer_generation_only_release_needs_the_overlap_loop(loop) -> None:
+@pytest.mark.parametrize("kv", [
+    {
+        "defer_generation_only_release": True
+    },
+    {
+        "defer_context_only_release": True
+    },
+    {
+        "context_claim_ahead": 6
+    },
+    {
+        "context_prefetch_blocks": 24000
+    },
+])
+def test_defer_generation_only_release_needs_the_overlap_loop(loop, kv) -> None:
     """Rejected at parse time, before any rank loads the checkpoint."""
-    defer = KvCacheConfig(defer_generation_only_release=True)
+    defer = KvCacheConfig(**kv)
     with pytest.raises(ValueError, match="overlap scheduler loop"):
         TorchLlmArgs(model=llama_model_path, kv_cache_config=defer, **loop)
     TorchLlmArgs(model=llama_model_path, kv_cache_config=defer)

@@ -1772,11 +1772,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t, std::optional<size_t>, bool>(), nb::arg("quota"), nb::arg("max_quota") = nb::none(),
-            nb::arg("allow_remote_numa_fallback") = true)
+        .def(nb::init<size_t, std::optional<size_t>, bool, float>(), nb::arg("quota"),
+            nb::arg("max_quota") = nb::none(), nb::arg("allow_remote_numa_fallback") = true,
+            nb::arg("free_reserve_fraction") = 0.0F)
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
         .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
         .def_rw("allow_remote_numa_fallback", &kv::HostCacheTierConfig::allowRemoteNumaFallback)
+        .def_rw("free_reserve_fraction", &kv::HostCacheTierConfig::freeReserveFraction,
+            "Share of each pool group's slots, 0 to 0.25, that evictions keep free ahead of need while a tier below "
+            "takes them (0: evict only what is needed). No effect on the last tier.")
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
@@ -1790,15 +1794,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::HostMemBackingConfig::validate) DEF_COPY(kv::HostMemBackingConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string, int, bool, bool, float>(), nb::arg("quota"), nb::arg("path"),
+        .def(nb::init<size_t, std::string, int, bool, bool, float, size_t>(), nb::arg("quota"), nb::arg("path"),
             nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false,
-            nb::arg("protected_copy_fraction") = 1.0F)
+            nb::arg("protected_copy_fraction") = 1.0F, nb::arg("write_behind_bytes") = 0)
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
         .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
         .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
         .def_rw("write_through", &kv::DiskCacheTierConfig::writeThrough)
         .def_rw("protected_copy_fraction", &kv::DiskCacheTierConfig::protectedCopyFraction)
+        .def_rw("write_behind_bytes", &kv::DiskCacheTierConfig::writeBehindBytes)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -2027,7 +2032,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep)
+                std::optional<kv::BatchDesc> coldTypicalStep, int hostCopyThreads, int copyStreamBusySkip,
+                int pageStagingMiB, int pageStagingDepth)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2057,6 +2063,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
                 cfg->coldTypicalStep = std::move(coldTypicalStep);
+                cfg->hostCopyThreads = hostCopyThreads;
+                cfg->copyStreamBusySkip = copyStreamBusySkip;
+                cfg->pageStagingMiB = pageStagingMiB;
+                cfg->pageStagingDepth = pageStagingDepth;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2072,7 +2082,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
-            nb::arg("cold_typical_step").none() = std::nullopt)
+            nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("host_copy_threads") = 1,
+            nb::arg("copy_stream_busy_skip") = 0,
+            nb::arg("page_staging_mib") = kv::KVCacheManagerConfig::kDefaultPageStagingMiB,
+            nb::arg("page_staging_depth") = 1)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2109,6 +2122,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
         .def_rw("pool_rebalance", &kv::KVCacheManagerConfig::poolRebalance)
+        .def_rw("host_copy_threads", &kv::KVCacheManagerConfig::hostCopyThreads,
+            "Threads, 1 to 64, that one host-side copy callback spreads its page tasks over, the CUDA callback "
+            "thread included. Process-wide: the first manager that sets a value above 1 sets it for the life of "
+            "the process.")
+        .def_rw("copy_stream_busy_skip", &kv::KVCacheManagerConfig::copyStreamBusySkip,
+            "Pooled CUDA streams, 0 to 4096, that a page copy skips while they still have work pending (0: it takes "
+            "the next pooled stream, busy or not). Process-wide: the first manager that sets a nonzero value sets it "
+            "for the life of the process.")
+        .def_rw("page_staging_mib", &kv::KVCacheManagerConfig::pageStagingMiB,
+            "Size in MiB, 1 to 65536, of the pinned host ring that page moves between GPU and the disk tier (or a "
+            "remote level) pass through; at least three of the largest cold pages. Per manager.")
+        .def_rw("page_staging_depth", &kv::KVCacheManagerConfig::pageStagingDepth,
+            "Stretches of the page staging ring, 1 to 16, that one page move between GPU and the disk tier keeps in "
+            "flight on its own streams (1: one stretch after another on the move's stream). Per manager.")
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -2443,8 +2470,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "async_disk_io_enabled", []() { return kv::asyncDiskIoEnabled(); },
         "Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous.");
     mIntrospection.def(
+        "host_copy_threads", []() { return kv::hostCopyThreads(); },
+        "Threads a host-side copy callback may use now, the callback thread included.");
+    mIntrospection.def(
+        "set_host_copy_threads_for_testing",
+        [](size_t numThreads) { return kv::setHostCopyThreadsForTesting(numThreads); }, nb::arg("num_threads"),
+        "Set the host copy width (1: every task on the callback thread) whatever was configured; returns the width.");
+    mIntrospection.def(
+        "host_copy_helper_tasks_for_testing", []() { return kv::hostCopyHelperTasksForTesting(); },
+        "Page tasks of host-side copy callbacks run by pool workers so far.");
+    mIntrospection.def(
+        "copy_stream_busy_skip", []() { return kv::busyStreamSkip(); },
+        "Busy pooled streams a temporary copy stream may skip (0: off).");
+    mIntrospection.def(
+        "set_copy_stream_busy_skip_for_testing", [](size_t maxBusy) { kv::setBusyStreamSkipForTesting(maxBusy); },
+        nb::arg("max_busy"), "Set the busy-stream skip bound whatever was configured.");
+    mIntrospection.def(
+        "busy_copy_streams_skipped_for_testing", []() { return kv::busyStreamsSkippedForTesting(); },
+        "Busy pooled streams temporary copy streams have skipped so far.");
+    mIntrospection.def(
         "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
         nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");
+    mIntrospection.def(
+        "disk_write_behind_pages_for_testing", []() { return kv::diskWriteBehindPagesForTesting(); },
+        "Pages in disk write-behind staging (pending a flush, or kept after a failed one).");
+    mIntrospection.def(
+        "delay_disk_write_behind_flushes_for_testing",
+        [](double seconds) { kv::delayDiskWriteBehindFlushesForTesting(seconds); }, nb::arg("seconds"),
+        "A disk write-behind flush starts only once it has been queued for `seconds`.");
+    mIntrospection.def(
+        "wait_for_disk_io_for_testing", []() { kv::waitForDiskIo(); }, nb::call_guard<nb::gil_scoped_release>(),
+        "Return once the async disk I/O pool has no piece queued or running (at once without the pool).");
     mIntrospection.def(
         "delay_background_disk_writes_for_testing",
         [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),
@@ -2960,6 +3016,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return groups;
         },
         nb::arg("manager"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "page_staging",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const info = manager.storage().pageStagingInfo();
+            nb::dict result;
+            result["bytes"] = info.bytes;
+            result["depth"] = info.depth;
+            result["lane_chunks"] = info.laneChunks;
+            result["lane_read_chunks"] = info.laneReadChunks;
+            return result;
+        },
+        nb::arg("manager"));
     mIntrospection.def(
         "disk_copy_counters",
         [](kv::KvCacheManager& manager)
@@ -3667,14 +3736,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("refresh_retention", &kv::KvCacheManager::refreshRetention, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch_reuse",
-            [](kv::KvCacheManager& self, nb::object reuseScopeObj, nb::object inputTokens, int target)
+            // By shared_ptr: the transient KvCache calls shared_from_this() on the manager.
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens, int target)
             {
                 auto reuseScope = castReuseScope(std::move(reuseScopeObj));
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
                         nb::gil_scoped_release release;
-                        return self.prefetchReuse(std::move(reuseScope), view, kv::CacheLevel{target}, knownNoDigest);
+                        return self->prefetchReuse(std::move(reuseScope), view, kv::CacheLevel{target}, knownNoDigest);
                     });
             },
             nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))

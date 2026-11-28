@@ -606,6 +606,8 @@ def create_config(
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
     disk_tier_options: dict | None = None,
+    manager_options: dict | None = None,
+    host_tier_options: dict | None = None,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -623,11 +625,12 @@ def create_config(
     assert gpu_quota > 0
     cache_tiers = [
         GpuCacheTierConfig(quota=gpu_quota),
-        HostCacheTierConfig(quota=host_quota),
+        HostCacheTierConfig(quota=host_quota, **(host_tier_options or {})),
         DiskCacheTierConfig(quota=disk_quota, path=disk_path, **(disk_tier_options or {})),
     ]
     cache_tiers = [t for t in cache_tiers if t.quota > 0]
     return KVCacheManagerConfig(
+        **(manager_options or {}),
         tokens_per_block=tokens_per_block,
         cache_tiers=[t for t in cache_tiers if t.quota > 0],
         layers=[
@@ -6477,6 +6480,8 @@ class TestKVCacheManagerV2(unittest.TestCase):
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
     disk_tier_options: dict = {}
+    manager_options: dict = {}
+    host_tier_options: dict = {}
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -6525,6 +6530,8 @@ class TestKVCacheManagerV2(unittest.TestCase):
             kv_buf_size,
             block_quant_buf_size,
             disk_tier_options=self.disk_tier_options,
+            manager_options=self.manager_options,
+            host_tier_options=self.host_tier_options,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -6799,6 +6806,22 @@ class TestRetention(TestKVCacheManagerV2):
         time.sleep(0.04)
         self.manager.refresh_retention()
         self.assertEqual(self._cache(tokens[:4]).get_page_priorities(0), [80])
+
+    def test_prefetch_without_a_live_kv_cache(self) -> None:
+        """prefetch_reuse works while no KV cache owns the manager.
+
+        Its transient KV cache calls shared_from_this() on the manager, which threw bad_weak_ptr
+        on a fresh manager and once every KV cache was gone while the binding took it by reference.
+        """
+        self._prepare_retention()
+        tokens = list(range(12))
+        # Nothing is cached yet, so there is nothing to move.
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self._cache(tokens)
+        self._close_caches()
+        gc.collect()
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), len(tokens))
 
     def test_prefetch_rejects_invalid_cache_levels(self) -> None:
         self._prepare_retention()
@@ -12760,8 +12783,435 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self.manager.clear_reusable_blocks()
 
 
+_WRITE_BEHIND_BYTES = 256 << 20
+
+
+class TestNoBatchingDiskWriteBehind(TestNoBatchingDiskOptions):
+    """The disk-option tests again with write-behind staging for host -> disk writes.
+
+    A staged write completes once the page is copied into staging; a pool worker writes the file later, and reads of
+    the page are served from staging until then. Every test here that runs the I/O pool also stages, so its restores
+    pass refcheck through staging and through the file. Write-behind is process-wide and set by each manager's disk
+    tier, so a later manager with write_behind_bytes 0 turns it off again.
+    """
+
+    disk_tier_options = dict(_ALL_DISK_OPTIONS, write_behind_bytes=_WRITE_BEHIND_BYTES)
+
+    def setUp(self) -> None:
+        # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
+        name = self._testMethodName
+        if (
+            name not in type(self).__dict__
+            and name not in TestNoBatchingDiskOptions.__dict__
+            and not name.startswith(self._INHERITED_DISK_TESTS)
+        ):
+            self.skipTest("inherited test does not reach the disk tier")
+        TestNoBatching.setUp(self)
+
+    def prepare(self, *args, **kwargs) -> None:
+        options = dict(self.disk_tier_options or {})
+        if options.get("num_io_threads", 0) > 0:
+            options.setdefault("write_behind_bytes", _WRITE_BEHIND_BYTES)
+        self.disk_tier_options = options
+        super().prepare(*args, **kwargs)
+
+    def tearDown(self) -> None:
+        _introspection.delay_disk_write_behind_flushes_for_testing(0)
+        super().tearDown()
+
+    def test_failed_write_through_copy_is_not_reused(self) -> None:
+        # A staged write's flush failure keeps the page in staging and records nothing, so the copy stays usable:
+        # covered by test_failed_flush_keeps_staged_pages_readable instead.
+        self.skipTest(
+            "write-behind keeps a failed flush's page readable instead of discarding the copy"
+        )
+
+    def test_eviction_takes_back_copy_whose_write_is_still_running(self) -> None:
+        # A staged write-through copy completes at memory speed, so no copy is still in flight when its page falls to
+        # disk (the base test's reused_pending). The staged counterpart: copies whose flush has not run yet are taken
+        # back by the host -> disk evictions, and restoring the prefix reads them from staging.
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        _introspection.delay_disk_write_behind_flushes_for_testing(3600)
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        counters = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(counters["write_through_pages"], 0)
+        self.assertGreater(counters["reused"], 0)
+        self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+        self._assert_copies_balance(counters)
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        _introspection.delay_disk_write_behind_flushes_for_testing(0)
+        self._wait_for_flushes()
+        self.manager.clear_reusable_blocks()
+
+    def _push_first_request_to_disk(self) -> tuple["TestNoBatching.Request", itertools.count]:
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertTrue(_introspection.async_disk_io_enabled())
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        # GPU and host each hold about one request, so these push the first one's pages GPU -> host -> disk.
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        return first, req_ids
+
+    def _restore_prefix(self, first: "TestNoBatching.Request", req_ids: itertools.count) -> None:
+        prompt = first.kv_cache.committed_tokens[: 32 * 11]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        # refcheck: the restored KV must be exactly what the first request computed.
+        self._run_and_close(reuse)
+
+    def _wait_for_flushes(self, timeout: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout
+        while _introspection.disk_write_behind_pages_for_testing() > 0:
+            self.assertLess(time.monotonic(), deadline, "write-behind flushes did not finish")
+            time.sleep(0.01)
+
+    def test_restores_are_served_from_staging_before_the_flush(self) -> None:
+        # No flush runs, so every page written to disk is still in staging when the prefix is restored from disk.
+        _introspection.delay_disk_write_behind_flushes_for_testing(3600)
+        first, req_ids = self._push_first_request_to_disk()
+        self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+        self._restore_prefix(first, req_ids)
+        # Flush, then restore the same prefix from the file.
+        _introspection.delay_disk_write_behind_flushes_for_testing(0)
+        self._wait_for_flushes()
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, 32 * 22 - 256))
+        self._restore_prefix(first, req_ids)
+        self.manager.clear_reusable_blocks()
+
+    def test_failed_flush_keeps_staged_pages_readable(self) -> None:
+        # Every flush fails: the pages stay in staging, and restoring them from "disk" still returns their KV.
+        _introspection.inject_disk_write_failures_for_testing(1 << 30)
+        try:
+            first, req_ids = self._push_first_request_to_disk()
+            # Once the pool is idle every queued flush has been attempted, and with every write failing the pages
+            # they would have retired are still staged: the restore below reads pages whose flush failed.
+            _introspection.wait_for_disk_io_for_testing()
+            self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+            self._restore_prefix(first, req_ids)
+            self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+        finally:
+            _introspection.inject_disk_write_failures_for_testing(0)
+        self.manager.clear_reusable_blocks()
+
+    def test_staging_is_released_after_flushes(self) -> None:
+        first, req_ids = self._push_first_request_to_disk()
+        self._wait_for_flushes()
+        self._restore_prefix(first, req_ids)
+        self.manager.clear_reusable_blocks()
+
+
+class TestNoBatchingDiskCopyPathOptions(TestNoBatchingDiskOptions):
+    """The disk-option tests again with host copy threads and busy-stream skipping on, plus the host free reserve.
+
+    Both are process-wide, and the first manager that sets one keeps it for the process, so setUp sets them through the
+    testing hooks as well and tearDown restores the defaults: the order of the test classes does not matter. With the
+    async I/O pool running, host <-> disk pieces stay on the pool; what the copy threads run here are the copies no
+    pool takes. Skipping hands each migration an idle stream, and the restores still pass refcheck.
+    """
+
+    manager_options = {"host_copy_threads": 16, "copy_stream_busy_skip": 4096}
+
+    def setUp(self) -> None:
+        # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
+        name = self._testMethodName
+        if (
+            name not in type(self).__dict__
+            and name not in TestNoBatchingDiskOptions.__dict__
+            and not name.startswith(self._INHERITED_DISK_TESTS)
+        ):
+            self.skipTest("inherited test does not reach the disk tier")
+        TestNoBatching.setUp(self)
+        self.assertGreater(_introspection.set_host_copy_threads_for_testing(16), 1)
+        _introspection.set_copy_stream_busy_skip_for_testing(4096)
+
+    def tearDown(self) -> None:
+        _introspection.set_host_copy_threads_for_testing(1)
+        _introspection.set_copy_stream_busy_skip_for_testing(0)
+        super().tearDown()
+
+    def test_restores_skip_streams_still_busy_with_delayed_writes(self) -> None:
+        # Background writes are delayed, so the write-through copies keep their streams busy. A pooled stream goes
+        # back to the pool as soon as its copy is submitted; a later migration skips the busy ones and the prefix,
+        # restored meanwhile, still passes refcheck.
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual(self.cfg.host_copy_threads, 16)
+        self.assertEqual(self.cfg.copy_stream_busy_skip, 4096)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        skipped = _introspection.busy_copy_streams_skipped_for_testing()
+        _introspection.delay_background_disk_writes_for_testing(2.0)
+        try:
+            for _ in range(4):
+                self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+            prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+            reuse = self.Request(
+                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32
+            )
+            self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+            self._run_and_close(reuse)
+        finally:
+            _introspection.delay_background_disk_writes_for_testing(0.0)
+        counters = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(counters["write_through_pages"], 0)
+        # Not an exact count: whether a pooled stream is still busy when it comes up again depends on timing, and the
+        # pool is the native one, which Python cannot hold busy. This test is the refcheck under skipping; the skip
+        # itself is required deterministically by the gtest KvCacheManagerV2CopyUtilsTest.
+        # TemporaryStreamsSkipBusyPooledStreams, which makes every cached pooled stream busy first.
+        self.assertGreaterEqual(_introspection.busy_copy_streams_skipped_for_testing(), skipped)
+        self.manager.clear_reusable_blocks()
+
+    def test_a_manager_applies_both_settings_in_a_fresh_process(self) -> None:
+        # Both settings are process-wide and the first manager's value wins, and setUp presets them through the hooks,
+        # so the effective values the other tests read do not show that a manager applies its own. A fresh process
+        # does: nothing has set them there before the manager.
+        import subprocess
+        import textwrap
+
+        package = _introspection.__name__.rpartition(".")[0]
+        code = textwrap.dedent(
+            f"""
+            import importlib
+            kv = importlib.import_module({package!r})
+            from {package} import _introspection
+            assert (_introspection.host_copy_threads(), _introspection.copy_stream_busy_skip()) == (1, 0)
+            manager = kv.KVCacheManager(kv.KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[kv.GpuCacheTierConfig(4 << 20)],
+                layers=[kv.AttentionLayerConfig(0, [kv.BufferConfig("key", 4096)])],
+                host_copy_threads=16,
+                copy_stream_busy_skip=4096,
+            ))
+            print("APPLIED", _introspection.host_copy_threads(), _introspection.copy_stream_busy_skip())
+            manager.shutdown()
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=900
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        self.assertIn("APPLIED 16 4096", result.stdout)
+
+    def test_host_free_reserve_evicts_ahead_of_need(self) -> None:
+        # With a reserve, every pass that pages fall into the host tier through evicts until a quarter of each host
+        # pool group is free again, so the next pages falling to host take slots whose disk write has finished.
+        # Restores through the tiers still pass refcheck.
+        self.host_tier_options = {"free_reserve_fraction": 0.25}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual(self.cfg.cache_tiers[1].free_reserve_fraction, 0.25)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        for stats in self.manager.get_storage_statistics(CacheLevel(1)):
+            self.assertGreaterEqual(stats.free, int(stats.total * 0.25), stats)
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+
+@pytest.mark.cpu_only
+class TestKVCacheManagerConfigReplace(unittest.TestCase):
+    """dataclasses.replace() on the KVCacheManagerConfig binding keeps every constructor field.
+
+    The binding is not a dataclass: __init__.py grafts a field spec onto it, and replace() rebuilds the config from
+    exactly those fields. The cache managers call replace() on the config they build (_lay_out_regions, the host
+    sparse pool quota), so a constructor keyword missing from the spec is silently reset to its default there.
+    """
+
+    _OPTIONS = {
+        "host_copy_threads": 4,
+        "copy_stream_busy_skip": 8,
+        "page_staging_mib": 1024,
+        "page_staging_depth": 4,
+    }
+
+    @staticmethod
+    def _config(**options) -> KVCacheManagerConfig:
+        return create_config(32, 64 << 20, 64 << 20, 1 << 30, 2, None, 0, manager_options=options)
+
+    def test_replace_keeps_the_copy_path_and_page_staging_options(self) -> None:
+        cfg = self._config(**self._OPTIONS)
+        for rebuilt in (replace(cfg), replace(cfg, regions=[])):
+            self.assertEqual({k: getattr(rebuilt, k) for k in self._OPTIONS}, self._OPTIONS)
+
+    def test_every_writable_constructor_field_is_in_the_field_spec(self) -> None:
+        import inspect
+
+        cfg = self._config()
+        spec = set(KVCacheManagerConfig.__dataclass_fields__)
+        base = {name: getattr(cfg, name) for name in spec}
+        checked, missing = set(), []
+        for name in dir(KVCacheManagerConfig):
+            if name.startswith("_"):
+                continue
+            attr = inspect.getattr_static(KVCacheManagerConfig, name)
+            if not hasattr(type(attr), "__set__") or (
+                isinstance(attr, property) and attr.fset is None
+            ):
+                continue  # a method or a read-only property: not a constructor field
+            checked.add(name)
+            if name in spec:
+                continue
+            try:
+                KVCacheManagerConfig(**base, **{name: getattr(cfg, name)})
+            except TypeError:
+                continue  # writable, but not a constructor keyword: replace() never passes it
+            missing.append(name)
+        self.assertIn("tokens_per_block", checked)
+        self.assertEqual(missing, [], "constructor fields that dataclasses.replace() would reset")
+
+
+class TestNoBatchingDiskPageStaging(TestNoBatchingDiskOptions):
+    """The disk-option tests again through a 1 MiB page staging ring with four stretches in flight per move.
+
+    The ring is never smaller than three of the largest cold pages, so at 1 MiB it holds only a few, and every move
+    between GPU and disk takes many stretches of it. With page_staging_depth 4 each move cuts them to a quarter of the
+    ring and issues them round-robin on four streams of its own, which the move's stream waits for. Both options are per
+    manager. The restores still pass refcheck.
+    """
+
+    manager_options = {"page_staging_mib": 1, "page_staging_depth": 4}
+
+    def setUp(self) -> None:
+        # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
+        name = self._testMethodName
+        if (
+            name not in type(self).__dict__
+            and name not in TestNoBatchingDiskOptions.__dict__
+            and not name.startswith(self._INHERITED_DISK_TESTS)
+        ):
+            self.skipTest("inherited test does not reach the disk tier")
+        TestNoBatching.setUp(self)
+
+    def _restore_prefix_from_disk(self) -> tuple[int, int]:
+        # Push the first request's prefix down to disk, then restore it; refcheck verifies the restored KV. Only a
+        # restore from disk keeps a copy (keep_copy_after_restore), so copies created by the restore show it read
+        # disk. Returns the disk -> GPU lane stretches issued before and after the restore: the restore may also
+        # evict pages to disk, whose stretches do not count here.
+        self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        before = _introspection.page_staging(self.manager)["lane_read_chunks"]
+        filled = _introspection.disk_copy_counters(self.manager)
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["created"], filled["created"])
+        self._assert_copies_balance(restored)
+        after = _introspection.page_staging(self.manager)["lane_read_chunks"]
+        self.manager.clear_reusable_blocks()
+        return before, after
+
+    def test_busy_skip_and_deep_staging_never_meet_in_one_process(self) -> None:
+        # Busy-stream skipping is process-wide. A manager asking for it is refused while one with page_staging_depth
+        # above 1 lives, and a manager with that depth is refused while a skip is in effect, whichever comes first.
+        self.disk_tier_options = {"num_io_threads": 4}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual(self.cfg.page_staging_depth, 4)
+        skipping = replace(self.cfg, copy_stream_busy_skip=64, page_staging_depth=1)
+        try:
+            with self.assertRaisesRegex((ValueError, RuntimeError), "pageStagingDepth > 1 live"):
+                KVCacheManager(skipping)
+            self.assertEqual(_introspection.copy_stream_busy_skip(), 0)  # left unchanged
+            self.manager.shutdown()
+            del self.manager
+            # The other order: a skip in effect (set by an earlier manager of the process) refuses the depth.
+            _introspection.set_copy_stream_busy_skip_for_testing(64)
+            with self.assertRaisesRegex(
+                (ValueError, RuntimeError), "cannot be combined with busy-stream skipping"
+            ):
+                KVCacheManager(self.cfg)
+            _introspection.set_copy_stream_busy_skip_for_testing(0)
+            # With the deep manager gone, the skip is taken.
+            manager = KVCacheManager(skipping)
+            manager.shutdown()
+        finally:
+            _introspection.set_copy_stream_busy_skip_for_testing(0)
+
+    def test_default_options_build_the_64_mib_ring(self) -> None:
+        # Without the options a manager builds the ring KV cache manager v2 always had.
+        self.manager_options = {}
+        self.disk_tier_options = {"num_io_threads": 4}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual((self.cfg.page_staging_mib, self.cfg.page_staging_depth), (64, 1))
+        staging = _introspection.page_staging(self.manager)
+        self.assertEqual(
+            (
+                staging["bytes"],
+                staging["depth"],
+                staging["lane_chunks"],
+                staging["lane_read_chunks"],
+            ),
+            (64 << 20, 1, 0, 0),
+        )
+
+    def test_disk_moves_run_in_ring_stretches_on_extra_streams(self) -> None:
+        before, after = self._restore_prefix_from_disk()
+        self.assertEqual((self.cfg.page_staging_mib, self.cfg.page_staging_depth), (1, 4))
+        staging = _introspection.page_staging(self.manager)
+        self.assertEqual(staging["depth"], 4)
+        self.assertGreaterEqual(staging["bytes"], 1 << 20)
+        self.assertLess(staging["bytes"], 64 << 20)  # not the default ring
+        # The disk -> GPU restore ran in stretches on the move's extra streams.
+        self.assertGreater(after, before)
+
+
+class TestNoBatchingDiskSmallStagingRing(TestNoBatchingDiskPageStaging):
+    """The same through a 1 MiB ring with the default depth.
+
+    Every move takes ring-full after ring-full on its own stream, as with the default ring, only more of them.
+    """
+
+    manager_options = {"page_staging_mib": 1}
+
+    def test_disk_moves_stay_on_the_move_stream(self) -> None:
+        before, after = self._restore_prefix_from_disk()
+        staging = _introspection.page_staging(self.manager)
+        self.assertEqual(staging["depth"], 1)
+        self.assertLess(staging["bytes"], 64 << 20)
+        self.assertEqual((before, after), (0, 0))
+
+
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS
+
+
+class TestResizeQuotaHostReserve(TestResizeQuota):
+    # Shrinking the host tier defragments its overflow pages within the tier; a free-slot reserve must not send one
+    # of them to disk on the way (the defragmentation takes exactly the slots they need).
+    host_tier_options = {"free_reserve_fraction": 0.25}
+
+
+class TestResizeQuotaDiskWriteBehind(TestResizeQuota):
+    # Quota changes resize the disk file while pages may still be in write-behind staging.
+    disk_tier_options = dict(_ALL_DISK_OPTIONS, write_behind_bytes=_WRITE_BEHIND_BYTES)
 
 
 class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):

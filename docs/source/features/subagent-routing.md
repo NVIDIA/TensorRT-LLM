@@ -73,7 +73,17 @@ environment variable `TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS` schedules a request
 estimated above that many tokens after the other context requests of each
 iteration, and `TLLM_V2_CTX_DEMOTE_MAX_ITERS` bounds how many consecutive
 iterations a request is demoted before it keeps its arrival order (0, the
-default, means no limit). Both default to off.
+default, means no limit). Both default to off. A request without the router's
+estimate, as on a worker without attention DP, is never demoted; with the
+prototype option `scheduler_config.context_demote_probe: true` the scheduler
+measures such a request with its own prefix-reuse probe, once while it waits,
+and demotes it when more than the threshold is uncached.
+`scheduler_config.context_demote_no_walk: true` skips that probe for a request
+whose conversation's earlier prompt, as the scheduler recorded it, already
+proves it short. On a context server with `kv_cache_config.context_claim_ahead`,
+`scheduler_config.context_claim_hold: true` lets a newly arrived request wait
+one iteration behind the demoted prefills, so that its prefix is matched and
+resumed off the executor thread before it runs.
 
 Use `/v1/chat/completions` for both instance and ADP-rank affinity. The
 `/v1/completions` endpoint supports instance affinity only.

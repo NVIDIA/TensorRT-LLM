@@ -18,6 +18,7 @@ import hashlib
 import math
 import os
 import sys
+import threading
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -159,6 +160,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .host_helper import CLAIM, PREFETCH, RELEASE, KvHostHelper
 from .page_table import ByHead, PageTableSpec, Replicated, explicit_layer_specs, kv_dtype_name
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
@@ -229,6 +231,53 @@ _GUARD_PAGE_REQUEST_ID = CUDA_GRAPH_DUMMY_REQUEST_ID - _CUDA_GRAPH_DUMMY_RESERVE
 # Caches the manager holds for itself rather than for a request. Anything that
 # reasons about "no request is active" has to exclude these.
 _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
+
+# _ContextClaim.state
+_CLAIM_PENDING, _CLAIM_RUNNING, _CLAIM_DONE, _CLAIM_FAILED = range(4)
+
+# The context-cache path a claim ahead stands in for: a claim calls impl.create_kv_cache and
+# resume() itself, and _create_kv_cache adopts the result. A subclass that overrides one of these
+# creates or resumes differently (CSA2 passes a replay backtrack and selects reuse endpoints), so
+# its claim would not be the cache the scheduling pass makes. A subclass names the overrides that
+# only wrap the base path in its own `_context_claim_safe_overrides`.
+_CONTEXT_CLAIM_PATH = (
+    "prepare_context_cache",
+    "_create_kv_cache",
+    "_resume_context_cache",
+    "_resume_and_restore",
+    "_set_page_index_bufs",
+    "_restore_page_index_bufs",
+)
+
+
+@dataclass(eq=False)
+class _ContextClaim:
+    """A first context chunk's cache, created and resumed ahead of its scheduling pass on the
+    host helper (enable_host_helper). The executor thread adopts it in _create_kv_cache."""
+
+    request_id: int
+    num_tokens: int
+    state: int = _CLAIM_PENDING
+    kv_cache: object = None
+    passes: int = 0
+    # The helper item that runs it, withdrawn from the helper's queue when the claim is dropped
+    # before it starts.
+    item: object = None
+
+
+@dataclass(eq=False)
+class _ContextPrefetch:
+    """A waiting context request's reusable prefix, brought to the GPU tier on the host helper.
+    Its blocks count against the prefetch bound until the request's cache is created or freed."""
+
+    request_id: int
+    num_blocks: int
+    cancelled: bool = False
+    # Set by the helper when the prefetch raised or brought nothing up; the executor then gives
+    # its blocks back to the bound (offer_context_prefetch).
+    failed: bool = False
+    item: object = None
+
 
 # Storage dtypes accepted as the history half of a mixed-precision KV cache.
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
@@ -2414,6 +2463,32 @@ class KVCacheManagerV2(BaseResourceManager):
     # __init__ gives each instance its own queue.
     _defer_close_enabled: bool = False
     _deferred_closes: "deque[tuple[int, _KVCache]] | tuple[()]" = ()
+    # Which finished requests defer their close: generation-only (defer_generation_only_release)
+    # and context-only (defer_context_only_release, a disaggregated context server).
+    _defer_generation_close: bool = False
+    _defer_context_close: bool = False
+    # Background thread for deferred closes, context claims ahead and context prefetches
+    # (enable_host_helper); None runs everything on the calling thread.
+    _host_helper: KvHostHelper | None = None
+    _helper_releases: bool = False
+    # Deferred closes the helper has finished (only grows; flush_deferred_closes compares it).
+    _num_helper_closes: int = 0
+    # Context claims ahead: request id -> claim, at most _claim_ahead_limit of them.
+    _claim_ahead_limit: int = 0
+    _claims: "dict[int, _ContextClaim]" = {}
+    # Requests whose claim aged out or was released for pages; they are not claimed again.
+    _claims_expired: "set[int]" = set()
+    # Forwards left in which no claim is made, after release_claims_ahead gave pages back.
+    _claims_paused: int = 0
+    _claims_cond: threading.Condition | None = None
+    _claim_stream: torch.cuda.Stream | None = None
+    # Context prefetch: prefetched blocks not yet claimed stay within _prefetch_block_limit.
+    _prefetch_block_limit: int = 0
+    _prefetches: "dict[int, _ContextPrefetch]" = {}
+    _prefetch_blocks: int = 0
+    # Overrides of _CONTEXT_CLAIM_PATH methods that this class defines and that keep context claims
+    # ahead valid; read from each defining class's own namespace, not inherited.
+    _context_claim_safe_overrides: tuple[str, ...] = ()
     # Local layer id -> storage of the draft-owned layers a subclass appends
     # after the layers it describes itself (KimiK3HybridCacheManager).
     # Empty when ``layer_specs`` describes every layer.
@@ -3357,7 +3432,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             if kv_cache_config.host_cache_bind_to_gpu_numa_node:
                 host_tier_numa_node = _host_tier_numa_node(int(host_quota), mapping)
-            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
+            cache_tiers.append(
+                HostCacheTierConfig(
+                    quota=int(host_quota),
+                    free_reserve_fraction=kv_cache_config.host_cache_free_reserve_fraction,
+                )
+            )
         disk_cache_size = kv_cache_config.disk_cache_size
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path
@@ -3371,6 +3451,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     keep_copy_after_restore=kv_cache_config.disk_keep_copy_after_restore,
                     write_through=kv_cache_config.disk_write_through,
                     protected_copy_fraction=kv_cache_config.disk_protected_copy_fraction,
+                    write_behind_bytes=kv_cache_config.disk_write_behind_mib << 20,
                 )
             )
             logger.info(
@@ -3378,7 +3459,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"at {disk_cache_path} (io_threads={kv_cache_config.disk_io_threads}, "
                 f"keep_copy_after_restore={kv_cache_config.disk_keep_copy_after_restore}, "
                 f"write_through={kv_cache_config.disk_write_through}, "
-                f"protected_copy_fraction={kv_cache_config.disk_protected_copy_fraction})"
+                f"protected_copy_fraction={kv_cache_config.disk_protected_copy_fraction}, "
+                f"write_behind_mib={kv_cache_config.disk_write_behind_mib})"
             )
         if kv_cache_config.remote_cache_config is not None and remote_init_error is None:
             try:
@@ -5205,6 +5287,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache_config.cold_tier_offload_min_priority is None
                 else kv_cache_config.cold_tier_offload_min_priority
             ),
+            host_copy_threads=kv_cache_config.host_copy_threads,
+            copy_stream_busy_skip=kv_cache_config.copy_stream_busy_skip,
+            page_staging_mib=kv_cache_config.page_staging_mib,
+            page_staging_depth=kv_cache_config.page_staging_depth,
         )
 
     def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:
@@ -9980,12 +10066,19 @@ class KVCacheManagerV2(BaseResourceManager):
 
             publish_donation_failure(planned, error)
 
-    def enable_deferred_close(self, enabled: bool) -> None:
-        """Turn the deferred close of finished generation-only requests on or off
-        (the overlap executor's switch). Turning it off runs any closes still pending."""
+    def enable_deferred_close(
+        self, enabled: bool, *, context_only: bool = False, generation_only: bool = True
+    ) -> None:
+        """Turn the deferred close of finished disaggregated requests on or off (the overlap
+        executor's switch): generation-only requests with ``generation_only``, context-only ones
+        with ``context_only``. Turning it off runs any closes still pending."""
         if not enabled:
             self.flush_deferred_closes()
-        self._defer_close_enabled = bool(enabled) and not self.is_draft
+        self._defer_close_enabled = (
+            bool(enabled) and not self.is_draft and (generation_only or context_only)
+        )
+        self._defer_generation_close = self._defer_close_enabled and generation_only
+        self._defer_context_close = self._defer_close_enabled and context_only
 
     def _defer_remove_kv_cache(self, request_id: int) -> bool:
         """`_remove_kv_cache` except for the close, which `flush_deferred_closes` runs later.
@@ -10001,26 +10094,420 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.discard(request_id)
         self.kv_cache_map.pop(request_id, None)
         kv_cache.discard_pending_stats()
+        self._mixed_precision_low_prefix_len.pop(request_id, None)
+        if self.num_locality_domains > 1:
+            self._locality_domain_load[kv_cache.locality_domain_id] -= 1
         self._deferred_closes.append((request_id, kv_cache))
+        if self._helper_releases:
+            self._host_helper.submit(RELEASE, self._close_next_deferred)
         return True
 
-    def flush_deferred_closes(self) -> bool:
-        """Close the KvCaches `_defer_remove_kv_cache` left open, oldest first.
+    def _close_deferred(self, request_id: int, kv_cache: _KVCache) -> None:
+        try:
+            if self._sharing is not None:
+                self._sharing._on_free(request_id, kv_cache)
+            kv_cache.close()
+        finally:
+            self.impl.clear_stats_excluded(request_id)
 
-        Returns whether any was pending. A close that raises leaves the later ones queued; its own
-        request is forgotten all the same.
-        """
+    def _close_next_deferred(self) -> None:
+        """The host helper's release item: the oldest deferred close, if one is left."""
+        try:
+            request_id, kv_cache = self._deferred_closes.popleft()
+        except IndexError:
+            return  # flushed on the executor thread already
+        try:
+            self._close_deferred(request_id, kv_cache)
+        finally:
+            self._num_helper_closes += 1
+
+    def _flush_deferred_closes_here(self) -> bool:
         if not self._deferred_closes:
             return False
         while self._deferred_closes:
-            request_id, kv_cache = self._deferred_closes.popleft()
-            try:
-                if self._sharing is not None:
-                    self._sharing._on_free(request_id, kv_cache)
-                kv_cache.close()
-            finally:
-                self.impl.clear_stats_excluded(request_id)
+            self._close_deferred(*self._deferred_closes.popleft())
         return True
+
+    def flush_deferred_closes(self) -> bool:
+        """Close the KvCaches `_defer_remove_kv_cache` left open, oldest first, on this thread.
+        With the host helper, first wait for the close it may be running.
+
+        Returns whether any was pending, or the helper finished one while this call waited for
+        it. Closes the helper finished earlier gave their pages back before the caller ran out,
+        so they do not count: a context request out of pages would otherwise keep waiting for
+        pages that are not coming instead of preempting. A close that raises leaves the later
+        ones queued; its own request is forgotten all the same.
+        """
+        helper = self._host_helper
+        if not self._helper_releases:
+            return self._flush_deferred_closes_here()
+        flushed = []
+        closed_before = self._num_helper_closes
+        helper.drain(RELEASE, lambda: flushed.append(self._flush_deferred_closes_here()))
+        return flushed[0] or self._num_helper_closes != closed_before
+
+    def enable_host_helper(
+        self,
+        device: int | None,
+        *,
+        releases: bool = False,
+        claim_ahead: int = 0,
+        prefetch_blocks: int = 0,
+        start_thread: bool = True,
+    ) -> KvHostHelper | None:
+        """Start the background thread that runs deferred closes (``releases``), context claims
+        ahead (up to ``claim_ahead`` parked caches) and context prefetches (up to
+        ``prefetch_blocks`` prefetched, unclaimed blocks) beside the executor thread, in the
+        windows the executor opens on the returned helper. Returns None when nothing applies.
+        """
+        reasons = []
+        if self.is_draft:
+            reasons.append("a draft pool")
+        if (claim_ahead or prefetch_blocks) and not self.enable_block_reuse:
+            reasons.append("block reuse is off")
+            claim_ahead = prefetch_blocks = 0
+        if claim_ahead and (
+            self.mixed_precision_reuse != "strict"
+            or self.num_locality_domains > 1
+            or self._has_cp_helix
+            or self.kv_connector_manager is not None
+        ):
+            reasons.append(
+                "context claims ahead need strict reuse, one locality domain, no helix and no "
+                "KV connector"
+            )
+            claim_ahead = 0
+        if claim_ahead and (overrides := self._context_claim_path_overrides()):
+            reasons.append(
+                "context claims ahead stand in for the base context-cache path, which "
+                f"{', '.join(overrides)} change"
+            )
+            claim_ahead = 0
+        if releases and self._sharing is not None:
+            reasons.append("deferred closes notify a cache lender on the executor thread")
+            releases = False
+        if reasons:
+            logger.warning(f"KV cache host helper: {'; '.join(reasons)}")
+        if self.is_draft or not (releases or claim_ahead or prefetch_blocks):
+            return None
+        self.stop_host_helper()
+        self._host_helper = KvHostHelper(device, start_thread=start_thread)
+        self._helper_releases = releases
+        self._claim_ahead_limit = claim_ahead
+        self._claims = {}
+        self._claims_expired = set()
+        self._claims_paused = 0
+        self._claims_cond = threading.Condition()
+        self._prefetch_block_limit = prefetch_blocks
+        self._prefetches = {}
+        self._prefetch_blocks = 0
+        logger.info(
+            f"KV cache host helper: releases={releases}, claim_ahead={claim_ahead}, "
+            f"prefetch_blocks={prefetch_blocks}"
+        )
+        return self._host_helper
+
+    def stop_host_helper(self) -> None:
+        """Run the deferred closes, stop the helper thread and close the parked claims.
+
+        Every step runs even when an earlier one raises (a close that fails, say); the first
+        error is raised once all of them have run. A call after a failed one finishes what that
+        one left: the remaining deferred closes and parked claims."""
+        helper = self._host_helper
+        if helper is None and not self._claims and not self._deferred_closes:
+            return
+        errors: list[BaseException] = []
+        if helper is not None:
+            try:
+                self.flush_deferred_closes()
+            except Exception as error:  # noqa: BLE001 - raised below, after the cleanup
+                errors.append(error)
+            self._helper_releases = False
+            try:
+                helper.stop()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+            self._host_helper = None
+        # Each close takes its item off the queue before it runs, so one that raises does not
+        # stop the rest.
+        while self._deferred_closes:
+            try:
+                self._close_deferred(*self._deferred_closes.popleft())
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        # _pop_claim forgets a claim before its cache is closed, so the loop always ends.
+        while self._claims:
+            try:
+                self._drop_claim(next(iter(self._claims)))
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        self._claim_ahead_limit = 0
+        self._claims_expired = set()
+        self._claims_paused = 0
+        for prefetch in self._prefetches.values():
+            prefetch.cancelled = True
+        self._prefetches = {}
+        self._prefetch_blocks = 0
+        self._prefetch_block_limit = 0
+        if errors:
+            raise errors[0]
+
+    # ---- context claims ahead (host helper) --------------------------------------------------
+
+    def _context_claim_path_overrides(self) -> list[str]:
+        """The `_CONTEXT_CLAIM_PATH` methods a subclass overrides without listing them as safe."""
+        overrides = []
+        for name in _CONTEXT_CLAIM_PATH:
+            owner = next(cls for cls in type(self).__mro__ if name in vars(cls))
+            if owner is not KVCacheManagerV2 and name not in vars(owner).get(
+                "_context_claim_safe_overrides", ()
+            ):
+                overrides.append(f"{owner.__name__}.{name}")
+        return overrides
+
+    def _context_create_args(self, req: LlmRequest) -> tuple[ReuseScope, dict]:
+        """The scope and keywords `_create_kv_cache` passes `impl.create_kv_cache` for a context
+        request of this manager (`prepare_context_cache`'s arguments)."""
+        return self._impl_create_args(
+            req.lora_task_id,
+            cache_salt=req.cache_salt,
+            is_dummy=False,
+            enable_request_stats=req.return_perf_metrics,
+            expected_prompt_length=self._expected_prompt_length(req),
+            kv_cache_retention_config=self._retention_config_for_request(req),
+            custom_priority_callback=self._context_priority_callback(req),
+        )
+
+    def claim_context_ahead(self, requests: Sequence[LlmRequest]) -> int:
+        """Queue claims for waiting first context chunks on the host helper, in order, while
+        fewer than the claim limit are parked. Each claim creates and resumes the request's cache
+        (its reused prefix included) on the helper's stream; `_create_kv_cache` adopts it when the
+        scheduler prepares the request. A claim not adopted within four passes (a demoted long
+        prefill, say) is closed, and its request is not claimed again. Returns the number queued."""
+        if not self._claim_ahead_limit:
+            return 0
+        for claim in list(self._claims.values()):
+            claim.passes += 1
+            if claim.passes <= 4:
+                continue
+            # A running claim is left to finish: dropping it here would make this forward wait.
+            # The check and the cancel of a pending one are one step under the condition, so the
+            # helper cannot start it in between.
+            with self._claims_cond:
+                if claim.state == _CLAIM_RUNNING:
+                    continue
+                if claim.state == _CLAIM_PENDING:
+                    claim.state = _CLAIM_FAILED
+            self._drop_claim(claim.request_id)
+            self._claims_expired.add(claim.request_id)
+        if self._claims_paused:
+            self._claims_paused -= 1
+            return 0
+        queued = 0
+        for req in requests:
+            if len(self._claims) >= self._claim_ahead_limit:
+                break
+            request_id = req.py_request_id
+            if (
+                request_id in self._claims
+                or request_id in self._claims_expired
+                or request_id in self.kv_cache_map
+                or not req.is_first_context_chunk
+                or req.is_dummy
+                or req.is_disagg_generation_init_state
+                or request_id in _RESERVED_REQUEST_IDS
+            ):
+                continue
+            if self._claim_stream is None:
+                self._claim_stream = torch.cuda.Stream()
+            tokens = self._context_reuse_tokens(req, self.context_reuse_claim_limit(req))
+            scope, kwargs = self._context_create_args(req)
+            claim = _ContextClaim(request_id, len(tokens))
+            claim.item = functools.partial(
+                self._run_claim, claim, scope, tokens, kwargs, self._claim_stream
+            )
+            self._claims[request_id] = claim
+            self._host_helper.submit(CLAIM, claim.item)
+            queued += 1
+        return queued
+
+    def _run_claim(self, claim: _ContextClaim, scope, tokens, kwargs, stream) -> None:
+        """The host helper's claim item."""
+        with self._claims_cond:
+            if claim.state != _CLAIM_PENDING:
+                return
+            claim.state = _CLAIM_RUNNING
+        kv_cache = None
+        resumed = False
+        try:
+            try:
+                kv_cache = self.impl.create_kv_cache(scope, tokens, id=claim.request_id, **kwargs)
+                kv_cache.cuda_stream = stream.cuda_stream
+                resumed = bool(kv_cache.resume(stream.cuda_stream))
+            except Exception as error:  # noqa: BLE001 - the scheduler claims inline instead
+                logger.warning(
+                    f"context claim ahead of request {claim.request_id} failed: {error!r}"
+                )
+            if not resumed and kv_cache is not None:
+                # Forgotten before the close, which may raise: the claim then still fails.
+                failed, kv_cache = kv_cache, None
+                failed.close()
+        finally:
+            # Only a cache whose resume succeeded is handed over; every other path fails the
+            # claim, so the scheduling pass creates the cache itself.
+            adopt = kv_cache if resumed else None
+            with self._claims_cond:
+                claim.kv_cache = adopt
+                claim.state = _CLAIM_DONE if adopt is not None else _CLAIM_FAILED
+                self._claims_cond.notify_all()
+
+    def _pop_claim(self, request_id: int):
+        """Forget the claim of this request: ``(claim, its resumed cache or None)``, or
+        ``(None, None)`` without one. A queued claim is withdrawn and a running one waited for."""
+        claim = self._claims.pop(request_id, None)
+        if claim is None:
+            return None, None
+        withdraw = False
+        with self._claims_cond:
+            while claim.state == _CLAIM_RUNNING:
+                self._claims_cond.wait()
+            if claim.state == _CLAIM_PENDING:
+                claim.state = _CLAIM_FAILED
+                withdraw = True
+            kv_cache, claim.kv_cache = claim.kv_cache, None
+        if withdraw and self._host_helper is not None and claim.item is not None:
+            # Not left in the queue: it would run as a no-op only in a later forward window.
+            self._host_helper.withdraw(CLAIM, claim.item)
+        claim.item = None
+        return claim, kv_cache
+
+    def _close_claimed(self, request_id: int, kv_cache: _KVCache) -> None:
+        kv_cache.discard_pending_stats()
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+
+    def _take_claim(self, request_id: int, num_tokens: int):
+        """The resumed cache a claim ahead made for this request and this lookup, else None.
+
+        A queued claim is withdrawn, a running one is waited for, and a claim for another lookup
+        is closed: the caller then creates the cache itself."""
+        claim, kv_cache = self._pop_claim(request_id)
+        if kv_cache is not None and claim.num_tokens != num_tokens:
+            self._close_claimed(request_id, kv_cache)
+            return None
+        return kv_cache
+
+    def _drop_claim(self, request_id: int) -> bool:
+        """Close the claim of this request, if it has one; returns whether it held a cache."""
+        _, kv_cache = self._pop_claim(request_id)
+        if kv_cache is None:
+            return False
+        self._close_claimed(request_id, kv_cache)
+        return True
+
+    @property
+    def context_claim_limit(self) -> int:
+        """Claims ahead the host helper may park (kv_cache_config.context_claim_ahead); 0: off."""
+        return self._claim_ahead_limit
+
+    def context_claim_room(self) -> int:
+        """Claims the next `claim_context_ahead` call may queue: the limit less the parked
+        claims; 0 while claims are off or paused after `release_claims_ahead`."""
+        if not self._claim_ahead_limit or self._claims_paused:
+            return 0
+        return max(self._claim_ahead_limit - len(self._claims), 0)
+
+    def has_context_claim(self, request_id: int) -> bool:
+        """Whether a claim ahead is parked (queued, running or done) for this request."""
+        return request_id in self._claims
+
+    def context_claim_given_up(self, request_id: int) -> bool:
+        """Whether this request's claim aged out or was released: it is not claimed again."""
+        return request_id in self._claims_expired
+
+    def committed_prompt_depth(self, prompt_len: int) -> int:
+        """Prompt tokens a finished prefill of ``prompt_len`` tokens leaves reusable for a
+        later prompt that extends it, as a lower bound: its full blocks. Managers whose reuse
+        ends at recurrent-state snapshots override it."""
+        if not self.enable_block_reuse:
+            return 0
+        return prompt_len // self.tokens_per_block * self.tokens_per_block
+
+    def release_claims_ahead(self) -> bool:
+        """Close every parked claim, so that its pages go back to the pool. Their requests are
+        not claimed again, and no claim is made in the next four forwards: claims made meanwhile
+        would take the pages back before the request that needs them is scheduled. Returns
+        whether a claim held pages. The scheduler calls it before it suspends a running request
+        for pages."""
+        if not self._claim_ahead_limit:
+            return False
+        self._claims_paused = 4
+        released = False
+        for request_id in list(self._claims):
+            released |= self._drop_claim(request_id)
+            self._claims_expired.add(request_id)
+        return released
+
+    # ---- context prefetch (host helper) ------------------------------------------------------
+
+    def offer_context_prefetch(self, requests: Sequence[LlmRequest]) -> int:
+        """Queue a GPU-tier prefetch of each new first context chunk's reusable prefix on the host
+        helper, while the prefetched blocks not yet claimed stay within the bound. Returns the
+        number queued."""
+        if not self._prefetch_block_limit or not self.can_evict:
+            return 0  # nothing below the GPU tier to bring up
+        # A prefetch that raised or brought nothing up gives its blocks back to the bound now,
+        # not when its request is admitted or freed. Its request is not offered again.
+        for prefetch in [p for p in self._prefetches.values() if p.failed]:
+            self._prefetch_blocks -= prefetch.num_blocks
+            prefetch.num_blocks = 0
+        queued = 0
+        for req in requests:
+            request_id = req.py_request_id
+            if (
+                request_id in self._prefetches
+                or request_id in self.kv_cache_map
+                or not req.is_first_context_chunk
+                or req.is_dummy
+                or req.is_disagg_generation_init_state
+            ):
+                continue
+            tokens = self._context_reuse_tokens(req)
+            num_blocks = len(tokens) // self.tokens_per_block
+            if num_blocks == 0 or self._prefetch_blocks + num_blocks > self._prefetch_block_limit:
+                continue
+            prefetch = _ContextPrefetch(request_id, num_blocks)
+            self._prefetches[request_id] = prefetch
+            self._prefetch_blocks += num_blocks
+            scope = ReuseScope(
+                lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)
+            )
+            prefetch.item = functools.partial(self._run_prefetch, prefetch, scope, tokens)
+            self._host_helper.submit(PREFETCH, prefetch.item)
+            queued += 1
+        return queued
+
+    def _run_prefetch(self, prefetch: _ContextPrefetch, scope, tokens) -> None:
+        """The host helper's prefetch item. A failure is only flagged on the prefetch: the
+        executor thread owns the prefetch bound."""
+        if prefetch.cancelled:
+            return
+        try:
+            if self.impl.prefetch_reuse(scope, tokens, GPU_LEVEL) is False:
+                prefetch.failed = True
+        except Exception as error:  # noqa: BLE001 - the request restores its prefix inline
+            prefetch.failed = True
+            logger.warning(f"context prefetch of request {prefetch.request_id} failed: {error!r}")
+
+    def _end_prefetch(self, request_id: int) -> None:
+        prefetch = self._prefetches.pop(request_id, None)
+        if prefetch is not None:
+            prefetch.cancelled = True
+            self._prefetch_blocks -= prefetch.num_blocks
+            prefetch.num_blocks = 0
+            if self._host_helper is not None and prefetch.item is not None:
+                self._host_helper.withdraw(PREFETCH, prefetch.item)
+            prefetch.item = None
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -10060,10 +10547,18 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
+        if self._claim_ahead_limit:
+            self._drop_claim(request.py_request_id)
+            self._claims_expired.discard(request.py_request_id)
+        if self._prefetches:
+            self._end_prefetch(request.py_request_id)
         # Dummies reuse request ids, so their closes stay immediate.
         if (
             self._defer_close_enabled
-            and request.is_generation_only_request
+            and (
+                (self._defer_generation_close and request.is_generation_only_request)
+                or (self._defer_context_close and request.is_context_only_request)
+            )
             and not pin_on_release
             and not request.is_dummy
             # Host history reservations back admission; keep their release with the close.
@@ -10468,7 +10963,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.event_manager.shutdown()
 
     def _shutdown_caches(self) -> None:
-        # impl.shutdown() raises while any cache is open, deferred ones included.
+        # impl.shutdown() raises while any cache is open, deferred and claimed ones included.
+        self.stop_host_helper()
         self.enable_deferred_close(False)
         # Before the caches close: a lender waiting on a lease has to be told to stop while
         # the caches it lent against are still alive.
@@ -11300,6 +11796,58 @@ class KVCacheManagerV2(BaseResourceManager):
             if expected_prompt_length is None and input_tokens is not None:
                 expected_prompt_length = len(input_tokens)
             input_tokens = None
+        kv_cache = None
+        if self._claims and input_tokens is not None:
+            # Created and resumed ahead on the host helper (claim_context_ahead).
+            kv_cache = self._take_claim(request_id, len(input_tokens))
+        if kv_cache is None:
+            scope, create_kwargs = self._impl_create_args(
+                lora_task_id,
+                cache_salt=cache_salt,
+                is_dummy=is_dummy,
+                enable_request_stats=enable_request_stats,
+                expected_prompt_length=expected_prompt_length,
+                kv_cache_retention_config=kv_cache_retention_config,
+                custom_priority_callback=custom_priority_callback,
+            )
+            kv_cache = self.impl.create_kv_cache(
+                scope,
+                input_tokens,
+                id=request_id,
+                locality_domain_id=locality_domain_id,
+                optional_reuse_max_backtrack=optional_reuse_max_backtrack,
+                **create_kwargs,
+            )
+        if self._prefetches:
+            self._end_prefetch(request_id)
+        enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
+        self.kv_cache_map[request_id] = kv_cache
+        if locality_domain_id is not None:
+            self._locality_domain_load[locality_domain_id] += 1
+            if not is_dummy and self._locality_domain_pending[locality_domain_id] > 0:
+                self._locality_domain_pending[locality_domain_id] -= 1
+        if enable_request_stats and not self.enable_stats:
+            self._request_stats_enabled_ids.add(request_id)
+        if is_dummy:
+            kv_cache.stop_committing()
+            self.impl.mark_stats_excluded(request_id)
+            kv_cache.discard_pending_stats()
+        self.index_mapper.add_new_sequence(request_id)
+        self._set_page_index_bufs(request_id, kv_cache)
+        return kv_cache
+
+    def _impl_create_args(
+        self,
+        lora_task_id: int | None,
+        *,
+        cache_salt: str | None,
+        is_dummy: bool,
+        enable_request_stats: bool,
+        expected_prompt_length: int | None,
+        kv_cache_retention_config: KvCacheRetentionConfig | None,
+        custom_priority_callback: PagePriorityCallback | None,
+    ) -> tuple[ReuseScope, dict]:
+        """The reuse scope and the request-dependent keywords of `impl.create_kv_cache`."""
         reuse_salt = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
@@ -11326,31 +11874,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     return custom_priority_callback(ordinal, life_cycle)
 
                 priority_kwargs["custom_priority_callback"] = priority
-        kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
-            input_tokens,
-            id=request_id,
+        return ReuseScope(lora_id=lora_task_id, salt=reuse_salt), dict(
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
-            locality_domain_id=locality_domain_id,
-            optional_reuse_max_backtrack=optional_reuse_max_backtrack,
             **priority_kwargs,
         )
-        self.kv_cache_map[request_id] = kv_cache
-        if locality_domain_id is not None:
-            self._locality_domain_load[locality_domain_id] += 1
-            if not is_dummy and self._locality_domain_pending[locality_domain_id] > 0:
-                self._locality_domain_pending[locality_domain_id] -= 1
-        if enable_request_stats and not self.enable_stats:
-            self._request_stats_enabled_ids.add(request_id)
-        if is_dummy:
-            kv_cache.stop_committing()
-            self.impl.mark_stats_excluded(request_id)
-            kv_cache.discard_pending_stats()
-        self.index_mapper.add_new_sequence(request_id)
-        self._set_page_index_bufs(request_id, kv_cache)
-        return kv_cache
 
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None, cache_salt=None):
         """Probe the v2 KV cache radix tree for prefix match length.

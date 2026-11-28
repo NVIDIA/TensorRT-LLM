@@ -2373,3 +2373,94 @@ def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
         TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
     for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
         assert Draft202012Validator(schemas[filename]).is_valid(launch), filename
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_config", "loop", "valid"),
+    [
+        *(
+            (kv, loop, valid)
+            for kv in (
+                {"defer_context_only_release": True},
+                {"defer_generation_only_release": True, "deferred_release_thread": True},
+                {"context_claim_ahead": 6},
+                {"context_prefetch_blocks": 24000},
+            )
+            for loop, valid in (
+                ({}, True),
+                ({"disable_overlap_scheduler": True}, False),
+                ({"pipeline_parallel_size": 2}, False),
+            )
+        ),
+        ({"context_claim_ahead": 0}, {"disable_overlap_scheduler": True}, True),
+        ({"deferred_release_thread": True}, {}, False),
+        ({"context_claim_ahead": 6, "enable_block_reuse": False}, {}, False),
+        ({"context_prefetch_blocks": 8, "enable_block_reuse": False}, {}, False),
+        ({"defer_context_only_release": True, "use_kv_cache_manager_v2": False}, {}, False),
+    ],
+)
+def test_host_helper_rules_match_runtime(
+    schemas: dict[str, dict], kv_cache_config: dict, loop: dict, valid: bool
+) -> None:
+    """Both schemas accept the KV cache host helper fields exactly when KvCacheConfig and TorchLlmArgs do."""
+    from types import SimpleNamespace
+
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+
+    def runtime_accepts() -> bool:
+        try:
+            args = SimpleNamespace(
+                kv_cache_config=KvCacheConfig(**kv_cache_config),
+                disable_overlap_scheduler=loop.get("disable_overlap_scheduler", False),
+                pipeline_parallel_size=loop.get("pipeline_parallel_size", 1),
+            )
+            TorchLlmArgs.validate_defer_generation_only_release(args)
+        except (ValidationError, ValueError):
+            return False
+        return True
+
+    assert runtime_accepts() == valid
+    config = {"kv_cache_config": kv_cache_config, **loop}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            # The worker sections carry the same rules as the root.
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
+
+
+@pytest.mark.parametrize(
+    ("depth", "busy_skip", "valid"),
+    [(4, 64, False), (4, 0, True), (1, 64, True)],
+)
+def test_page_staging_depth_and_busy_skip_rule_matches_runtime(
+    schemas: dict[str, dict], tmp_path, depth: int, busy_skip: int, valid: bool
+) -> None:
+    """Both schemas refuse page_staging_depth > 1 with copy_stream_busy_skip > 0, as KvCacheConfig does."""
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    kv_cache_config = {
+        "use_kv_cache_manager_v2": True,
+        "disk_cache_size": 2048,
+        "disk_cache_path": str(tmp_path),
+        "page_staging_depth": depth,
+        "copy_stream_busy_skip": busy_skip,
+    }
+    try:
+        KvCacheConfig(**kv_cache_config)
+        runtime_accepts = True
+    except ValidationError:
+        runtime_accepts = False
+    assert runtime_accepts == valid
+    config = {"kv_cache_config": kv_cache_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section

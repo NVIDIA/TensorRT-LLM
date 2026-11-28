@@ -125,6 +125,7 @@ from .hang_detector import (HangDetector, distributed_warmup_guard,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .iteration_stats import IterationStatsRecord
+from .kv_cache.host_helper import RELEASE
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
@@ -728,6 +729,12 @@ class _ExecutorExecutionConfig:
     transfer_budget_is_explicit: bool = False
     # kv_cache_config.defer_generation_only_release.
     defer_generation_only_release: bool = False
+    # kv_cache_config.defer_context_only_release, deferred_release_thread,
+    # context_claim_ahead and context_prefetch_blocks.
+    defer_context_only_release: bool = False
+    deferred_release_thread: bool = False
+    context_claim_ahead: int = 0
+    context_prefetch_blocks: int = 0
 
 
 def _without_batch_idx_first(requests: List[LlmRequest]) -> List[LlmRequest]:
@@ -761,8 +768,15 @@ class PyExecutor:
     # count for the busy-path fetch; set at construction.
     _fetch_hint_enabled = False
     # Whether the overlap loop defers the KV cache close of finished
-    # generation-only requests (kv_cache_config.defer_generation_only_release).
+    # generation-only or context-only requests
+    # (kv_cache_config.defer_generation_only_release / defer_context_only_release).
     _defer_generation_only_release = False
+    # The KV cache manager's host helper (kv_cache_config.deferred_release_thread,
+    # context_claim_ahead, context_prefetch_blocks), started by the overlap loop.
+    _kv_host_helper = None
+    # KVCacheV2Scheduler.note_generation_release when
+    # scheduler_config.gen_init_pause_after_release is on.
+    _note_generation_release = None
     # Whether the model forward runs under torch.compile; read once at construction.
     _uses_torch_compile = False
     # TLLM_BENCHMARK_REQ_QUEUES_SIZE schedule state; see _configure_benchmark_req_queues_size.
@@ -851,6 +865,10 @@ class PyExecutor:
         gen_preemption: Optional[GenPreemptionConfig] = None,
         transfer_budget_is_explicit: bool = False,
         defer_generation_only_release: bool = False,
+        defer_context_only_release: bool = False,
+        deferred_release_thread: bool = False,
+        context_claim_ahead: int = 0,
+        context_prefetch_blocks: int = 0,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
             raise ValueError(
@@ -943,6 +961,10 @@ class PyExecutor:
             enable_kv_pool_rebalance=enable_kv_pool_rebalance,
             transfer_budget_is_explicit=transfer_budget_is_explicit,
             defer_generation_only_release=defer_generation_only_release,
+            defer_context_only_release=defer_context_only_release,
+            deferred_release_thread=deferred_release_thread,
+            context_claim_ahead=context_claim_ahead,
+            context_prefetch_blocks=context_prefetch_blocks,
         )
         self._resources_released = False
         self._closed = False
@@ -1222,9 +1244,14 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
-        self._defer_generation_only_release = (
-            self._is_kv_manager_v2
-            and self._execution_config.defer_generation_only_release)
+        execution_config = self._execution_config
+        self._defer_generation_only_release = self._is_kv_manager_v2 and (
+            execution_config.defer_generation_only_release
+            or execution_config.defer_context_only_release)
+        self._note_generation_release = (
+            self.scheduler.note_generation_release
+            if isinstance(self.scheduler, KVCacheV2Scheduler)
+            and self.scheduler._gen_init_pause_after_release else None)
         # The KV cache manager takes Mamba snapshots inside the forward and
         # finishes them on the execution stream right after it (_forward_step).
         self._finish_inforward_snapshots = (
@@ -8396,7 +8423,15 @@ class PyExecutor:
         # next batch's preparation.
         defer_kv_close = self._defer_generation_only_release
         if defer_kv_close:
-            self.kv_cache_manager.enable_deferred_close(True)
+            self.kv_cache_manager.enable_deferred_close(
+                True,
+                context_only=self._execution_config.defer_context_only_release,
+                generation_only=self._execution_config.
+                defer_generation_only_release)
+        helper = self._start_kv_host_helper()
+        # Deferred closes the helper has not started by the end of a forward run
+        # here instead once this many are queued.
+        helper_release_backlog = 8
         with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
                 self.hang_detector:
             iter_start_time = time.time()
@@ -8608,8 +8643,11 @@ class PyExecutor:
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
 
-                if defer_kv_close:
-                    # Closes left by the previous iteration's terminations.
+                if defer_kv_close and (
+                        not self.kv_cache_manager._helper_releases or
+                        helper.num_pending(RELEASE) > helper_release_backlog):
+                    # Closes left by the previous iteration's terminations; the
+                    # host helper runs them in the GPU waits instead.
                     self.kv_cache_manager.flush_deferred_closes()
 
                 # Staged responses go out now, so the response threads work
@@ -8618,9 +8656,13 @@ class PyExecutor:
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._intake_window_started = time.monotonic()
                     self._intake_window.set()
+                    if helper is not None:
+                        helper.begin_wait()
                     try:
                         self._update_requests(self.previous_batch.sample_state)
                     finally:
+                        if helper is not None:
+                            helper.end_wait()
                         if not self.is_shutdown:
                             self._intake_window.clear()
                     # Turning off speculative decoding when Acceptance Rate is low.
@@ -10460,6 +10502,8 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if self._kv_host_helper is not None:
+            self.kv_cache_manager.offer_context_prefetch(validated_requests)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             with disagg_diagnostics.suppress_diagnostic_errors():
                 for request in validated_requests:
@@ -12432,6 +12476,83 @@ class PyExecutor:
         scheduled_requests: ScheduledRequests,
         new_tensors_device: Optional[SampleStateTensors] = None
     ) -> Optional[dict[str, object]]:
+        helper = self._kv_host_helper
+        if helper is None:
+            return self._forward_step_impl(scheduled_requests,
+                                           new_tensors_device)
+        # A CUDA graph is captured only for a batch with generation requests, in
+        # warmup, or by torch.compile: the helper starts nothing in such a
+        # forward and has finished its running item when it begins.
+        may_capture = (bool(scheduled_requests.generation_requests)
+                       or self.is_warmup or self._uses_torch_compile)
+        helper.begin_forward(may_capture)
+        try:
+            if not may_capture:
+                self.kv_cache_manager.claim_context_ahead(
+                    self._context_claim_candidates(scheduled_requests))
+            return self._forward_step_impl(scheduled_requests,
+                                           new_tensors_device)
+        finally:
+            helper.end_forward()
+
+    def _context_claim_candidates(self, scheduled_requests: ScheduledRequests):
+        """Waiting first context chunks outside this batch: the ones the scheduler picked
+        (scheduler_config.context_claim_hold), else all of them in arrival order."""
+        scheduled = {
+            req.py_request_id
+            for req in scheduled_requests.context_requests
+        }
+        context_init = LlmRequestState.CONTEXT_INIT
+        picked = getattr(self.scheduler, "context_claim_candidates", None)
+        requests = picked if isinstance(picked, list) else self.active_requests
+        return (req for req in requests
+                if req.state == context_init and req.is_first_context_chunk and
+                not req.is_dummy_request and req.py_request_id not in scheduled)
+
+    def _start_kv_host_helper(self):
+        """Start the KV cache manager's host helper for the overlap loop, or None."""
+        config = self._execution_config
+        if not self._is_kv_manager_v2:
+            return None
+        releases = (config.deferred_release_thread
+                    and self._defer_generation_only_release)
+        claim_ahead = config.context_claim_ahead
+        mapping = self.dist.mapping
+        if (releases or claim_ahead or config.context_prefetch_blocks) and (
+                mapping.has_cp() or
+            (mapping.has_tp() and mapping.tp_group_shares_requests)):
+            # Ranks that schedule the same requests in lock step need the same
+            # free pages and reuse matches at every pass. The helper's timing
+            # differs between ranks, so their schedules could diverge.
+            logger.warning(
+                "kv_cache_config.deferred_release_thread, context_claim_ahead "
+                "and context_prefetch_blocks are ignored on ranks that "
+                "schedule in lock step (tensor parallelism without attention "
+                "DP, context parallelism)")
+            self._kv_host_helper = None
+            return None
+        if claim_ahead and (getattr(self.scheduler, "_joint_draft_manager",
+                                    None) is not None
+                            or config.enable_kv_pool_rebalance):
+            # A paired draft pool claims at a depth both pools probe in the
+            # pass; a rebalance moves pages that a parked claim holds.
+            logger.warning(
+                "kv_cache_config.context_claim_ahead is ignored with a paired "
+                "draft KV cache pool or enable_kv_pool_rebalance")
+            claim_ahead = 0
+        helper = self.kv_cache_manager.enable_host_helper(
+            self.device_id,
+            releases=releases,
+            claim_ahead=claim_ahead,
+            prefetch_blocks=config.context_prefetch_blocks)
+        self._kv_host_helper = helper
+        return helper
+
+    def _forward_step_impl(
+        self,
+        scheduled_requests: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None
+    ) -> Optional[dict[str, object]]:
         self._maybe_record_hang_diagnostic_phase(
             "forward_call",
             scheduled_requests,
@@ -13134,6 +13255,10 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
         self._free_request_resources(request)
+        note_release = self._note_generation_release
+        if (note_release is not None and request.is_generation_only_request
+                and not request.is_dummy_request):
+            note_release()
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         self._release_multimodal_resources(request)

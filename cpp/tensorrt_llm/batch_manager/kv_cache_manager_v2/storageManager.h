@@ -441,6 +441,18 @@ public:
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
 
+    //! The page staging ring as built (KVCacheManagerConfig::pageStagingMiB / pageStagingDepth), and how many ring
+    //! stretches page moves between GPU and disk have issued on extra streams (pageStagingDepth > 1).
+    struct PageStagingInfo
+    {
+        size_t bytes{0};            //!< Ring size; 0 when no level needs one.
+        size_t depth{1};            //!< Stretches one move keeps in flight.
+        uint64_t laneChunks{0};     //!< Stretches issued on a move's extra streams so far.
+        uint64_t laneReadChunks{0}; //!< Those of them that moved pages from disk to GPU.
+    };
+
+    [[nodiscard]] PageStagingInfo pageStagingInfo() const noexcept;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
@@ -578,6 +590,12 @@ private:
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
         PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+    //! The disk half of submitMigrationBatch: the pages pass through the page staging ring, one stretch at a time on
+    //! `stream`, or with mPageStagingDepth > 1 in stretches of at most 1/depth of the ring, round-robin on that many
+    //! extra streams that start after `stream` and that `stream` waits for before returning.
+    void submitStagedDiskMigration(bool srcIsHot, LayerGroupId batchingLayerGroupId, PoolGroupBase& srcPoolGroup,
+        PoolGroupBase& dstPoolGroup, size_t coldPageBytes, PageIndexPair const* pageIndices, size_t numPages,
+        CUstream stream);
 
     //! The level's storage when it is a remote level (storage/remoteMem.h), else null.
     [[nodiscard]] RemoteCacheLevelStorage* remoteLevel(CacheLevel level) const;
@@ -705,8 +723,12 @@ private:
     int mNumLocalityDomains{1};
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
 
-    static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
+    // The page staging ring holds at least this many of the largest cold pages, whatever its configured size.
     static constexpr size_t kPageStagingDepth = 3;
+    // Ring stretches one page move between GPU and disk keeps in flight (StorageConfig::pageStagingDepth).
+    size_t mPageStagingDepth = 1;
+    uint64_t mPageStagingLaneChunks = 0;
+    uint64_t mPageStagingLaneReadChunks = 0;
     static constexpr size_t kMaxIndexBatchBytes = 64u << 10u;
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
@@ -743,6 +765,12 @@ private:
 
     TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt;   // per level: keepCopyAfterRestore of that disk tier
     TypedVec<CacheLevel, float> mProtectedCopyFractionAt; // per level: protectedCopyFraction of that disk tier
+    TypedVec<CacheLevel, float> mFreeReserveFractionAt;   // per level: freeReserveFraction of that host tier
+    // Nonzero while _prepareFreeSlots must take only the slots asked for: a shrink's defragmentation (its overflow
+    // pages must stay at their level), or the retry of a preparation that the reserve's extra evictions failed.
+    int mFreeReserveSuppressed = 0;
+    // The current _prepareFreeSlots call evicted ahead of need for a reserve.
+    bool mFreeReserveApplied = false;
     //! Retained copies the pool group may hold ahead of pages whose only copy is at \p level.
     [[nodiscard]] SlotCount protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const;
     // Oldest first.

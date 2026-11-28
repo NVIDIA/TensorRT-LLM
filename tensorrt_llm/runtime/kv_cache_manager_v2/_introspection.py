@@ -70,6 +70,39 @@ def async_disk_io_enabled() -> bool:
     return bool(_cpp().async_disk_io_enabled())
 
 
+def host_copy_threads() -> int:
+    """Threads a host-side copy callback may use now, the CUDA callback thread included."""
+    return int(_cpp().host_copy_threads())
+
+
+def set_host_copy_threads_for_testing(num_threads: int) -> int:
+    """Set the host copy width (1: every task on the callback thread) whatever was configured.
+
+    Returns the width set, which is smaller when not every worker thread started.
+    """
+    return int(_cpp().set_host_copy_threads_for_testing(num_threads))
+
+
+def host_copy_helper_tasks_for_testing() -> int:
+    """Page tasks of host-side copy callbacks run by pool workers (not by the callback thread) so far."""
+    return int(_cpp().host_copy_helper_tasks_for_testing())
+
+
+def copy_stream_busy_skip() -> int:
+    """Busy pooled streams a temporary copy stream may skip (0: off)."""
+    return int(_cpp().copy_stream_busy_skip())
+
+
+def set_copy_stream_busy_skip_for_testing(max_busy: int) -> None:
+    """Set the busy-stream skip bound whatever was configured."""
+    _cpp().set_copy_stream_busy_skip_for_testing(max_busy)
+
+
+def busy_copy_streams_skipped_for_testing() -> int:
+    """Busy pooled streams temporary copy streams have skipped so far."""
+    return int(_cpp().busy_copy_streams_skipped_for_testing())
+
+
 def inject_disk_write_failures_for_testing(count: int) -> None:
     """Make the next ``count`` disk write pieces fail without writing."""
     _cpp().inject_disk_write_failures_for_testing(count)
@@ -82,6 +115,23 @@ def delay_background_disk_writes_for_testing(seconds: float) -> None:
     A piece promoted to a required write is not delayed.
     """
     _cpp().delay_background_disk_writes_for_testing(seconds)
+
+
+def disk_write_behind_pages_for_testing() -> int:
+    """Pages in disk write-behind staging: pending a flush, or kept after a failed one."""
+    return int(_cpp().disk_write_behind_pages_for_testing())
+
+
+def wait_for_disk_io_for_testing() -> None:
+    """Return once the async disk I/O pool has no piece queued or running (at once without the pool): every queued
+    write-behind flush has then been attempted."""
+    _cpp().wait_for_disk_io_for_testing()
+
+
+def delay_disk_write_behind_flushes_for_testing(seconds: float) -> None:
+    """A disk write-behind flush starts only once it has been queued for ``seconds`` (0: no delay), so reads of the
+    staged pages are served from staging meanwhile."""
+    _cpp().delay_disk_write_behind_flushes_for_testing(seconds)
 
 
 def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]) -> Any:
@@ -276,6 +326,13 @@ def level_pool_groups(manager: Any, cache_level: int) -> list[tuple[int, int, li
         (int(slots), int(slot_bytes), list(life_cycles))
         for slots, slot_bytes, life_cycles in _cpp().level_pool_groups(manager, cache_level)
     ]
+
+
+def page_staging(manager: Any) -> dict[str, int]:
+    """The page staging ring of the storage manager: ``bytes`` (0 without one), ``depth`` (stretches one disk move
+    keeps in flight), ``lane_chunks`` (stretches issued on a move's extra streams so far) and ``lane_read_chunks``
+    (those of them that moved pages from disk to GPU)."""
+    return dict(_cpp().page_staging(manager))
 
 
 def disk_copy_counters(manager: Any) -> dict[str, int]:

@@ -127,6 +127,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # Context claims ahead (KVCacheManagerV2.enable_host_helper): _create_kv_cache only logs the
+    # reuse of the cache the base created or adopted.
+    _context_claim_safe_overrides = ("_create_kv_cache",)
     # Whether a decode step whose requests, SSM base blocks and dummy flags all
     # match the last upload keeps the uploaded state indices and dummy mask
     # without rebuilding them.
@@ -775,6 +778,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             buffer.size
             for layer_id in self.mamba_pp_layers
             for buffer in self._get_recurrent_buffer_configs(layer_id)
+        )
+
+    def committed_prompt_depth(self, prompt_len: int) -> int:
+        """A later prompt reuses a finished prefill up to a recurrent-state snapshot: the
+        deepest one its from-end offsets place (``mamba_state_config``); 0 without one (a
+        snapshot grid alone is not taken as committed)."""
+        if not self.kv_cache_config.enable_block_reuse:
+            return 0
+        offsets = self.kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_end
+        return max(
+            (prompt_len - offset for offset in offsets if 0 < offset < prompt_len), default=0
         )
 
     def _num_ssm_snapshots_for_capacity(

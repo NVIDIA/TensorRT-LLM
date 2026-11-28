@@ -198,16 +198,27 @@ def _is_set_to(name: str, schema: dict) -> dict:
     return {"properties": {name: schema}, "required": [name]}
 
 
+# KvCacheConfig fields of the overlap loop's deferred releases and KV cache host helper, with the
+# value that turns each on (llm_args._KV_CACHE_HOST_HELPER_FIELDS).
+_HOST_HELPER_FIELDS_ON = {
+    "defer_generation_only_release": {"const": True},
+    "defer_context_only_release": {"const": True},
+    "deferred_release_thread": {"const": True},
+    "context_claim_ahead": {"type": "integer", "minimum": 1},
+    "context_prefetch_blocks": {"type": "integer", "minimum": 1},
+}
+
+
 def _launch_rules() -> list[dict]:
     """Top-level ``if``/``then`` rules: DWDP and ``validate_defer_generation_only_release()``.
 
     ``_dwdp_launch_rules()``, plus ``TorchLlmArgs.validate_defer_generation_only_release()`` (the overlap loop
-    without pipeline parallelism). As there, values the YAML does not set are left to runtime validation.
+    without pipeline parallelism, for every host helper field). As there, values the YAML does not set are left
+    to runtime validation.
     """
-    defer = {"type": "object", **_is_set_to("defer_generation_only_release", {"const": True})}
     return _dwdp_launch_rules() + [
         {
-            "if": _is_set_to("kv_cache_config", defer),
+            "if": _is_set_to("kv_cache_config", {"type": "object", **_is_set_to(name, on)}),
             "then": {
                 "properties": {
                     "disable_overlap_scheduler": {"not": {"const": True}},
@@ -215,6 +226,7 @@ def _launch_rules() -> list[dict]:
                 }
             },
         }
+        for name, on in _HOST_HELPER_FIELDS_ON.items()
     ]
 
 
@@ -236,12 +248,34 @@ def _cross_field_rules(definitions: dict) -> None:
         {"required": ["donor"], "properties": {"donor": {"type": "object"}}},
         {"required": ["level"], "properties": {"level": {"type": "object"}}},
     ]
-    # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release().
+    # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release() (the host
+    # helper fields).
     kv_v2 = {"properties": {"use_kv_cache_manager_v2": {"not": {"const": False}}}}
     definitions["KvCacheConfig"].setdefault("allOf", []).extend(
         [
             when(_is_set_to("remote_cache_config", {"type": "object"}), kv_v2),
-            when(_is_set_to("defer_generation_only_release", {"const": True}), kv_v2),
+            *(when(_is_set_to(name, on), kv_v2) for name, on in _HOST_HELPER_FIELDS_ON.items()),
+            when(
+                _is_set_to("deferred_release_thread", {"const": True}),
+                {
+                    "anyOf": [
+                        _is_set_to("defer_generation_only_release", {"const": True}),
+                        _is_set_to("defer_context_only_release", {"const": True}),
+                    ]
+                },
+            ),
+            *(
+                when(
+                    _is_set_to(name, _HOST_HELPER_FIELDS_ON[name]),
+                    {"properties": {"enable_block_reuse": {"not": {"const": False}}}},
+                )
+                for name in ("context_claim_ahead", "context_prefetch_blocks")
+            ),
+            # validate_disk_cache_config(): a page_staging_depth above 1 refuses busy-stream skipping.
+            when(
+                _is_set_to("page_staging_depth", {"type": "integer", "minimum": 2}),
+                {"properties": {"copy_stream_busy_skip": {"maximum": 0}}},
+            ),
             when(
                 _is_set_to("remote_cache_config", _is_set_to("level", {"type": "object"})),
                 {

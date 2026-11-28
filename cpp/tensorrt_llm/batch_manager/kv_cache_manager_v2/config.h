@@ -73,6 +73,17 @@ struct HostCacheTierConfig
     //! host memory's placement strict; the tier itself does not read it.
     bool allowRemoteNumaFallback = true;
 
+    //! Upper bound of freeReserveFraction, matching KvCacheConfig.host_cache_free_reserve_fraction.
+    static constexpr float kMaxFreeReserveFraction = 0.25F;
+
+    //! Share of each pool group's slots, 0 to kMaxFreeReserveFraction, that evictions keep free ahead of need while a
+    //! tier below this one takes them. A slot freed by an eviction is usable only once its page has been copied to
+    //! the tier below, so on a full tier every incoming page (a GPU -> host eviction, and the restore waiting for the
+    //! GPU slot it frees) waits for a write-out. With a reserve, each eviction pass evicts enough to leave the
+    //! reserve free again: evictions keep their size but run one reserve ahead, and incoming pages take slots whose
+    //! write-out has finished. 0 (default): evict only what is needed. No effect on the last tier.
+    float freeReserveFraction = 0.0F;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
@@ -84,6 +95,8 @@ struct HostCacheTierConfig
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
         if (maxQuota.has_value() && *maxQuota < quota)
             throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
+        if (!(freeReserveFraction >= 0.0F && freeReserveFraction <= kMaxFreeReserveFraction)) // also rejects NaN
+            throw std::invalid_argument("HostCacheTierConfig: freeReserveFraction must be between 0 and 0.25");
     }
 };
 
@@ -113,6 +126,12 @@ struct DiskCacheTierConfig
     //! released only for what evicting those pages cannot cover. 1 favors saving writes (write-bound deployments); a
     //! lower value keeps more distinct pages on disk (capacity-bound deployments).
     float protectedCopyFraction = 1.0F;
+
+    //! Host memory, in bytes, for write-behind of host -> disk writes (0: off). A page write that fits completes once
+    //! the page is copied there, so the host slot it came from is free at memory speed; an I/O worker writes the file
+    //! afterwards, and reads of the page are served from that memory until then. Requires numIoThreads > 0.
+    //! Process-wide, like the I/O pool: the last disk tier configured sets it.
+    size_t writeBehindBytes = 0;
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -767,6 +786,46 @@ struct KVCacheManagerConfig
     Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
 
     HostMemBackingConfig hostMemBacking;
+
+    //! Upper bound of hostCopyThreads, matching KvCacheConfig.host_copy_threads.
+    static constexpr int kMaxHostCopyThreads = 64;
+
+    //! Threads, 1 to kMaxHostCopyThreads, that one host-side copy callback (host <-> host, disk <-> disk, and
+    //! host <-> disk without the async disk I/O pool) spreads its page tasks over, the CUDA callback thread included.
+    //! CUDA runs a context's host functions one at a time, so with 1 every later host function, and every copy queued
+    //! behind one, waits for the whole callback. The callback still returns only once every task has finished.
+    //! Process-wide: the first manager that sets a value above 1 sets it for the life of the process.
+    int hostCopyThreads = 1;
+
+    //! Upper bound of copyStreamBusySkip, matching KvCacheConfig.copy_stream_busy_skip.
+    static constexpr int kMaxCopyStreamBusySkip = 4096;
+
+    //! Pooled CUDA streams, 0 to kMaxCopyStreamBusySkip, that a page copy skips while they still have work pending
+    //! (0: it takes the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted,
+    //! so without skipping, a restore can be queued behind an unrelated copy still waiting -- a disk write waiting for
+    //! the I/O pool, for one -- on the stream it was handed. Process-wide, like the stream pool: the first manager that
+    //! sets a nonzero value sets it for the life of the process.
+    int copyStreamBusySkip = 0;
+
+    //! Default and upper bound of pageStagingMiB, matching KvCacheConfig.page_staging_mib.
+    static constexpr int kDefaultPageStagingMiB = 64;
+    static constexpr int kMaxPageStagingMiB = 65536;
+
+    //! Size in MiB, 1 to kMaxPageStagingMiB, of the pinned host ring that page moves between GPU and a cache level
+    //! the GPU cannot address (the disk tier, a remote level) pass through. A move takes one stretch of the ring at a
+    //! time, and waits for the earlier move that used the same stretch, so a burst of moves larger than the ring runs
+    //! one ring-full at a time. The ring is never smaller than three of the largest cold pages. Per manager.
+    int pageStagingMiB = kDefaultPageStagingMiB;
+
+    //! Upper bound of pageStagingDepth, matching KvCacheConfig.page_staging_depth.
+    static constexpr int kMaxPageStagingDepth = 16;
+
+    //! Stretches of the page staging ring, 1 to kMaxPageStagingDepth, that one page move between GPU and the disk tier
+    //! keeps in flight. 1 (default): the move takes as much of the ring as it needs and copies one stretch after
+    //! another on its own stream. N > 1: the move is cut into stretches of at most 1/N of the ring, issued round-robin
+    //! on N streams that start after the move's stream and that it waits for at the end, so up to N disk reads of one
+    //! move run at once and other moves find room in the ring. Per manager.
+    int pageStagingDepth = 1;
 
     bool enableSwaScratchReuse() const noexcept
     {

@@ -156,13 +156,19 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.block_reuse_config.policy` | `literal` | `categorical` | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
 | `kv_cache_config.cold_tier_offload_min_priority` | `int\|none` | `value` |  |
+| `kv_cache_config.context_claim_ahead` | `int` | `value` |  |
+| `kv_cache_config.context_prefetch_blocks` | `int` | `value` |  |
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
+| `kv_cache_config.copy_stream_busy_skip` | `int` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
+| `kv_cache_config.defer_context_only_release` | `bool` | `value` |  |
+| `kv_cache_config.deferred_release_thread` | `bool` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
 | `kv_cache_config.disk_io_threads` | `int` | `value` |  |
 | `kv_cache_config.disk_keep_copy_after_restore` | `bool` | `value` |  |
 | `kv_cache_config.disk_prefetch_num_reqs` | `int` | `value` |  |
 | `kv_cache_config.disk_protected_copy_fraction` | `float` | `value` |  |
+| `kv_cache_config.disk_write_behind_mib` | `int` | `value` |  |
 | `kv_cache_config.disk_write_through` | `bool` | `value` |  |
 | `kv_cache_config.dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `fp8_ds_mla`, `nvfp4`, `mixed_nvfp4_fp8`, `mixed_nvfp4_float16`, `mixed_nvfp4_bfloat16` |
 | `kv_cache_config.enable_block_reuse` | `bool` | `value` |  |
@@ -173,7 +179,9 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.fp8_context_mla_kv_len_cap` | `int\|none` | `value` |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.host_cache_bind_to_gpu_numa_node` | `bool` | `value` |  |
+| `kv_cache_config.host_cache_free_reserve_fraction` | `float` | `value` |  |
 | `kv_cache_config.host_cache_size` | `int\|none` | `value` |  |
+| `kv_cache_config.host_copy_threads` | `int` | `value` |  |
 | `kv_cache_config.iteration_stats_interval` | `int` | `value` |  |
 | `kv_cache_config.kv_cache_event_hash_algo` | `literal` | `categorical` | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
 | `kv_cache_config.kv_events_config.buffer_steps` | `int` | `value` |  |
@@ -197,6 +205,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.max_util_for_resume` | `float` | `value` |  |
 | `kv_cache_config.mixed_precision_first_n` | `int` | `value` |  |
 | `kv_cache_config.mixed_precision_last_n` | `int` | `value` |  |
+| `kv_cache_config.page_staging_depth` | `int` | `value` |  |
+| `kv_cache_config.page_staging_mib` | `int` | `value` |  |
 | `kv_cache_config.pool_ratio` | `list[float]\|none` | `value` |  |
 | `kv_cache_config.sink_token_length` | `int\|none` | `value` |  |
 | `kv_cache_config.tokens_per_block` | `int` | `value` |  |
@@ -303,12 +313,17 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sampler_force_async_worker` | `bool` | `value` |  |
 | `scheduler_config.capacity_scheduler_policy` | `enum[CapacitySchedulerPolicy]` | `categorical` | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `enum[ContextChunkingPolicy]\|none` | `categorical` | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
+| `scheduler_config.context_claim_hold` | `bool` | `value` |  |
+| `scheduler_config.context_demote_no_walk` | `bool` | `value` |  |
+| `scheduler_config.context_demote_probe` | `bool` | `value` |  |
 | `scheduler_config.context_scheduling_policy` | `enum[ContextSchedulingPolicy]` | `categorical` | `fcfs`, `shortest_uncached_first` |
 | `scheduler_config.context_starvation_iterations` | `int\|none` | `value` |  |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `int` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_batch_size_tuning` | `bool` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `bool` | `value` |  |
 | `scheduler_config.enable_prefix_aware_scheduling` | `bool` | `value` |  |
+| `scheduler_config.gen_handoff_seat` | `bool` | `value` |  |
+| `scheduler_config.gen_init_pause_after_release` | `bool` | `value` |  |
 | `scheduler_config.gen_preemption.target_output_tps` | `float\|none` | `value` |  |
 | `scheduler_config.gen_preemption.tpot_budget` | `float\|none` | `value` |  |
 | `scheduler_config.max_gen_init_admissions_per_pass` | `int\|none` | `value` |  |
