@@ -59,6 +59,7 @@ def cutlass_descriptor(
     kernel_name: str = KERNEL_GROUPED_GEMM,
     supports_moe_lora: bool = False,
     supports_expert_bias: bool = True,
+    supports_spare_slots: bool = False,
 ) -> MoEImplDescriptor:
     """Build one leaf's descriptor.
 
@@ -76,6 +77,10 @@ def cutlass_descriptor(
             in ``CutlassMoELoraMixin`` may set it.
         supports_expert_bias: Whether the leaf's kernel applies an expert FC
             bias.
+        supports_spare_slots: Whether the leaf runs with the unbacked spare
+            EPLB slots of Wide-EP fault tolerance: its weight method creates
+            them, and ``torch.ops.trtllm.fused_moe`` tunes only the active
+            slots.
     """
     return MoEImplDescriptor(
         identity=MoEImplId(provider, technique, kernel_name, quant),
@@ -84,6 +89,7 @@ def cutlass_descriptor(
             CUTLASS_CAPABILITIES,
             supports_moe_lora=supports_moe_lora,
             supports_expert_bias=supports_expert_bias,
+            supports_spare_slots=supports_spare_slots,
         ),
         input_requirement=CUTLASS_INPUT_REQUIREMENT,
         doc=doc,
