@@ -15,6 +15,7 @@
 import atexit
 import collections
 import concurrent.futures
+import contextlib
 import json
 import os
 import pickle  # nosec B403
@@ -242,6 +243,9 @@ class GenerationExecutorProxy(GenerationExecutor):
     # Total wait for the worker futures in an orderly shutdown. Generous
     # enough for the teardown of a large engine.
     _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
+    _RESULT_RECV_TIMEOUT_S = 0.5
+    _DISPATCH_DRAIN_TIMEOUT_S = 5.0
+    _DISPATCH_STOP_TIMEOUT_S = 5.0
     # Set from gen_prompt_tail_tokens; None sends full prompts.
     _prompt_tail: Optional[PromptTailPolicy] = None
 
@@ -269,6 +273,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = False
         self.worker_cls = worker_cls
+        self._admission_lock = threading.Lock()
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         self._owns_mpi_session = mpi_session is None
@@ -510,14 +515,16 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _mark_engine_dead(self, error: Optional[BaseException] = None) -> None:
         """Set the sticky flag and push EngineDeadError onto pending results."""
-        if self._engine_dead:
-            return
-        self._engine_dead = True
+        with self._get_admission_lock():
+            if self._engine_dead:
+                return
+            self._engine_dead = True
+            pending_results = list(self._results.values())
         dead_error = EngineDeadError(error)
         # Snapshot to avoid mutation-during-iteration; best-effort per result.
         # Use put() (not put_nowait()) so the async _SyncQueue path also wakes
         # the awaiting event loop, not just the sync Queue path.
-        for result in list(self._results.values()):
+        for result in pending_results:
             try:
                 result.queue.put(dead_error)
             except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
@@ -635,11 +642,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                                           name="proxy_request_queue")
             self._request_sender = _create_request_sender(
                 self.request_queue, self._error_queue)
-            self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
-                                              is_server=True,
-                                              fuse_message=False,
-                                              socket_type=zmq.PULL,
-                                              name="proxy_result_queue")
+            self.result_queue = FusedIpcQueue(
+                frontend_result_addrs[0],
+                is_server=True,
+                fuse_message=False,
+                socket_type=zmq.PULL,
+                recv_timeout=self._RESULT_RECV_TIMEOUT_S,
+                name="proxy_result_queue")
         else:
             request_addr = None
             self.request_queue = IpcQueue(is_server=True,
@@ -654,6 +663,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 fuse_message=False,
                 socket_type=zmq.PULL
                 if self.enable_postprocess_parallel else zmq.PAIR,
+                recv_timeout=self._RESULT_RECV_TIMEOUT_S,
                 name="proxy_result_queue")
         self.worker_init_status_queue = IpcQueue(
             is_server=True,
@@ -895,7 +905,11 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
+        try:
+            res = self.result_queue.get()
+        except Empty:
+            return True
+        if res is None:
             return False  # shutdown the thread
 
         async_queues = []
@@ -933,39 +947,130 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         res = res if isinstance(res, list) else [res]
 
-        for i in res:
-            global_tracer().log_instant("IPC.get")
-            if i is None:
-                return False
-            process_res(i)
+        keep_running = True
+        try:
+            for i in res:
+                global_tracer().log_instant("IPC.get")
+                if i is None:
+                    keep_running = False
+                elif keep_running:
+                    process_res(i)
+                else:
+                    try:
+                        release_undelivered_response(i)
+                    except Exception as error:  # noqa: BLE001 - preserve sentinel exit and remaining cleanup
+                        logger.warning(
+                            f"Failed to release undelivered response after shutdown sentinel: {error}"
+                        )
+        finally:
+            if async_queues:
+                try:
+                    _SyncQueue.notify_many(event_loop, async_queues)
+                except AsyncQueue.EventLoopShutdownError:
+                    logger.warning(
+                        "proxy.py: EventLoopShutdownError because event loop is not running"
+                    )
 
-        if async_queues:
-            try:
-                _SyncQueue.notify_many(event_loop, async_queues)
-            except AsyncQueue.EventLoopShutdownError:
-                logger.warning(
-                    "proxy.py: EventLoopShutdownError because event loop is not running"
-                )
-
-        return True  # success
+        return keep_running
 
     # NOTE: _iteration_result_task, dispatch_stats_task, and dispatch_kv_cache_events_task
     # have been removed as stats and kv_events are now fetched via RPC directly.
 
+    def _get_admission_lock(self) -> threading.Lock:
+        lock = getattr(self, "_admission_lock", None)
+        if lock is None:
+            lock = self.__dict__.setdefault("_admission_lock", threading.Lock())
+        return lock
+
+    def _on_dispatch_thread_exit(self) -> None:
+        thread = getattr(self, "dispatch_result_thread", None)
+        if getattr(self, "doing_shutdown",
+                   False) or (thread is not None
+                              and thread.stop_event.is_set()):
+            self._finish_pending_requests()
+        close_now = False
+        with self._get_admission_lock():
+            self._dispatcher_exited = True
+            if getattr(self, "_result_queue_close_deferred", False):
+                self._result_queue_close_deferred = False
+                close_now = True
+        if close_now:
+            self._finish_pending_requests()
+            if getattr(self, "result_queue", None) is not None:
+                self.result_queue.close()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _dispatch_thread_context(
+            proxy_ref: "weakref.ref[GenerationExecutorProxy]",
+            gc_threshold: Optional[int]):
+        with customized_gc_thresholds(gc_threshold):
+            try:
+                yield
+            finally:
+                proxy = proxy_ref()
+                if proxy is not None:
+                    proxy._on_dispatch_thread_exit()
+
     def _start_dispatch_threads(self):
-        if self.dispatch_result_thread is None:
-
-            self.dispatch_result_thread = ManagedThread(
-                weakref.WeakMethod(self.dispatch_result_task),
-                error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread",
-                context=customized_gc_thresholds(
-                    self.garbage_collection_gen0_threshold),
-            )
-
-            self.dispatch_result_thread.start()
+        with self._get_admission_lock():
+            if getattr(self, "doing_shutdown", False):
+                raise RuntimeError("Executor is shutting down")
+            if self.dispatch_result_thread is None:
+                self._dispatcher_exited = False
+                self._result_queue_close_deferred = False
+                self.dispatch_result_thread = ManagedThread(
+                    weakref.WeakMethod(self.dispatch_result_task),
+                    error_queue=self._error_queue,
+                    name="proxy_dispatch_result_thread",
+                    context=self._dispatch_thread_context(
+                        weakref.ref(self),
+                        self.garbage_collection_gen0_threshold),
+                )
+                self.dispatch_result_thread.start()
 
         self._handle_background_error()
+
+    def _finish_pending_requests(self) -> None:
+        with self._get_admission_lock():
+            if getattr(self, "_engine_dead", False):
+                return
+            results = list(self._results.items())
+            self._results.clear()
+        for client_id, result in results:
+            try:
+                result.queue.put(
+                    ErrorResponse(client_id, 'Executor proxy shut down',
+                                  client_id))
+            except AsyncQueue.EventLoopShutdownError:
+                continue
+
+    def _stop_dispatch_thread(self, *, drain: bool) -> bool:
+        """Join the result dispatcher before its socket is closed.
+
+        Returns True once the thread has exited (or was never started), and
+        False if it is still alive so the caller skips closing the ZMQ socket
+        from another thread.
+        """
+        thread = self.dispatch_result_thread
+        if thread is None or not thread.is_alive():
+            return True
+        if thread is threading.current_thread():
+            thread.stop()
+            logger.warning(
+                "Result dispatcher cannot join itself during shutdown")
+            return False
+        if drain:
+            thread.join(timeout=self._DISPATCH_DRAIN_TIMEOUT_S)
+        if thread.is_alive():
+            thread.stop()
+            thread.join(timeout=self._DISPATCH_STOP_TIMEOUT_S)
+        if thread.is_alive():
+            logger.warning(
+                "Result dispatcher did not stop within shutdown timeout; "
+                "leaving result_queue open to avoid cross-thread ZMQ close")
+            return False
+        return True
 
     def _abort_owned_session(self, reason: BaseException) -> None:
         """Force the worker world down, but only if this proxy created it.
@@ -1187,9 +1292,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         logger_debug('Proxy.pre_shutdown...\n', "yellow")
 
-        if self.doing_shutdown:
-            return
-        else:
+        with self._get_admission_lock():
+            if self.doing_shutdown:
+                return
             self.doing_shutdown = True
 
         self._worker_process_monitor.close()
@@ -1322,14 +1427,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                 threading.current_thread() is not self._error_monitor_thread):
             self._error_monitor_thread.join(timeout=5)
 
-        if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
-        ):
-            self.dispatch_result_thread.stop()
-            # With the engine dead, the shutdown sentinel will never arrive
-            # and the dispatcher may be blocked in a ZMQ recv forever: bound
-            # the join and leak the daemon thread.
-            self.dispatch_result_thread.join(
-                timeout=5.0 if self._engine_dead else None)
+        dispatcher_stopped = self._stop_dispatch_thread(
+            drain=not self._engine_dead)
 
         # Drain the profile-control executor before closing its sockets.
         # ``shutdown(wait=True)`` blocks until any in-flight
@@ -1351,7 +1450,16 @@ class GenerationExecutorProxy(GenerationExecutor):
         # close all the sockets
         self.request_queue.close()
         self.worker_init_status_queue.close()
-        self.result_queue.close()
+        close_result_queue = dispatcher_stopped
+        if not close_result_queue:
+            with self._get_admission_lock():
+                if getattr(self, "_dispatcher_exited", False):
+                    close_result_queue = True
+                else:
+                    self._result_queue_close_deferred = True
+        if close_result_queue:
+            self._finish_pending_requests()
+            self.result_queue.close()
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
         self._cleanup_multi_frontend_ipc_dir()
@@ -1384,6 +1492,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Sticky fast-fail: don't accept new work once the engine is known dead.
         if self._engine_dead or self._fatal_error is not None:
             raise EngineDeadError(self._fatal_error)
+        if getattr(self, "doing_shutdown", False):
+            raise RuntimeError("Executor is shutting down")
 
         self._start_dispatch_threads()
 
@@ -1396,16 +1506,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             executor=self,
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
-        self._results[request.id] = result
-
-        # Close the submit-vs-death race: _mark_engine_dead() runs on the
-        # error-monitor thread and its one-shot sweep snapshots _results, so a
-        # result registered just after that snapshot would never be unblocked
-        # and would hang forever on a dead worker. Re-check after registering
-        # and fail fast if the engine died in that window.
-        if self._engine_dead or self._fatal_error is not None:
-            self._results.pop(request.id, None)
-            raise EngineDeadError(self._fatal_error)
+        with self._get_admission_lock():
+            if self._engine_dead or self._fatal_error is not None:
+                raise EngineDeadError(self._fatal_error)
+            if getattr(self, "doing_shutdown", False):
+                raise RuntimeError("Executor is shutting down")
+            self._results[request.id] = result
 
         # Requests that read their full prompt keep it (see prompt_tail.py).
         if self._prompt_tail is not None:

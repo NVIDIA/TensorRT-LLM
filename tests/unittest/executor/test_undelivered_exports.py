@@ -10,6 +10,7 @@ consumed.
 
 import base64
 import gc
+from functools import partial
 from pathlib import Path
 from queue import Queue
 from types import MethodType, SimpleNamespace
@@ -85,14 +86,17 @@ class _ResultQueue:
         return self._item
 
 
-def _drop_at_proxy(response):
+def _drop_at_proxy(response: LlmResponse, *, after_sentinel: bool = False) -> None:
     # Without __init__, which spawns workers; the attributes keep teardown a no-op.
     proxy = object.__new__(GenerationExecutorProxy)
     proxy.workers_started = False
     proxy._multi_frontend_ipc_dir = None
-    proxy._results = {}
-    proxy.result_queue = _ResultQueue(ResponseWrapper(response))
-    assert proxy.dispatch_result_task()
+    client_queue = Queue()
+    proxy._results = {CLIENT_ID: SimpleNamespace(queue=client_queue)} if after_sentinel else {}
+    wrapped = ResponseWrapper(response)
+    proxy.result_queue = _ResultQueue([None, wrapped] if after_sentinel else wrapped)
+    assert proxy.dispatch_result_task() is not after_sentinel
+    assert client_queue.empty()
 
 
 class _RpcProxy(RpcExecutorMixin, GenerationExecutor):
@@ -110,8 +114,20 @@ def _drop_at_rpc_proxy(response):
 
 @pytest.mark.parametrize(
     "drop",
-    [_drop_at_worker, _replace_at_worker_on_background_error, _drop_at_proxy, _drop_at_rpc_proxy],
-    ids=["refused_at_worker", "errored_at_worker", "late_at_proxy", "unknown_at_rpc_proxy"],
+    [
+        _drop_at_worker,
+        _replace_at_worker_on_background_error,
+        _drop_at_proxy,
+        partial(_drop_at_proxy, after_sentinel=True),
+        _drop_at_rpc_proxy,
+    ],
+    ids=[
+        "refused_at_worker",
+        "errored_at_worker",
+        "late_at_proxy",
+        "after_sentinel_at_proxy",
+        "unknown_at_rpc_proxy",
+    ],
 )
 def test_a_dropped_response_releases_its_exports(drop):
     response, files = _exporting_response()

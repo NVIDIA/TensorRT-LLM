@@ -18,6 +18,7 @@ import time
 import weakref
 from collections import UserDict
 from collections.abc import Iterator
+from queue import Empty
 from threading import Thread
 from typing import Literal
 
@@ -355,6 +356,25 @@ class TestIpcBasics:
             assert time.monotonic() - start_time < 1.0
         finally:
             server.close()
+
+    @pytest.mark.parametrize(
+        ("recv_timeout", "timeout_ms"), [(None, -1), (0, 0), (0.0001, 1), (0.0011, 2)]
+    )
+    def test_recv_timeout_socket_option(self, recv_timeout: float | None, timeout_ms: int) -> None:
+        """Keep blocking/zero semantics and round positive fractional milliseconds up."""
+        receiver = ZeroMqQueue(is_server=True, recv_timeout=recv_timeout)
+        try:
+            assert receiver.socket.getsockopt(zmq.RCVTIMEO) == timeout_ms
+            if recv_timeout is not None:
+                with pytest.raises(Empty):
+                    receiver.get()
+        finally:
+            receiver.close()
+
+    def test_recv_timeout_rejects_negative_values(self) -> None:
+        """A negative timeout must not select ZeroMQ's infinite-wait convention."""
+        with pytest.raises(ValueError, match="recv_timeout must be non-negative"):
+            ZeroMqQueue(is_server=True, recv_timeout=-0.0001)
 
     @staticmethod
     def _orphaned_sender(linger_ms: int | None = None) -> ZeroMqQueue:
