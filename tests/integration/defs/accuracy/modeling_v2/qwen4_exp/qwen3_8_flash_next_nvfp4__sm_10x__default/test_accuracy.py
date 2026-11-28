@@ -41,6 +41,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     modeling as target_modeling,
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import get_sm_version, is_flashinfer_gdn_decode_supported_arch
 from tensorrt_llm.executor.utils import RequestError, get_spawn_proxy_process_env
 from tensorrt_llm.inputs import VideoData
@@ -1418,8 +1419,10 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         The split runs a tail of at most `inforward_snapshot_max_tail` tokens (FlashInfer's
         in-place path); a longer one no longer fails the bind. With `[0, 128]` the final
         snapshot is at the prompt end, and with `[128]` the tail is twice the split's: neither
-        prompt is split in its forward, and a second turn still restores its prefix from the
-        snapshot and names the pass key.
+        prompt is split in its forward. Turn one's prefill takes two context steps, one that
+        ends at the snapshot L - 128 and one over the 128-token tail. A second turn restores
+        its prefix from the last snapshot the first committed (L with `[0, 128]`, L - 128 with
+        `[128]`) and names the pass key.
         """
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
         splits = []
@@ -1430,6 +1433,16 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             return split(*args, **kwargs)
 
         monkeypatch.setattr(target_modeling, "flashinfer_chunk_gdn_inforward_split", counting_split)
+        # Each context step of every request, as (prompt length, first position, end).
+        steps = []
+        move = LlmRequest.move_to_next_context_chunk
+
+        def recording_move(request):
+            begin = request.context_current_position
+            steps.append((request.prompt_len, begin, begin + request.context_chunk_size))
+            return move(request)
+
+        monkeypatch.setattr(LlmRequest, "move_to_next_context_chunk", recording_move)
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
         prompt, key = _passkey_prompts(tokenizer, (3000,))[0]
         turn1 = tokenizer.encode(prompt)
@@ -1456,16 +1469,23 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 env_overrides=rank_env,
             ) as llm,
         ):
+            # The executor's warmup runs requests of its own: record turn one's steps only.
             splits.clear()
+            steps.clear()
             first = llm.generate({"prompt_token_ids": turn1}, greedy, use_tqdm=False)
             assert not splits, "a tail past the split's took the in-forward split"
+            n = len(turn1)
+            turn1_steps = [(begin, end) for length, begin, end in steps if length == n]
+            assert turn1_steps == [(0, n - 128), (n - 128, n)], (turn1_steps, n)
             answer = list(first.outputs[0].token_ids)
             if answer and answer[-1] == end_of_turn:
                 answer.pop()
             second = llm.generate(
                 {"prompt_token_ids": turn1 + answer + follow_up}, greedy, use_tqdm=False
             )
-        assert 0 < second.cached_tokens <= len(turn1), (second.cached_tokens, len(turn1))
+        # The last snapshot turn one committed: the prompt end with `[0, 128]`, else L - 128.
+        restored = n if 0 in offsets else n - 128
+        assert second.cached_tokens == restored, (second.cached_tokens, restored, n)
         assert key in first.outputs[0].text, first.outputs[0].text
         assert key in second.outputs[0].text, second.outputs[0].text
 
