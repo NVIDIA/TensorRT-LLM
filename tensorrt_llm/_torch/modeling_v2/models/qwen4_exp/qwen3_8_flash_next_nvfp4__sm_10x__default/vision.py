@@ -56,8 +56,8 @@ _VISION_MASK_PADDING = 0
 
 # Per-call constants of the tower's attention: the encoder-only mode of `thop_attention`.
 # Omitting `kv_cache_block_offsets`, `host_kv_cache_pool_pointers` and
-# `host_kv_cache_pool_mapping` selects that mode. `update_kv_cache=False` is rejected ("KV
-# cache update cannot be disabled now"), so it stays True.
+# `host_kv_cache_pool_mapping` selects that mode. Fused-QKV self-attention requires
+# `update_kv_cache=True`, even without a cache.
 _VISION_CALL_CONSTANTS = dict(
     k=None,
     v=None,

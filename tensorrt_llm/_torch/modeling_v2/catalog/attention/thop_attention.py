@@ -302,8 +302,8 @@ class ThopAttention(OpWrapper):
 
     No KV cache (an encoder): pass `kv_cache_block_offsets`,
     `host_kv_cache_pool_pointers` and `host_kv_cache_pool_mapping` all None,
-    with `update_kv_cache=True` -- False is rejected ("KV cache update cannot
-    be disabled now"). One context sequence per frame; mask_type 0 confines a
+    with `update_kv_cache=True`: fused-QKV self-attention requires it even without
+    a cache. One context sequence per frame; mask_type 0 confines a
     frame to itself. `tokens_per_block` and `use_paged_context_fmha` are
     bitwise inert there. Passing only some of the three None is unmeasured. An
     image is one frame and a video one frame per frame group; the cells run up to

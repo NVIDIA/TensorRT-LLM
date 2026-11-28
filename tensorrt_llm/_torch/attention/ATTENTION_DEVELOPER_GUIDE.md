@@ -558,8 +558,10 @@ initialized during warmup.
 
 `FallbackFmha._is_supported()` accepts separate Q/K/V only for MLA, cross
 attention, or SageAttention; self-attention requires KV-cache updates. It rejects
-raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
-with the native `AttentionOp` input requirements.
+raw FP8 E4M3 query input and custom masks. Direct `FallbackFmha.attention` callers
+may additionally issue read-only Q-only MHA context calls with a paged cache and
+paged-context FMHA; they supply no K/V inputs and disable cache updates.
+`_is_supported()` intentionally does not select this direct-call mode.
 
 ##### 3.2.2.1 Selection order (`TLLM_FMHA_LIBS`)
 
@@ -703,8 +705,10 @@ initialized during warmup.
 
 `FallbackFmha._is_supported()` accepts separate Q/K/V only for MLA, cross
 attention, or SageAttention; self-attention requires KV-cache updates. It rejects
-raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
-with the native `AttentionOp` input requirements.
+raw FP8 E4M3 query input and custom masks. Direct `FallbackFmha.attention` callers
+may additionally issue read-only Q-only MHA context calls with a paged cache and
+paged-context FMHA; they supply no K/V inputs and disable cache updates.
+`_is_supported()` intentionally does not select this direct-call mode.
 
 ##### 3.2.2.6 Package layout
 
