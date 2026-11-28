@@ -137,7 +137,7 @@ cd tests/integration/defs
 # Run all fp8 functional test
 pytest --no-header -vs --test-list=../test_lists/qa/functional/llm_function_core.txt -k fp8
 # Run a single test case
-pytest -vs accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
+pytest -vs accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16
 ```
 
 ### Automated Execution

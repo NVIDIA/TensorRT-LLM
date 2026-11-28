@@ -75,6 +75,7 @@ _SPEC_SRC_PREFIXES: tuple[str, ...] = (
 #   - "test_spec_decoding_metrics"   → serve metrics tests
 #   - "test_llmapi_speculative_decoding" → ~3 entries
 #   - "speculative_decoding_bls"     → triton BLS spec-dec test (1 entry)
+#   - "test_kimi_k3_specdec"         → Kimi K3 SA spec-dec parity tests
 #   - "test_mtp"            → method-name match: TestNemotronSuperV3 MTP +
 #                             KVCacheV2DSv3Lite MTP scheduler tests
 #                             (~5 entries)
@@ -94,6 +95,7 @@ _SPEC_ENTRY_PATTERNS: tuple[str, ...] = (
     "test_spec_decoding_metrics",
     "test_llmapi_speculative_decoding",
     "speculative_decoding_bls",
+    "test_kimi_k3_specdec",
     "test_mtp",
     "mtp_nextn",
     "_mtp",

@@ -158,6 +158,22 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
+  # Kimi K3 single-GPU KDA, attention-residual and MoE routing unit tests (SM103, single GPU).
+  - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
+  - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py
+  - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_decode_state_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
+  - unittest/_torch/moe/test_kimi_k3_route_sort.py
+  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   # K3 single-GPU kernel and wrapper checks.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_ctx_kv/test_k3_ctx_kv.py

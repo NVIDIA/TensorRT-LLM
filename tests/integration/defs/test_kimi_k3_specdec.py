@@ -13,7 +13,7 @@ aggregate hard-fails.
 
 Requirements: 4 GPUs and the Kimi K3 checkpoint (env KIMI_K3_CKPT or
 <LLM_MODELS_ROOT>/Kimi-K3). Fails — deliberately does not skip — when the
-checkpoint is absent: the test is CI-listed (GB300 post-merge), and a
+checkpoint is absent: the test is CI-listed (GB300 pre-merge, B200 post-merge), and a
 checkpoint that vanishes from the runners' models mount must surface as a
 regression rather than an indistinguishable green skip. The MoE backend is
 routed to TRTLLM by KimiK3MoERuntime regardless of any
@@ -73,7 +73,7 @@ def _find_lfs_pointer_files(ckpt):
 @pytest.mark.skip_less_device(4)
 def test_kimi_k3_sa_specdec_logits_parity():
     ckpt = _find_checkpoint()
-    # Hard failure, not a skip: on the post-merge stage a skip is
+    # Hard failure, not a skip: on CI stages a skip is
     # indistinguishable from a pass, so a checkpoint dropped from the
     # runners' models mount would silently end this coverage.
     assert ckpt is not None, (

@@ -73,27 +73,9 @@ l0_gb300:
   # moe/kernels/parallel runs on B300 (l0_b300), the same SM103 kernels.
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
-  # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
-  - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
-  - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py
-  - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
-  - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
-  - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
-  - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
-  - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
-  - unittest/_torch/modules/kimi_kda/test_kimi_kda_decode_state_parity.py
-  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
-  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
-  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
-  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
-  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/visual_gen/test_attention_deco.py
-  # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
-  - unittest/_torch/moe/test_kimi_k3_route_sort.py
   - unittest/_torch/moe/test_moe_sorted_routing.py
-  # Router-logits kernel in the MoE gate (the kernel test runs with kernels/parallel above).
-  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   # Qwen3.5 decode kernels: low-M warp-MMA GEMM, TRTLLM-gen NVFP4 MoE decode / route fronts, draft experts,
   # GDN fused target verify.
   - unittest/_torch/modules/test_low_m_mma_gemm.py
@@ -176,6 +158,9 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/comm
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_long_context TIMEOUT (60)
+  # Kimi K3 truncated-model (first 4 layers: KDA + first MLA + MoE + SA spec-dec) e2e logits
+  # parity on 4xGB300; fails if <LLM_MODELS_ROOT>/Kimi-K3 is not staged.
+  - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (40)
 
 # K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
 # NVLink domain.

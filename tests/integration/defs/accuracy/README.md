@@ -137,7 +137,7 @@ If all the evaluated accuracies are equal to or higher than the corresponding th
 
 ### Add New Test Cases with Existing Tasks
 
-We suggest supporting the model with LLM API, and then add tests to [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`mistralai/Ministral-8B-Instruct-2410`](https://huggingface.co/mistralai/Ministral-8B-Instruct-2410) has the test class defined as:
+We suggest supporting the model with LLM API, and then add tests to [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, an illustrative test class for a model such as [`mistralai/Ministral-8B-Instruct-2410`](https://huggingface.co/mistralai/Ministral-8B-Instruct-2410) can be written as:
 
 ```python
 class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
@@ -166,7 +166,7 @@ The last step is registering the accuracy reference. If the new test case shares
 Otherwise, run the new test case without reference by prepending `TRTLLM_ACCURACY_NO_REFERENCE=1`. For example,
 
 ```bash
-TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype"
+TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16"
 ```
 
 The results would look like:

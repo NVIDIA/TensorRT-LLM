@@ -25,10 +25,7 @@ from test_common.moe_tactics import skip_unless_moe_tactic_runs_here
 from transformers import AutoProcessor
 
 from tensorrt_llm import LLM
-from tensorrt_llm.evaluate.post_processing import (
-    extract_kimi_k3_mmmu_answer,
-    strip_thinking_and_extract_mmmu_answer,
-)
+from tensorrt_llm.evaluate.post_processing import extract_kimi_k3_mmmu_answer
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
@@ -539,69 +536,6 @@ class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
             QuantAlgo.MIXED_PRECISION,
             monkeypatch,
         )
-
-
-class TestKimiK25(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K2.5"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
-    MAX_NUM_TOKENS = 16384
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS,
-        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-    )
-
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.75,
-    )
-
-    # Thinking mode (thinking=True): model uses <think>...</think>
-    # chain-of-thought reasoning before outputting the answer.
-    # post_process_fn strips the thinking block and extracts the final
-    # answer, compensating for lm-eval's MMMU regex which fails on common
-    # reasoning-model output formats (see
-    # tensorrt_llm.evaluate.post_processing for cross-engine evidence).
-    # preserve_caller_max_tokens=True keeps our 16384 max_tokens instead of
-    # being overridden by lm-eval task's default 512 (too small for CoT).
-    EXTRA_EVALUATOR_KWARGS = dict(
-        chat_template_kwargs={"thinking": True},
-        post_process_fn=strip_thinking_and_extract_mmmu_answer,
-        preserve_caller_max_tokens=True,
-    )
-
-    @pytest.mark.timeout(7200)
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device_memory(183000)
-    @pytest.mark.parametrize(
-        "ep_size,attention_dp",
-        [(8, True)],
-        ids=["dep8"],
-    )
-    def test_nvfp4(self, ep_size, attention_dp):
-        """NVFP4 accuracy on MMMU benchmark (8x B200)."""
-        # Do not pass ``max_num_tokens`` here: keep it at the LLM default
-        # (8192) so the resolved ``moe_max_num_tokens`` stays at
-        # ``8192 * dp_size`` and the per-call fused_moe workspace fits
-        # within activation headroom. Raising it pushed the workspace
-        # past the fragmented allocator budget on dep8 (NVBug 6182617).
-        with LLM(
-            self.MODEL_PATH,
-            kv_cache_config=self.kv_cache_config,
-            tensor_parallel_size=8,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=ep_size,
-            enable_attention_dp=attention_dp,
-            trust_remote_code=True,
-            enable_chunked_prefill=True,
-        ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                sampling_params=self.sampling_params,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
 
 
 class TestKimiK3(LlmapiAccuracyTestHarness):
