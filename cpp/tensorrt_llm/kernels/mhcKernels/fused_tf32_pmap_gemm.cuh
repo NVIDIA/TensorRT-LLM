@@ -54,6 +54,7 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cuda_bf16.h>
+#include <cute/arch/util.hpp>
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cutlass/arch/barrier.h>
 

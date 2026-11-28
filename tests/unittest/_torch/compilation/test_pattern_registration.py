@@ -5,8 +5,18 @@ import os
 from unittest.mock import patch
 
 import pytest
+import torch
+from torch._inductor.pattern_matcher import (
+    MULTIPLE,
+    CallFunction,
+    KeywordArg,
+    MultiOutputPattern,
+    PatternMatcherPass,
+)
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.compilation.patterns import _register_pattern_replacement
 from tensorrt_llm.mapping import Mapping
 
 
@@ -46,3 +56,36 @@ def test_single_gpu_pattern_registration() -> None:
 
     with patch("tensorrt_llm.mpi_world_size", return_value=1):
         Backend.build_custom_passes(False, mapping)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("shape", [(3, 7), (17, 32)])
+@pytest.mark.parametrize("accept_match", [False, True])
+def test_explicit_pattern_replacement(shape, accept_match):
+    """Match named captures and preserve multiple outputs and custom guards."""
+    add = CallFunction(
+        torch.ops.aten.add.Tensor, KeywordArg("input"), KeywordArg("residual"), _users=MULTIPLE
+    )
+    pattern = MultiOutputPattern([CallFunction(torch.ops.aten.mul.Tensor, add, 2), add])
+
+    def replacement(input, residual):
+        combined = input + residual
+        return combined + combined, combined
+
+    custom_pass = PatternMatcherPass("explicit_pattern_test")
+    _register_pattern_replacement(
+        pattern, replacement, custom_pass, extra_check=lambda match: accept_match
+    )
+
+    def original(input, residual):
+        combined = input + residual
+        return combined * 2, combined
+
+    inputs = [torch.randn(shape), torch.randn(shape)]
+    gm = make_fx(original, tracing_mode="fake")(*inputs)
+    assert custom_pass.apply(gm) == int(accept_match)
+    gm.graph.lint()
+    gm.recompile()
+    torch.testing.assert_close(gm(*inputs), original(*inputs))
+    multiplications = [node for node in gm.graph.nodes if node.target == torch.ops.aten.mul.Tensor]
+    assert len(multiplications) == int(not accept_match)

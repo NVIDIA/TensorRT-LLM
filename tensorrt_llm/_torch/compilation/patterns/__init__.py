@@ -14,20 +14,31 @@
 # limitations under the License.
 
 from inspect import signature
-from typing import Callable, List
+from typing import Callable
 
-import torch
+from torch._inductor.pattern_matcher import (Match, PatternExpr,
+                                             PatternMatcherPass,
+                                             register_graph_pattern)
 
 MATCHER_SUBSYSTEM = "torch_compile"
 
 
-def _make_pattern_example_inputs(
-        search_fn: Callable[..., object]) -> List[torch.Tensor]:
-    """Dummy inputs for register_replacement when using search_fn_pattern.
+def _register_pattern_replacement(
+    pattern: PatternExpr,
+    replacement: Callable[..., object],
+    custom_pass: PatternMatcherPass,
+    *,
+    extra_check: Callable[[Match], bool] = lambda match: True,
+) -> None:
+    """Replace an explicit FX pattern using its named captures.
 
-    Torch 2.13+ always builds initial_arg_info from example_inputs via
-    _trace_args_for_initial_trace, even when search_fn_pattern is supplied.
-    Empty [] raises IndexError. These tensors are only for signature
-    flattening; matching still uses search_fn_pattern.
+    Graph patterns already describe the search operations. Register them
+    directly so the matcher traces only the replacement, using the matched
+    inputs' shapes and dtypes.
     """
-    return [torch.empty(0) for _ in signature(search_fn).parameters]
+    argnames = tuple(signature(replacement).parameters)
+
+    @register_graph_pattern(pattern, extra_check, pass_dict=custom_pass)
+    def replace(match: Match, *args, **kwargs):
+        match.replace_by_example(replacement,
+                                 [kwargs[name] for name in argnames])

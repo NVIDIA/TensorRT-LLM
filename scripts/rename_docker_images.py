@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse as _ap
+import base64
 import datetime as _dt
+import json
+import netrc
 import os
 import pathlib as _pl
 import subprocess as _sp
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 CURRENT_TAG_FILE = "current_image_tags.properties"
 IMAGE_MAPPING = {
@@ -13,8 +32,6 @@ IMAGE_MAPPING = {
     "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:sbsa-__stage__-torch_skip",
     "LLM_SBSA_WHEEL_DOCKER_IMAGE":
     "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:sbsa-ubuntu24-torch_skip-py312",
-    "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE":
-    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py310",
     "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE":
     "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py312",
 }
@@ -22,7 +39,10 @@ IMAGE_MAPPING = {
 
 def parse_arguments() -> _ap.Namespace:
     parser = _ap.ArgumentParser(
-        description="Rename Docker images based on the given instructions.")
+        description="Retag Docker images using the Artifactory API by default.",
+        epilog="API authentication: set ARTIFACTORY_TOKEN to an access token, "
+        "or configure credentials for the registry host in ~/.netrc. "
+        "With --use-docker, authenticate using docker login.")
     parser.add_argument(
         'src_build_id',
         type=int,
@@ -35,6 +55,11 @@ def parse_arguments() -> _ap.Namespace:
         '--dry-run',
         action='store_true',
         help="Simulate the rename process without making any changes.")
+    parser.add_argument(
+        '--use-docker',
+        action='store_true',
+        help="Pull, tag and push images locally with Docker instead of using "
+        "the Artifactory API.")
     parser.add_argument(
         "--timestamp",
         type=str,
@@ -89,6 +114,65 @@ def run_shell_command(command: str, dry_run: bool) -> None:
     print(command)
     if not dry_run:
         _sp.run(command, shell=True, check=True, text=True)
+
+
+def _split_image(image: str) -> tuple[str, str, str, str]:
+    """Split an explicitly tagged image into registry, repo key, name and tag."""
+    registry, repo_key, image_tag = image.split("/", 2)
+    name, tag = image_tag.rsplit(":", 1)
+    if not all((registry, repo_key, name, tag)) or "@" in image:
+        raise ValueError(f"Expected a tagged Artifactory image: {image}")
+    return registry, repo_key, name, tag
+
+
+def retag_image(src_image: str, dst_image: str, dry_run: bool) -> None:
+    """Copy an image to a new name and tag using Artifactory Docker promotion.
+
+    Args:
+        src_image: Fully qualified source image with an explicit tag.
+        dst_image: Fully qualified destination image on the same registry.
+        dry_run: Print the request without contacting Artifactory.
+    """
+    registry, src_repo, src_name, src_tag = _split_image(src_image)
+    dst_registry, dst_repo, dst_name, dst_tag = _split_image(dst_image)
+    if registry != dst_registry:
+        raise ValueError("Artifactory promotion requires the same registry")
+    url = (f"https://{registry}/artifactory/api/docker/"
+           f"{quote(src_repo, safe='')}/v2/promote")
+    payload = {
+        "targetRepo": dst_repo,
+        "dockerRepository": src_name,
+        "targetDockerRepository": dst_name,
+        "tag": src_tag,
+        "targetTag": dst_tag,
+        "copy": True,
+    }
+    print(f"POST {url} {json.dumps(payload)}")
+    if dry_run:
+        return
+
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("ARTIFACTORY_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        try:
+            credentials = netrc.netrc().authenticators(registry)
+        except FileNotFoundError:
+            credentials = None
+        if credentials is None:
+            raise ValueError("Set ARTIFACTORY_TOKEN or configure ~/.netrc "
+                             f"credentials for {registry}")
+        login, _, password = credentials
+        encoded = base64.b64encode(f"{login}:{password}".encode()).decode()
+        headers["Authorization"] = f"Basic {encoded}"
+
+    request = Request(url,
+                      data=json.dumps(payload).encode(),
+                      headers=headers,
+                      method="POST")
+    with urlopen(request, timeout=300) as response:
+        print(f"Retagged {src_image} -> {dst_image}: HTTP {response.status}")
 
 
 def find_script_directory() -> _pl.Path:
@@ -204,7 +288,8 @@ def rename_images(*,
                   commit: str | None = None,
                   src_branch: str | None = None,
                   timestamp: str | None = None,
-                  dry_run: bool = False) -> None:
+                  dry_run: bool = False,
+                  use_docker: bool = False) -> None:
     if src_branch is not None:
         src_branch_sanitized = src_branch.replace("/", "_")
         src_suffix = f"{src_branch_sanitized}-{src_build_id}"
@@ -234,11 +319,14 @@ def rename_images(*,
         dst_image = replace_text_between_dashes(
             f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}", 3, stage)
 
-        platform = "linux/arm64" if "SBSA" in dst_key else "linux/amd64"
-        run_shell_command(f"docker pull --platform {platform} {src_image}",
-                          dry_run)
-        run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
-        run_shell_command(f"docker push {dst_image}", dry_run)
+        if use_docker:
+            platform = "linux/arm64" if "SBSA" in dst_key else "linux/amd64"
+            run_shell_command(f"docker pull --platform {platform} {src_image}",
+                              dry_run)
+            run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
+            run_shell_command(f"docker push {dst_image}", dry_run)
+        else:
+            retag_image(src_image, dst_image, dry_run)
         find_and_replace_in_files(current_tags_path.parent,
                                   current_tags_path.name, dst_image_old,
                                   dst_image, dry_run)

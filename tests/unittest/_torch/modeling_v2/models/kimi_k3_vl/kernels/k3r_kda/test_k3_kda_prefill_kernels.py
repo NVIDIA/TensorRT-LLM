@@ -293,7 +293,7 @@ def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
     sequence_lengths: list[int] | None,
 ) -> None:
     """In-kernel beta sigmoid matches the legacy host launch."""
-    from fla.modules.l2norm import l2norm_fwd
+    from fla.modules.norm.l2norm import l2norm_fwd
     from fla.ops.common.gate import fused_beta_sigmoid
 
     torch.manual_seed(10)

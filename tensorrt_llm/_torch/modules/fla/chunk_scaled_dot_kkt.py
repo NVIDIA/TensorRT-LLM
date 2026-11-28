@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_scaled_dot_kkt.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk_scaled_dot_kkt.py
 # -*- coding: utf-8 -*-
@@ -54,35 +56,44 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         bos, eos = i_b * T, i_b * T + T
     o_t = tl.arange(0, BT)
 
-    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T, ), (H, ), (i_t * BT, ),
-                               (BT, ), (0, ))
-    b_beta = tl.load(p_beta, boundary_check=(0, ))
+    p_beta_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_beta = (beta + bos * H + i_h) + p_beta_offsets_0.to(tl.int64) * (H)
+    p_beta_mask_0 = (p_beta_offsets_0 >= 0) & (p_beta_offsets_0 < (T))
+    b_beta = tl.load(p_beta, mask=p_beta_mask_0, other=0)
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        p_k_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_k_offsets_1 = (i_k * BK) + tl.arange(0, BK)
+        p_k = (k + (bos * Hg + i_h //
+                    (H // Hg)) * K) + p_k_offsets_0[:, None].to(tl.int64) * (
+                        Hg * K) + p_k_offsets_1[None, :].to(tl.int64) * (1)
+        p_k_mask_0 = (p_k_offsets_0 >= 0) & (p_k_offsets_0 < (T))
+        p_k_mask_1 = (p_k_offsets_1 >= 0) & (p_k_offsets_1 < (K))
+        b_k = tl.load(p_k,
+                      mask=p_k_mask_0[:, None] & p_k_mask_1[None, :],
+                      other=0)
         b_kb = b_k * b_beta[:, None]
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
 
     if USE_G:
-        p_g = tl.make_block_ptr(g_cumsum + bos * H + i_h, (T, ), (H, ),
-                                (i_t * BT, ), (BT, ), (0, ))
-        b_g = tl.load(p_g, boundary_check=(0, ))
+        p_g_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_g = (g_cumsum + bos * H + i_h) + p_g_offsets_0.to(tl.int64) * (H)
+        p_g_mask_0 = (p_g_offsets_0 >= 0) & (p_g_offsets_0 < (T))
+        b_g = tl.load(p_g, mask=p_g_mask_0, other=0)
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * safe_exp(b_g_diff)
 
     b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1),
-                            (i_t * BT, 0), (BT, BT), (1, 0))
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    p_A_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_A_offsets_1 = (0) + tl.arange(0, BT)
+    p_A = (A + (bos * H + i_h) * BT) + p_A_offsets_0[:, None].to(
+        tl.int64) * (BT * H) + p_A_offsets_1[None, :].to(tl.int64) * (1)
+    p_A_mask_0 = (p_A_offsets_0 >= 0) & (p_A_offsets_0 < (T))
+    p_A_mask_1 = (p_A_offsets_1 >= 0) & (p_A_offsets_1 < (BT))
+    tl.store(p_A,
+             b_A.to(p_A.dtype.element_ty),
+             mask=p_A_mask_0[:, None] & p_A_mask_1[None, :])
 
 
 def chunk_scaled_dot_kkt_fwd(

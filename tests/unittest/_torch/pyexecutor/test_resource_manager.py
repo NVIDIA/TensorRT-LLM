@@ -1946,7 +1946,12 @@ def test_scan_kv_buffer_keeps_checking_after_unsupported_check(monkeypatch):
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.resource_manager."
         "_INVALID_VALUE_SCAN_ELEMS", 2 * 16)
-    # isinf is not implemented for float8_e4m3fn, isnan is.
+
+    def unsupported_isinf(buffer):
+        raise NotImplementedError
+
+    # Exercise unsupported checks independently of the installed Torch version.
+    monkeypatch.setattr(torch, "isinf", unsupported_isinf)
     buffer = torch.zeros(9, 16, dtype=torch.float8_e4m3fn, device="cuda")
     assert _scan(buffer) == (False, True)
     buffer[8, 15] = float("nan")
