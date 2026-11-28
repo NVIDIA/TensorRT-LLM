@@ -75,7 +75,7 @@ def load_image(image: Union[str, Image.Image],
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     if isinstance(image, Image.Image):
-        return image.convert('RGB')
+        return convert_image_mode(image, "RGB")
 
     parsed_url = urlparse(image)
 
@@ -102,7 +102,7 @@ async def async_load_image(
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     if isinstance(image, Image.Image):
-        return image.convert('RGB')
+        return convert_image_mode(image, "RGB")
 
     parsed_url = urlparse(image)
 
