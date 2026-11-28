@@ -403,6 +403,19 @@ def test_check_tables_rejects_a_route_into_spare_capacity():
     assert "past the padded rows" in op.check_tables(views, ids, 128, 128, 8)
 
 
+@pytest.mark.cpu_only
+def test_check_tables_rejects_a_stale_row_below_a_cta_limit():
+    """One live route in a tile of 8, moved to permuted row 1 with the CTA limit raised to 2:
+    row 1 names the right token and expert, every per-entry check holds, but the limit also
+    hands stale row 0 to the runner."""
+    ids = torch.tensor([[130, 0, 1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int32)
+    views = _tables(ids, 128, 128, 8)
+    e2p, p2t, cta_expert, cta_limit, n_ctas, n_padded = views
+    assert int(e2p[0]) == 0 and int(cta_limit[0]) == 1
+    e2p[0], p2t[1], cta_limit[0] = 1, 0, 2
+    assert "not exactly the live permuted indices" in op.check_tables(views, ids, 128, 128, 8)
+
+
 _LEAN_CASES = [
     (96, 448, 64, 16, False),  # dep8 3 a rank, window 7
     (96, 448, 64, 16, True),  # the packed gather's routing-only front
