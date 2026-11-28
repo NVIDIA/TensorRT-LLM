@@ -108,9 +108,6 @@ BASELINE = {
         "test_standard_and_disagg_register_messages_route OpenAIDisaggServer",
         "test_standard_and_disagg_register_messages_route OpenAIServer",
     ],
-    "tests/unittest/llmapi/apps/test_context_length_error.py": [
-        "_disagg_server OpenAIDisaggServer",
-    ],
     "tests/unittest/llmapi/apps/test_openai_server_graceful_shutdown.py": [
         "_config_keywords OpenAIServer",
         "_serve_never_finishing_handler OpenAIServer",
