@@ -337,7 +337,7 @@ def assert_history_integrity(
     world_size: int,
     require_eviction: bool,
 ) -> None:
-    """Reconcile every configured offload layer and decode position per request/rank.
+    """Require distinct requests and complete FP8 offload history on each rank.
 
     Disaggregated context samples the first output token. Generation attention
     consumes the remaining output tokens' predecessors, starting at prompt length.
@@ -354,6 +354,10 @@ def assert_history_integrity(
     for rank, rows in _match_rank_events(
         events, prompt_lengths=prompt_lengths, world_size=world_size, kind="integrity"
     ):
+        request_ids = [row["request_id"] for row in rows]
+        assert len(set(request_ids)) == len(request_ids), (
+            f"rank {rank}: duplicate or split request integrity evidence"
+        )
         for event, (prompt_length, completion_length) in zip(rows, expected, strict=True):
             label = f"rank {rank}, request {event['request_id']}"
             metrics = event.get("integrity")

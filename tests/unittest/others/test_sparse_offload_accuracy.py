@@ -64,6 +64,7 @@ def _events() -> list[dict]:
     return [
         {
             "rank": rank,
+            "request_id": 1,
             "history_tokens": 8192,
             "selectable_units": [2048],
             "unit_tokens": 4,
@@ -111,9 +112,15 @@ def test_activation_gate_rejects_short_prompt() -> None:
         )
 
 
-def test_activation_gate_accepts_real_fetches_on_every_rank() -> None:
+@pytest.mark.parametrize("requests", [1, 2])
+def test_activation_gate_accepts_real_fetches_on_every_rank(requests: int) -> None:
+    events = [
+        {**event, "request_id": request_id}
+        for event in _events()
+        for request_id in range(1, requests + 1)
+    ]
     assert_host_fetches(
-        _events(), prompt_lengths=[8192], world_size=2, index_topk=512, unit_tokens=4
+        events, prompt_lengths=[8192] * requests, world_size=2, index_topk=512, unit_tokens=4
     )
 
 
@@ -543,19 +550,49 @@ def _history_event(
     }
 
 
-def test_history_gate_reconciles_complete_requests_on_every_rank() -> None:
+@pytest.mark.parametrize("second_prompt_length", [8, 12])
+def test_history_gate_reconciles_complete_requests_on_every_rank(
+    second_prompt_length: int,
+) -> None:
     events = [
         _history_event(rank, request_id, prompt_length)
         for rank in (1, 0)
-        for request_id, prompt_length in ((2, 12), (1, 8))
+        for request_id, prompt_length in ((2, second_prompt_length), (1, 8))
     ]
     assert_history_integrity(
         events,
-        prompt_lengths=[8, 12],
+        prompt_lengths=[8, second_prompt_length],
         completion_lengths=[4, 4],
         world_size=2,
         require_eviction=True,
     )
+
+
+@pytest.mark.parametrize("fp8_prefix_integrity", [False, True])
+def test_request_identity_check_is_fp8_integrity_only(fp8_prefix_integrity: bool) -> None:
+    events = [
+        {
+            **_history_event(rank, request_id, 8),
+            "selectable_units": [2],
+            "unit_tokens": 4,
+            "index_topk": 1,
+            "hits": 0,
+            "misses": 2,
+        }
+        for rank in (0, 1)
+        for request_id in (1, 2)
+    ]
+    events[-1]["request_id"] = 1
+    assert_host_fetches(events, prompt_lengths=[8, 8], world_size=2, index_topk=1, unit_tokens=4)
+    if fp8_prefix_integrity:
+        with pytest.raises(AssertionError, match="duplicate or split request"):
+            assert_history_integrity(
+                events,
+                prompt_lengths=[8, 8],
+                completion_lengths=[4, 4],
+                world_size=2,
+                require_eviction=True,
+            )
 
 
 @pytest.mark.parametrize(
