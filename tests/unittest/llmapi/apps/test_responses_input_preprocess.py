@@ -703,6 +703,117 @@ def test_calls_never_fold_into_replayed_history():
     assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_0"]
 
 
+# ---------------------------------------------------------------------------
+# One assistant turn - reasoning, then message text, then calls - stays the
+# one assistant message the model generated
+# ---------------------------------------------------------------------------
+
+
+def _reasoning_item(text):
+    return {
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": text}],
+    }
+
+
+def _assistant_item(text, item_id="msg_a"):
+    return {
+        "id": item_id,
+        "status": "completed",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+def _shapes(messages):
+    """(reasoning, content, call ids) of each assistant message."""
+    return [
+        (m.get("reasoning"), m.get("content"), [c["id"] for c in m.get("tool_calls") or []])
+        for m in messages
+        if m["role"] == "assistant"
+    ]
+
+
+@pytest.mark.parametrize(
+    "turn, expected",
+    [
+        (
+            [_reasoning_item("plan"), _assistant_item("Running."), _function_call_item(0)],
+            ("plan", "Running.", ["call_0"]),
+        ),
+        (
+            [_reasoning_item("plan"), _function_call_item(0), _function_call_item(1)],
+            ("plan", None, ["call_0", "call_1"]),
+        ),
+        ([_reasoning_item("plan"), _assistant_item("Done.")], ("plan", "Done.", [])),
+        # One generation's text split across items is joined as it was split.
+        (
+            [
+                _reasoning_item("plan"),
+                _assistant_item("Run", "msg_1"),
+                _assistant_item("ning.\n", "msg_2"),
+                _function_call_item(0),
+            ],
+            ("plan", "Running.\n", ["call_0"]),
+        ),
+        # So it is without reasoning, which is what opens a turn otherwise.
+        (
+            [
+                _assistant_item("Run", "msg_1"),
+                _assistant_item("ning.\n", "msg_2"),
+                _function_call_item(0),
+            ],
+            (None, "Running.\n", ["call_0"]),
+        ),
+    ],
+    ids=[
+        "reasoning_text_call",
+        "reasoning_call_call",
+        "reasoning_text",
+        "split_text",
+        "split_text_without_reasoning",
+    ],
+)
+def test_one_assistant_turn_becomes_one_assistant_message(turn, expected):
+    calls = sum(item["type"] == "function_call" for item in turn)
+    tail = [_function_call_output_item(i) for i in range(calls)] or [_message_item("user", "ok")]
+    messages = _messages({"input": [_message_item("user", "go"), *turn, *tail]})
+
+    assert [m["role"] for m in messages[:2]] == ["user", "assistant"]
+    assert _shapes(messages) == [expected]
+
+
+@pytest.mark.parametrize(
+    "items, expected",
+    [
+        # Text after the turn's calls is not part of that turn.
+        (
+            [_reasoning_item("plan"), _function_call_item(0), _assistant_item("Also.")],
+            [("plan", None, ["call_0"]), (None, "Also.", [])],
+        ),
+        # A reasoning item opens a turn of its own.
+        (
+            [_assistant_item("First."), _reasoning_item("plan"), _assistant_item("Second.")],
+            [(None, "First.", []), ("plan", "Second.", [])],
+        ),
+        (
+            [
+                _reasoning_item("one"),
+                _function_call_item(0),
+                _reasoning_item("two"),
+                _function_call_item(1),
+            ],
+            [("one", None, ["call_0"]), ("two", None, ["call_1"])],
+        ),
+    ],
+    ids=["text_after_calls", "reasoning_after_text", "two_reasoning_turns"],
+)
+def test_an_item_that_does_not_continue_the_turn_starts_a_new_message(items, expected):
+    assert _shapes(_messages({"input": items})) == expected
+
+
 # Multimodal content
 # ---------------------------------------------------------------------------
 
