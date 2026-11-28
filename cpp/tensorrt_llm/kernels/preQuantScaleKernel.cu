@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,22 +49,35 @@ __global__ void apply_per_channel_scale(T_out* smoothed_act, T_in const* act, T_
     T_in scale[kElems], act_vec[kElems];
     int col_offset = blockIdx.y * blockDim.x + threadIdx.x;
     int row_offset = blockIdx.x;
-    if (col_offset * kElems >= cols || row_offset * kProcessRows >= rows)
+    int64_t const validRows = num_valid_tokens_ptr ? min(static_cast<int64_t>(rows), *num_valid_tokens_ptr) : rows;
+    if (col_offset * kElems >= cols || static_cast<int64_t>(row_offset) * kProcessRows >= validRows)
+    {
         return;
-    if (num_valid_tokens_ptr && (row_offset * kProcessRows >= *num_valid_tokens_ptr))
-        return;
+    }
     act += row_offset * kProcessRows * cols;
     smoothed_act += row_offset * kProcessRows * cols;
+    int expert = 0;
+    if (expert_first_token_offset != nullptr)
+    {
+        expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
+                     static_cast<int64_t>(row_offset) * kProcessRows + 1)
+            - 1;
+    }
 #pragma unroll
     for (int i = 0; i < kProcessRows; ++i)
     {
-        *reinterpret_cast<AccessType*>(act_vec) = reinterpret_cast<AccessType const*>(act + i * cols)[col_offset];
-        int expert = 0;
-        if (expert_first_token_offset != nullptr)
+        if (static_cast<int64_t>(row_offset) * kProcessRows + i >= validRows)
         {
-            expert = findTotalEltsLessThanTarget(
-                         expert_first_token_offset, num_experts_per_node, (int64_t) row_offset * kProcessRows + i + 1)
-                - 1;
+            return;
+        }
+        *reinterpret_cast<AccessType*>(act_vec) = reinterpret_cast<AccessType const*>(act + i * cols)[col_offset];
+        if (expert_first_token_offset != nullptr && i > 0)
+        {
+            int64_t const row = static_cast<int64_t>(row_offset) * kProcessRows + i;
+            while (expert + 1 < num_experts_per_node && expert_first_token_offset[expert + 1] <= row)
+            {
+                ++expert;
+            }
         }
         *reinterpret_cast<AccessType*>(scale)
             = reinterpret_cast<AccessType const*>(per_channel_scale)[expert * cols / kElems + col_offset];
@@ -72,7 +85,8 @@ __global__ void apply_per_channel_scale(T_out* smoothed_act, T_in const* act, T_
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
                           || std::is_same_v<T_in, __nv_bfloat16>
 #endif
-                          ) &&(kElems % 2 == 0))
+                          )
+            && (kElems % 2 == 0))
         {
             using Vec2 = typename Vec2Type<T_in>::type;
 #pragma unroll
