@@ -2699,3 +2699,48 @@ def test_qwen4_inforward_snapshot_stages_and_restores_ple_state(monkeypatch):
         (manager._ple_conv_states[5].data_ptr(), stage_conv.data_ptr()),
         (manager._ple_ngram_contexts[5].data_ptr(), stage_ngram.data_ptr()),
     ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "offsets, cap, want",
+    [
+        ([0, 128], 64, 64),  # the final snapshot at the prompt end, one 128 tokens before it
+        ([128], 64, 64),
+        ([2, 128], 64, 64),
+        ([2], 64, 2),
+        ([0, 128], 0, 128),  # a model that names no limit
+    ],
+)
+def test_qwen4_inforward_snapshot_tail_is_capped_at_the_model_split(offsets, cap, want):
+    """The manager keeps its staging rows but plans in-forward tails no longer than the model's
+    split runs (`inforward_snapshot_max_tail`). A longer tail keeps the two-iteration path: the
+    scheduler ends the chunk at P (`_inforward_snapshot_point`), so the binding never sees a
+    tail it cannot serve."""
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager._inforward_snapshots = InforwardSnapshots()
+    manager._supports_inforward_snapshot = True
+    manager._inforward_min_main_request = 1
+    manager._inforward_max_tail_request = cap
+    manager._inforward_stage_ple = {}
+    manager._ple_layer_ids = []
+    manager.layer_offsets = {}
+    manager.local_num_mamba_layers = 1
+    manager._state_layout = SimpleNamespace(conv_state_layout="q_k_v")
+    manager.kv_cache_config = SimpleNamespace(
+        enable_block_reuse=True,
+        mamba_state_config=SimpleNamespace(additional_snapshot_offsets_from_end=offsets),
+    )
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.mapping = SimpleNamespace(pp_size=1)
+    manager.max_batch_size = 4
+    manager.ssm_bytes, manager.conv_bytes = 128, 288
+    manager.all_ssm_states = [torch.empty(1, 2, 4, 4)]
+    manager.ssm_state_shape, manager.conv_state_shape = [2, 4, 4], [8, 3]
+    manager.ssm_state_dtype = manager.conv_state_dtype = torch.float32
+    manager._setup_inforward_snapshots()
+
+    assert manager.inforward_snapshot_rows == 4
+    assert manager.inforward_snapshot_max_tail == want
+    assert manager.inforward_snapshot_min_main == 3  # the conv window

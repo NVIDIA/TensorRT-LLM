@@ -220,8 +220,13 @@ def _qsa_index_scores_visible_split(
     num_warps: int = _SPLIT_NUM_WARPS,
     num_stages: int = 2,
     wide: bool = False,
+    group_slots: int | None = None,
 ) -> torch.Tensor:
-    """One launch of the visible-split kernel after the callable's own checks."""
+    """One launch of the visible-split kernel after the callable's own checks. `group_slots`
+    (default `rows_per_tile`): the request slots a row tile launches, which must be at least the
+    distinct requests any of its row tiles holds (a caller that knows its rows come `p` a
+    request, consecutive and tile-aligned, passes `rows_per_tile // p`); `split` then counts
+    only those slots, so the device's programs go to requests that exist."""
     if index_cache.ndim != 4 or index_cache.shape[2] != 1:
         raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
@@ -260,11 +265,12 @@ def _qsa_index_scores_visible_split(
         )
     # Every (row tile, group slot) pair gets `split` programs; slots past a tile's request
     # count exit at once.
+    slots = rows_per_tile if group_slots is None else max(1, min(int(group_slots), rows_per_tile))
     split = min(
         triton.cdiv(max_compressed_blocks, block_n),
-        max(1, triton.cdiv(programs_per_sm * _sm_count(q.device), row_tiles * rows_per_tile)),
+        max(1, triton.cdiv(programs_per_sm * _sm_count(q.device), row_tiles * slots)),
     )
-    _qsa_index_scores_visible_split_kernel[(row_tiles, rows_per_tile, split)](
+    _qsa_index_scores_visible_split_kernel[(row_tiles, slots, split)](
         q,
         index_cache,
         block_table,
@@ -410,11 +416,16 @@ def _qsa_index_scores_group_kernel(
             per_head_scores = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.float32)
             for slot in tl.static_range(GROUP_ROWS):
                 request = tl.sum(tl.where(slots == slot, requests, 0), axis=0)
+                # This row's own visible blocks: a shorter request's table ends before the
+                # run's longest row. The columns past it are not stored for this row.
+                row_blocks = valid_blocks & (
+                    block_columns < tl.sum(tl.where(slots == slot, visible, 0), axis=0)
+                )
                 physical_pages = tl.load(
                     block_table
                     + request * block_table_stride_request
                     + logical_pages * block_table_stride_page,
-                    mask=valid_blocks,
+                    mask=row_blocks,
                     other=0,
                 ).to(tl.int64)
                 keys = tl.load(
@@ -422,7 +433,7 @@ def _qsa_index_scores_group_kernel(
                     + physical_pages[:, None] * cache_stride_page
                     + token_in_page[:, None] * cache_stride_token
                     + dim_offsets[None, :] * cache_stride_dim,
-                    mask=valid_blocks[:, None] & dim_ok,
+                    mask=row_blocks[:, None] & dim_ok,
                     other=0.0,
                 )
                 per_head_scores = tl.where(
@@ -447,6 +458,160 @@ def _qsa_index_scores_group_kernel(
         )
 
 
+#: Past every position: a masked-off row's term of the run's smallest position.
+_NO_POSITION: tl.constexpr = tl.constexpr(1 << 60)
+
+
+@triton.jit
+def _qsa_index_scores_group_prefetch_kernel(
+    q,
+    index_cache,
+    block_table,
+    query_positions,
+    request_indices,
+    output,
+    score_scale,
+    rows,
+    q_stride_row: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    cache_stride_page: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    block_table_stride_request: tl.constexpr,
+    block_table_stride_page: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    output_stride_block: tl.constexpr,
+    NUM_INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    MAX_COMPRESSED_BLOCKS: tl.constexpr,
+    GROUP_ROWS: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MARGIN: tl.constexpr,
+):
+    """`_qsa_index_scores_group_kernel` (one tile a program, always PDL) with a run's pages and
+    keys read BEFORE `griddepcontrol.wait`: the dependents (the block top-k, which waits before
+    it reads a score) are released at the program's start, the run's metadata and its tile of
+    pages and keys are loaded, then the wait; after it every key whose anchor is at or past the
+    run's smallest position minus `MARGIN` is read again (the only index slots the predecessor
+    -- the attention decode prologue -- writes are the rows' own positions and the anchor of a
+    block ending at one of them), then q, then the same dot, ReLU, pairwise head sum, scale and
+    masked store. Same loads, dot and epilogue: bitwise the request-group kernel's scores; only
+    the time a gather is issued moves. A run whose rows name several requests loads nothing
+    before the wait and is gathered row by row after it, as the request-group kernel does."""
+    BLOCK_H: tl.constexpr = BLOCK_G * NUM_INDEX_HEADS
+    tl.extra.cuda.gdc_launch_dependents()
+    group = tl.program_id(0)
+    slots = tl.arange(0, BLOCK_G)
+    group_rows = group * GROUP_ROWS + slots
+    row_ok = (slots < GROUP_ROWS) & (group_rows < rows)
+    # Step metadata (the engine fills it before the step's first layer): read before the wait.
+    lead = tl.load(request_indices + group * GROUP_ROWS).to(tl.int64)
+    requests = tl.load(request_indices + group_rows, mask=row_ok, other=0).to(tl.int64)
+    requests = tl.where(row_ok, requests, lead)
+    positions = tl.load(query_positions + group_rows, mask=row_ok, other=0)
+    visible = tl.where(row_ok, (positions + 1) // COMPRESS_RATIO, 0)
+    max_visible = tl.max(visible, axis=0)
+    tile = tl.program_id(1)
+    if tile * BLOCK_N >= max_visible:
+        # No visible column: this program writes nothing (it released its dependents above).
+        return
+    shared = tl.max((requests != lead).to(tl.int32), axis=0) == 0
+    fresh_from = tl.min(tl.where(row_ok, positions.to(tl.int64), _NO_POSITION), axis=0) - MARGIN
+
+    dim_offsets = tl.arange(0, BLOCK_D)
+    dim_ok = dim_offsets[None, :] < INDEX_HEAD_DIM
+    block_columns = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < max_visible)
+    anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
+    logical_pages = anchor_positions // TOKENS_PER_BLOCK
+    token_in_page = anchor_positions % TOKENS_PER_BLOCK
+    # The run's pages and keys before the wait (a run of one request only).
+    physical_pages = tl.load(
+        block_table + lead * block_table_stride_request + logical_pages * block_table_stride_page,
+        mask=valid_blocks & shared,
+        other=0,
+    ).to(tl.int64)
+    key_ptrs = (
+        index_cache
+        + physical_pages[:, None] * cache_stride_page
+        + token_in_page[:, None] * cache_stride_token
+        + dim_offsets[None, :] * cache_stride_dim
+    )
+    key_mask = valid_blocks[:, None] & dim_ok
+    keys = tl.load(key_ptrs, mask=key_mask & shared, other=0.0, eviction_policy="evict_first")
+
+    # The memory clobber keeps every load of the predecessor's outputs below the wait.
+    gdc_wait_with_memory_clobber()
+
+    # Dot column c is head c % heads of the run's row c // heads.
+    columns = tl.arange(0, BLOCK_H)
+    column_slot = columns // NUM_INDEX_HEADS
+    column_rows = group * GROUP_ROWS + column_slot
+    column_ok = (column_slot < GROUP_ROWS) & (column_rows < rows)
+    query_values = tl.load(
+        q
+        + column_rows[None, :] * q_stride_row
+        + dim_offsets[:, None] * q_stride_dim
+        + (columns % NUM_INDEX_HEADS)[None, :] * q_stride_head,
+        mask=(dim_offsets[:, None] < INDEX_HEAD_DIM) & column_ok[None, :],
+        other=0.0,
+    )
+    if shared:
+        # The slots the predecessor may have written this step, read again now that it is done.
+        fresh = valid_blocks & (anchor_positions >= fresh_from)
+        keys = tl.where(
+            fresh[:, None], tl.load(key_ptrs, mask=key_mask & fresh[:, None], other=0.0), keys
+        )
+        per_head_scores = tl.dot(keys, query_values, out_dtype=tl.float32)
+    else:
+        per_head_scores = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.float32)
+        for slot in tl.static_range(GROUP_ROWS):
+            request = tl.sum(tl.where(slots == slot, requests, 0), axis=0)
+            # This row's own visible blocks: a shorter request's table ends before the run's
+            # longest row. The columns past it are not stored for this row.
+            row_blocks = valid_blocks & (
+                block_columns < tl.sum(tl.where(slots == slot, visible, 0), axis=0)
+            )
+            row_pages = tl.load(
+                block_table
+                + request * block_table_stride_request
+                + logical_pages * block_table_stride_page,
+                mask=row_blocks,
+                other=0,
+            ).to(tl.int64)
+            row_keys = tl.load(
+                index_cache
+                + row_pages[:, None] * cache_stride_page
+                + token_in_page[:, None] * cache_stride_token
+                + dim_offsets[None, :] * cache_stride_dim,
+                mask=row_blocks[:, None] & dim_ok,
+                other=0.0,
+            )
+            per_head_scores = tl.where(
+                (column_slot == slot)[None, :],
+                tl.dot(row_keys, query_values, out_dtype=tl.float32),
+                per_head_scores,
+            )
+    # The row-wise kernel's head sum is (h0 + h1) + (h2 + h3): pairs, then the pairs.
+    pairs = tl.sum(
+        tl.reshape(tl.maximum(per_head_scores, 0.0), (BLOCK_N, BLOCK_G, NUM_INDEX_HEADS // 2, 2)),
+        axis=3,
+    )
+    scores = tl.sum(pairs, axis=2)
+    tl.store(
+        output
+        + group_rows[None, :] * output_stride_row
+        + block_columns[:, None] * output_stride_block,
+        scores * score_scale,
+        mask=(block_columns[:, None] < visible[None, :]) & row_ok[None, :],
+    )
+
+
 #: Index-head counts the request-group kernel serves: its head sum is the row-wise kernel's
 #: at up to 8 heads, two a thread then across the lanes; at 16 the row-wise kernel holds
 #: four a thread.
@@ -468,6 +633,27 @@ def _takes_request_groups(
         rows_per_request > 1
         and only_visible_blocks
         and not prefetch
+        and q.ndim == 3
+        and q.shape[1] in _GROUP_HEADS
+        and not (context_rows and q.shape[0] > _DECODE_ROW_LIMIT)
+    )
+
+
+def _takes_request_groups_prefetch(
+    q: torch.Tensor,
+    only_visible_blocks: bool,
+    context_rows: bool,
+    use_pdl: bool,
+    prefetch: bool,
+    rows_per_request: int,
+) -> bool:
+    """`prefetch` on a call the request-group kernel serves, launched with PDL: the request-group
+    kernel with the run's pages and keys read before its PDL wait."""
+    return (
+        prefetch
+        and use_pdl
+        and rows_per_request > 1
+        and only_visible_blocks
         and q.ndim == 3
         and q.shape[1] in _GROUP_HEADS
         and not (context_rows and q.shape[0] > _DECODE_ROW_LIMIT)
@@ -690,6 +876,67 @@ def _qsa_index_scores_request_groups(
     return output
 
 
+def _qsa_index_scores_request_groups_prefetch(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+    rows_per_request: int,
+) -> torch.Tensor:
+    """One PDL launch of the prefetching request-group kernel after the callable's own checks:
+    one 128-column tile a program; the re-read margin is one compressed block."""
+    rows, num_index_heads, index_head_dim = q.shape
+    max_compressed_blocks = _check_index_scores_operands(
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        tokens_per_block,
+        compress_ratio,
+    )
+    output = torch.empty((rows, max_compressed_blocks), dtype=torch.float32, device=q.device)
+    if rows == 0:
+        return output
+    grid = (triton.cdiv(rows, rows_per_request), triton.cdiv(max_compressed_blocks, _GROUP_BLOCK_N))
+    _qsa_index_scores_group_prefetch_kernel[grid](
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        output,
+        index_head_dim**-0.5,
+        rows,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        index_cache.stride(0),
+        index_cache.stride(1),
+        index_cache.stride(3),
+        block_table.stride(0),
+        block_table.stride(1),
+        output.stride(0),
+        output.stride(1),
+        NUM_INDEX_HEADS=num_index_heads,
+        INDEX_HEAD_DIM=index_head_dim,
+        BLOCK_D=max(16, triton.next_power_of_2(index_head_dim)),
+        TOKENS_PER_BLOCK=tokens_per_block,
+        COMPRESS_RATIO=compress_ratio,
+        MAX_COMPRESSED_BLOCKS=max_compressed_blocks,
+        GROUP_ROWS=rows_per_request,
+        BLOCK_G=max(triton.next_power_of_2(rows_per_request), 16 // num_index_heads, 1),
+        BLOCK_N=_GROUP_BLOCK_N,
+        MARGIN=compress_ratio,
+        num_warps=4,
+        launch_pdl=True,
+    )
+    return output
+
+
 _CHECKPOINT = dict(
     heads=4,
     head_dim=128,
@@ -804,12 +1051,16 @@ class QsaPagedIndexScores(OpWrapper):
     from row 0 (a verify step's `predicted_tokens_per_seq`): with `only_visible_blocks`,
     no `prefetch` and 2, 4 or 8 index heads, the entry's request-group kernel shares one
     key gather across each run (a run whose rows name different requests is gathered
-    row by row). With `prefill_query_tile`, a visible-only context-row call of more
+    row by row); with `prefetch` and `use_pdl` such a call runs the request-group kernel with
+    each run's pages and keys read before the PDL wait and the keys the predecessor may have
+    written this step (anchors from the run's smallest position minus one compressed block) read
+    again after it, bitwise the request-group kernel's scores. With `prefill_query_tile`, a
+    visible-only context-row call of more
     than 256 rows at 4 bf16 index heads of 128 runs the query-tiled kernel at a deeper
     launch, bitwise the engine launch's scores. With `wide_split`, a visible-split call
     of `_SPLIT_WIDE_MIN_ROWS` rows or more past one row tile takes more programs an SM,
     bitwise the narrow split. Both default off. Each cell names the kernel it was
-    measured on. The request-group kernel is bitwise the row-wise one; the visible-split
+    measured on. The request-group kernels are bitwise the row-wise one; the visible-split
     and query-tiled kernels are not.
 
     Fusion boundary: the table walk, the gather, the dots, relu, head sum,
@@ -949,6 +1200,45 @@ class QsaPagedIndexScores(OpWrapper):
                 context_rows=False,
                 use_pdl=True,
                 branch="visible_split",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        # A tep4 rank's verify step at 1 and 2 requests (`TEP_INDEX_PREFETCH`): the
+        # request-group kernel with the run's keys before the wait, behind the decode prologue,
+        # over the AgentX table (65600 columns) to the last position.
+        Cell(
+            why="tep4 MTP3 verify, prefetch: 1 request x 4 rows to 262143, 65600 cols",
+            spec=_spec(
+                layout="decode",
+                gen_positions=_decode_positions(1, _AGENTX_LAST_POSITION, rows_per_request=4),
+                rows_per_request=4,
+                call_rows_per_request=4,
+                slots=_TABLE_SLOTS,
+                pages=_AGENTX_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=False,
+                use_pdl=True,
+                prefetch=True,
+                branch="request_group_prefetch",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        Cell(
+            why="tep4 MTP3 verify, prefetch: 2 requests x 4 rows to 262143, 65600 cols",
+            spec=_spec(
+                layout="decode",
+                gen_positions=_decode_positions(2, _AGENTX_LAST_POSITION, rows_per_request=4),
+                rows_per_request=4,
+                call_rows_per_request=4,
+                slots=_TABLE_SLOTS,
+                pages=_AGENTX_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=False,
+                use_pdl=True,
+                prefetch=True,
+                branch="request_group_prefetch",
                 **_TRUNK_POOL_BF16,
             ),
         ),
@@ -1236,9 +1526,29 @@ class QsaPagedIndexScores(OpWrapper):
         rows_per_request: int = 1,
         prefill_query_tile: bool = False,
         wide_split: bool = False,
+        split_shape: tuple[int, int] | None = None,
     ) -> torch.Tensor:
+        """`split_shape` = `(programs a SM, request slots a row tile)` overrides the
+        visible-split launch's shape (`_qsa_index_scores_visible_split`'s `programs_per_sm` and
+        `group_slots`). Precondition: the slots are at least the distinct requests any row tile
+        holds (the target passes `tile // p` for rows that come `p` a request, consecutive and
+        tile-aligned); a tile's requests past its slots are not scored. Within that, the scores
+        do not depend on it. Other kernels ignore it."""
         if rows_per_request < 1:
             raise ValueError("QSA index scoring requires rows_per_request >= 1")
+        if _takes_request_groups_prefetch(
+            q, only_visible_blocks, context_rows, use_pdl, prefetch, rows_per_request
+        ):
+            return _qsa_index_scores_request_groups_prefetch(
+                q,
+                index_cache,
+                block_table,
+                query_positions,
+                request_indices,
+                tokens_per_block,
+                compress_ratio,
+                rows_per_request,
+            )
         if rows_per_request == 1 and _takes_visible_split(q, only_visible_blocks, prefetch):
             return _qsa_index_scores_visible_split(
                 q,
@@ -1250,6 +1560,8 @@ class QsaPagedIndexScores(OpWrapper):
                 compress_ratio,
                 use_pdl,
                 wide=wide_split,
+                programs_per_sm=None if split_shape is None else split_shape[0],
+                group_slots=None if split_shape is None else split_shape[1],
             )
         if _takes_request_groups(q, only_visible_blocks, context_rows, prefetch, rows_per_request):
             return _qsa_index_scores_request_groups(
@@ -1305,11 +1617,12 @@ class QsaPagedIndexScores(OpWrapper):
         rows_per_request: int = 1,
         prefill_query_tile: bool = False,
         wide_split: bool = False,
+        split_shape: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """fp32 scores, `-inf` past each row's bound -- or NaN there, meaning
         "unspecified", when `only_visible_blocks` is True. `context_rows`,
-        `rows_per_request`, `prefill_query_tile` and `wide_split` are ignored: they pick a
-        kernel or a launch, not a result.
+        `rows_per_request`, `prefill_query_tile`, `wide_split` and `split_shape` are ignored:
+        they pick a kernel or a launch, not a result.
 
         Walked in row chunks only to bound the gathered keys, which reach
         8.7 GiB in fp32 at 8191 rows x 2080 columns.

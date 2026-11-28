@@ -15,7 +15,7 @@
   rows come in multiples of the row-tile pass's groups (10 rows at 24 / 2 heads, 20 at 6 / 1),
   so a launch per group splits none of them and every row takes the same pass as in the one
   launch. At 6 / 1 heads the pass agrees with the NVFP4 per-row prefill kernel.
-* **MTP IndexShare.** The draft selection (`_selection`) in its fused and its two-launch form,
+* **MTP IndexShare.** The selection (`_selection`) in its cluster, one-CTA and two-launch forms,
   the capture of each request's draft-extend row into the shared buffers (decode and
   mixed-batch forms), and the reuse entry's order over canonical captures. The targets are
   built without weights: the capture methods read only their arguments, the metadata and the
@@ -299,11 +299,17 @@ def _select(scores, starts, ends) -> torch.Tensor:
 
 
 @_cuda
-@pytest.mark.parametrize("width", [2080, 65600])
-@pytest.mark.parametrize("fused", [False, True])
-def test_selection_matches_the_canonical_composition(width, fused, monkeypatch):
-    """The draft selection keeps the canonical tie order and expansion in the fused launch
-    and in the selection and the expansion apart."""
+@pytest.mark.parametrize(
+    "width, form",
+    # The cluster launch serves the 65600-wide table only (2080 is below its narrowest).
+    [(2080, "fused"), (2080, "apart"), (65600, "cluster"), (65600, "fused"), (65600, "apart")],
+)
+def test_selection_matches_the_canonical_composition(width, form, monkeypatch):
+    """The selection keeps the canonical tie order and expansion in each of its three forms:
+    the cluster launch (`qsa_topk_expand_cluster`, where its table widths reach), the
+    one-CTA-a-row launch, and the selection and the expansion apart."""
+    table = torch.empty((4, width), device=DEV)
+    assert M._topk_expand_cluster_supports(table) == (width == 65600)
     positions = torch.tensor([2043, 2047, 84000, 99999], dtype=torch.int64, device=DEV)
     visible = ((positions + 1) // 4).to(torch.int32)
     visible.clamp_(max=width)
@@ -320,11 +326,29 @@ def test_selection_matches_the_canonical_composition(width, fused, monkeypatch):
     expected_tokens = M.qsa_expand_block_indices(
         expected, positions, lengths, compress_ratio=4, token_topk=2048
     )
-    if not fused:
+    if form != "cluster":
+        monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, max_rows: False)
+    if form == "apart":
         monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: False)
+    launched = []
+    for name in ("qsa_topk_expand_cluster", "qsa_topk_expand_decode"):
+        real = getattr(M, name)
+        monkeypatch.setattr(
+            M,
+            name,
+            lambda *a, _real=real, _name=name, **k: (launched.append(_name), _real(*a, **k))[1],
+        )
     result = torch.full_like(expected, -7)
     selected = torch.full_like(expected_tokens, -7)
     M._selection(core, scores, visible, positions, lengths, result, starts, selected)
+    assert (
+        launched
+        == {
+            "cluster": ["qsa_topk_expand_cluster"],
+            "fused": ["qsa_topk_expand_decode"],
+            "apart": [],
+        }[form]
+    )
     assert torch.equal(result, expected)
     assert torch.equal(selected, expected_tokens)
 
@@ -440,8 +464,9 @@ def _chunked_calls(monkeypatch, rows: int, pages: int, parts, limit=None):
         assert q.shape[0] * columns < (limit or M._SCORE_TABLE_ELEMENTS)
         return q[:, 0, :1].expand(q.shape[0], columns)
 
-    def selection(core, scores, visible, logical, seq_lens, topk, starts, out, live_cols):
+    def selection(core, scores, visible, logical, seq_lens, topk, starts, out, live_cols, context):
         assert scores.shape == (logical.shape[0], columns) and live_cols == 7
+        assert context == calls[-1][2]  # the scoring call's context rows pick the launch
         out.copy_(logical[:, None].to(out.dtype).expand_as(out))
 
     monkeypatch.setattr(M, "qsa_paged_index_scores", scores_op)

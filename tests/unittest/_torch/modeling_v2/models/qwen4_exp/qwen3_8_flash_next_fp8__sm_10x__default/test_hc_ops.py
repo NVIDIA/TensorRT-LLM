@@ -8,6 +8,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (  # noqa: E501
+    qwen4_exp_hc_decode_rows_first as first_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (  # noqa: E501
+    qwen4_exp_hc_decode_rows_mix as mix_op,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
     qwen4_exp_hc_inject_norm,
 )
@@ -16,12 +22,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default import (  # noqa: E501
     modeling as M,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (  # noqa: E501
-    qwen4_exp_hc_decode_rows_first as first_op,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.hc.qwen4_exp_hc_decode_rows_tc__decode import (  # noqa: E501
-    qwen4_exp_hc_decode_rows_mix as mix_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.hc.qwen4_exp_hc_decode_tc_first__decode import (  # noqa: E501
     qwen4_exp_hc_decode_tc_first as op,

@@ -115,6 +115,8 @@ CELLS = certified_cells(op, TARGET_CELLS)
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     args = _build(cell.spec, seed=_seed(cell.why))
+    if cell.spec.get("pdl"):
+        args = (*args, True)
     x, z, weight = args[:3]
     assert z.stride()[1:] == (cell.spec["width"], 1)
     if cell.spec["tokens"] > 1:
@@ -168,6 +170,19 @@ def test_direct_launch_is_bitwise_the_registered_op(spec) -> None:
 
     assert torch.equal(op_module._direct_launch(x, z, weight, eps, act), expected)
     assert torch.equal(op(x, z, weight, eps, None, act, True), expected)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 20, 48, 97, 256])
+def test_pdl_launch_is_bitwise_the_registered_op(tokens) -> None:
+    """`pdl=True` (the NVFP4 target's lean verify step) launches the registered op's 4-row
+    kernel with PDL whatever the grid: the op's bytes at every dep-rank verify size, including
+    the grids past the SM count where the op itself launches without PDL, and an odd token
+    count (a masked last program)."""
+    spec = dict(op_module._DEP4, tokens=tokens)
+    x, z, weight, eps, _, act, _ = _build(spec, seed=_seed(f"pdl {tokens}"))
+    expected = torch.ops.trtllm.rms_norm_gated_token_major(x, z, weight, eps, None, act)
+    assert torch.equal(op_module._pdl_launch(x, z, weight, eps, act), expected)
+    assert torch.equal(op(x, z, weight, eps, None, act, False, True), expected)
 
 
 @pytest.mark.parametrize(

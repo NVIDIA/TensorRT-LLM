@@ -62,6 +62,25 @@ def _direct_launch(x, z, weight, eps, gate_activation):
     return out
 
 
+def _pdl_launch(x, z, weight, eps, gate_activation):
+    """The registered op's 4-row launch with PDL whatever the grid: the same kernel, one tile a
+    program, the same fast-path hints (`CONTIG`, `EVEN`) and early trigger, plus the
+    programmatic wait the registered op skips once its grid covers the SMs. The weight is read
+    before the wait, `x` and `z` after it, so the values are the registered op's."""
+    rows, n = x.shape
+    out = torch.empty_like(x)
+    rows_per_program = _layernorm_gated._MULTIROW_ROWS
+    _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(rows, rows_per_program),)](
+        x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
+        N=n, ROWS=rows_per_program, HEADS_PER_TOK=z.shape[1],
+        GATE_SIGMOID=gate_activation == "sigmoid", WEIGHT_IS_DELTA=False, LAUNCH_WITH_PDL=True,
+        EARLY_TRIGGER=True, CONTIG=x.stride(0) == n and out.stride(0) == n,
+        EVEN=rows % rows_per_program == 0, GROUPS=1, num_warps=_layernorm_gated._MULTIROW_NUM_WARPS,
+        launch_pdl=True,
+    )  # fmt: skip
+    return out
+
+
 def _prefill_launch(x, z, weight, eps, gate_activation):
     """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every SM)."""
     rows, n = x.shape
@@ -137,6 +156,14 @@ class RmsNormGatedTokenMajor(OpWrapper):
             why="dep4 decode: 48 heads at token stride 16480, a rank's 32 tokens",
             spec=dict(tokens=32, **_DEP4),
         ),
+        Cell(
+            why="dep lean verify: 48 heads, 20 tokens, PDL forced (grid 240 past the SMs)",
+            spec=dict(tokens=20, pdl=True, **_DEP4),
+        ),
+        Cell(
+            why="dep lean verify: 48 heads, 256 tokens (64 requests x 4), PDL forced",
+            spec=dict(tokens=256, pdl=True, **_DEP4),
+        ),
     )
 
     note = """
@@ -152,7 +179,11 @@ class RmsNormGatedTokenMajor(OpWrapper):
     launch is made here (`_direct_launch`, through the registered op's own
     launch helper), skipping only the custom-op dispatch: 24 instead of 39 us of
     host time a call on GB300. The test holds it bitwise equal to the op at the
-    direct-launch cells and more shapes.
+    direct-launch cells and more shapes. `pdl=True` (the NVFP4 target's attention-DP
+    lean verify step, behind the replay) takes the same 4-row launch with PDL at every
+    grid size (`_pdl_launch`): the weight before the programmatic wait, `x` and `z` after
+    it, so its output is the op's, which the test holds bitwise at 20..256 tokens of 48
+    heads (grids of 240..3072 programs, where the op itself drops PDL).
 
     Loud (measured), so not guarded: 3-D `x` (ValueError), a `z` not covering `x`
     (AssertionError "does not match x shape"; 2-D `z` ValueError), an unknown
@@ -212,17 +243,20 @@ class RmsNormGatedTokenMajor(OpWrapper):
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
         direct_launch: bool = False,
+        pdl: bool = False,
     ) -> torch.Tensor:
         if fp8_scale is None and z.dim() == 3 and _prefill_multirow(x, z, gate_activation):
             return _prefill_launch(x, z, weight, eps, gate_activation)
         if (
-            direct_launch
+            (direct_launch or pdl)
             and fp8_scale is None
             and x.dim() == 2
             and z.dim() == 3
             and weight.is_contiguous()
             and _multirow(x, z, gate_activation)
         ):
+            if pdl:
+                return _pdl_launch(x, z, weight, eps, gate_activation)
             return _direct_launch(x, z, weight, eps, gate_activation)
         return torch.ops.trtllm.rms_norm_gated_token_major(
             x, z, weight, eps, fp8_scale, gate_activation
@@ -237,9 +271,10 @@ class RmsNormGatedTokenMajor(OpWrapper):
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
         direct_launch: bool = False,
+        pdl: bool = False,
     ) -> torch.Tensor:
-        """fp32 throughout; row `t * heads + h` pairs with `z[t, h]`. `direct_launch` does
-        not change the result.
+        """fp32 throughout; row `t * heads + h` pairs with `z[t, h]`. `direct_launch` and
+        `pdl` do not change the result.
 
         With `fp8_scale` the gated value is rounded to `x.dtype` first, then
         multiplied by the fp32 reciprocal of the scale, as the kernel does.
@@ -265,6 +300,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
         direct_launch: bool = False,
+        pdl: bool = False,
     ) -> None:
         assert weight.shape == (x.shape[-1],), (
             f"weight must be 1-D of length x.shape[-1]={x.shape[-1]}; got "

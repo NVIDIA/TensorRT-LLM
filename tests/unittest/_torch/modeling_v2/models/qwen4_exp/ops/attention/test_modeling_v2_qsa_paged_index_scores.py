@@ -13,9 +13,10 @@ plane in one page (the last layer's plane taken), NaN wherever no request maps a
 page, with the pool's first and last page among those the cell reads -- the last
 one past 2^31 elements from the plane's base.
 
-The call has four kernels behind it: the entry's own visible-split kernel for
-ungrouped decode-sized visible-only calls and request-group kernel for verify-shaped
-ones, and the engine's row-wise and query-tile kernels. `_watch_launches` swaps the four Triton entry points
+The call has five kernels behind it: the entry's own visible-split kernel for
+ungrouped decode-sized visible-only calls and request-group kernel (and its prefetching form)
+for verify-shaped ones, and the engine's row-wise and query-tile kernels. `_watch_launches`
+swaps the five Triton entry points
 for recording proxies that still launch the real kernel, so every cell asserts
 the branch it names. Beyond the cells: capture and replay at every measured-pool decode
 and verify cell, and the refusal of metadata shorter than the rows by both launchers.
@@ -25,6 +26,8 @@ import math
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
@@ -90,6 +93,7 @@ class _watch_launches:
         (_qsa_kernels, "_qsa_paged_index_scores_qtile_kernel", "query_tile"),
         (_entry, "_qsa_index_scores_group_kernel", "request_group"),
         (_entry, "_qsa_index_scores_visible_split_kernel", "visible_split"),
+        (_entry, "_qsa_index_scores_group_prefetch_kernel", "request_group_prefetch"),
     )
 
     def __enter__(self):
@@ -276,6 +280,15 @@ def _assert_reaches_the_pool_ends(args, spec) -> None:
 def _branch_rule(rows, spec):
     heads = spec["heads"]
     if (
+        spec.get("call_rows_per_request", 1) > 1
+        and spec["only_visible_blocks"]
+        and spec.get("prefetch", False)
+        and spec.get("use_pdl", False)
+        and heads in (2, 4, 8)
+        and not (spec["context_rows"] and rows > DECODE_ROW_LIMIT)
+    ):
+        return "request_group_prefetch"
+    if (
         spec.get("call_rows_per_request", 1) == 1
         and spec["only_visible_blocks"]
         and not spec.get("prefetch", False)
@@ -442,6 +455,239 @@ def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:
         torch.cuda.synchronize()
         assert torch.equal(graph_out[visible], _engine_scores(**args)[visible]), f"replay {trial}"
         _compare(graph_out, op.reference(**args))
+
+
+@pytest.mark.parametrize("requests, mixed", [(1, False), (2, False), (4, True)])
+def test_request_group_prefetch_is_bitwise_and_reads_fresh_keys(requests, mixed) -> None:
+    """`prefetch` with `rows_per_request` 4 and PDL: the request-group kernel with each run's
+    pages and keys read before the wait. Under graph replay a producer rewrites q and, at every
+    row's own position and the anchor of a block ending at one, the index key -- what the
+    attention decode prologue writes -- right before the op; the scores must be the plain
+    request-group kernel's bits on every visible column. With `mixed` the runs name several
+    requests (gathered after the wait). The producer here is a plain launch, complete before
+    the op starts: this pins the bits and the capture, not the re-read after the wait
+    (`test_request_group_prefetch_rereads_what_a_late_producer_stores` does)."""
+    rows = 4 * requests
+    spec = _case(rows, 8, pages=_WIDTH_PAGES, only_visible_blocks=True)
+    spec.update(q_layout="scratch_slice", use_pdl=True)
+    args = _build(spec, seed=503 + rows + mixed)
+    slots = torch.unique(args["request_indices"])
+    gen = torch.Generator(device=DEV).manual_seed(rows)
+    if mixed:
+        pick = torch.randint(0, slots.numel(), (rows,), generator=gen, device=DEV)
+    else:
+        pick = (torch.arange(rows, device=DEV) // 4) % slots.numel()
+    args["request_indices"] = slots[pick].to(args["request_indices"].dtype)
+    cr, tpb = args["compress_ratio"], args["tokens_per_block"]
+    pos = args["query_positions"].long().clamp_min(cr - 1)
+    if not mixed:  # a verify run: four consecutive positions of one request
+        pos = (pos[::4].repeat_interleave(4) // 4) * 4 + torch.arange(rows, device=DEV) % 4
+        pos = pos.clamp_min(cr - 1)
+    args["query_positions"] = pos.to(args["query_positions"].dtype)
+    group = {**args, "rows_per_request": 4}
+    pages = args["block_table"][args["request_indices"].long(), pos // tpb].long()
+    written = (pages, pos % tpb)  # each row's own index slot (the store; anchors among them)
+    visible = _visible(args)
+    with _watch_launches() as watcher:
+        plain = op(**group)
+    assert watcher.branch == "request_group"
+    with _watch_launches() as watcher:
+        early = op(**{**group, "prefetch": True})
+    assert watcher.branch == "request_group_prefetch"
+    assert torch.equal(early[visible].view(torch.int32), plain[visible].view(torch.int32))
+    src_q = args["q"].clone()
+    src_k = args["index_cache"][written].clone()
+
+    def step():
+        args["q"].copy_(src_q * 1.0)
+        args["index_cache"][written] = src_k * 1.0
+        return op(**{**group, "prefetch": True})
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    for trial in range(3):
+        src_q.copy_(torch.randn(src_q.shape, generator=gen, device=DEV).to(src_q.dtype))
+        src_k.copy_(torch.randn(src_k.shape, generator=gen, device=DEV).to(src_k.dtype))
+        graph.replay()
+        torch.cuda.synchronize()
+        want = op(**group)
+        assert torch.equal(graph_out[visible].view(torch.int32), want[visible].view(torch.int32)), (
+            f"replay {trial}"
+        )
+        _compare(graph_out, op.reference(**args))
+
+
+@triton.jit
+def _late_slot_store(
+    src, index_cache, pages, slots, page_stride, slot_stride, delay_ns, ROW: tl.constexpr
+):
+    """Releases its PDL dependents at entry, then (~`delay_ns` later) stores row i of `src` into
+    the index plane's slot (`pages[i]`, `slots[i]`): a dependent that reads that slot before its
+    griddepcontrol.wait sees the old key."""
+    tl.extra.cuda.gdc_launch_dependents()
+    t0 = tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+    )
+    t = t0
+    while t - t0 < delay_ns:
+        t = tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+        )
+    i = tl.program_id(0)
+    page = tl.load(pages + i)
+    slot = tl.load(slots + i)
+    offs = tl.arange(0, ROW)
+    tl.store(
+        index_cache + page * page_stride + slot * slot_stride + offs,
+        tl.load(src + i * ROW + offs),
+    )
+
+
+def _late_store(index_cache, pages, slots, keys, delay_ns: int) -> None:
+    """`index_cache[pages, slots] = keys` by a producer that releases a PDL-launched successor
+    at entry and stores ~`delay_ns` later (what the attention decode prologue may still be
+    doing when the scores start)."""
+    row = index_cache.shape[2] * index_cache.shape[3]
+    assert index_cache.stride(3) == 1 and index_cache.stride(2) == index_cache.shape[3]
+    assert keys.dtype == index_cache.dtype and keys.numel() == pages.numel() * row
+    _late_slot_store[(pages.numel(),)](
+        keys.contiguous(),
+        index_cache,
+        pages.to(torch.int64).contiguous(),
+        slots.to(torch.int64).contiguous(),
+        index_cache.stride(0),
+        index_cache.stride(1),
+        delay_ns,
+        ROW=row,
+    )
+
+
+def test_request_group_prefetch_rereads_what_a_late_producer_stores() -> None:
+    """`prefetch` behind a producer that releases it at entry and stores, ~500 us later, the
+    run's own index slots and block 5's anchor (position 23, below the re-read bound): the keys
+    at or past the run's smallest position minus one compressed block are read again after the
+    wait, so those scores are the plain request-group kernel's bits over the stored keys.
+
+    Block 5 is the overlap signal of the same invocation: the op reads it before the wait and
+    never again, so its score is the old key's exactly when the op's loads ran before the
+    producer's store. Where they did not overlap (CUDA may serialize the pair) the re-read check
+    could not fail, and the attempt is retried, then reported inconclusive (skipped)."""
+    rows, p0 = 4, 4096  # one request's verify run at 4096..4099: row 3 ends a group
+    spec = _case(rows, 8, pages=_WIDTH_PAGES, only_visible_blocks=True)
+    spec.update(q_layout="scratch_slice", use_pdl=True)
+    args = _build(spec, seed=611)
+    cr, tpb = args["compress_ratio"], args["tokens_per_block"]
+    args["request_indices"] = args["request_indices"][:1].repeat(rows).contiguous()
+    pos = p0 + torch.arange(rows, device=DEV)
+    assert int(pos[-1]) < _WIDTH_PAGES * tpb
+    args["query_positions"] = pos.to(args["query_positions"].dtype)
+    group = {**args, "rows_per_request": 4}
+    req = args["request_indices"].long()
+    visible = _visible(args)
+    q, cache = args["q"], args["index_cache"]
+    # Keys whose score is positive (a row's own index head 0): the ReLU cannot hide them.
+    key_of = {r: q[r, 0].reshape(1, -1) for r in range(rows)}
+
+    # The run's own slots (slot 4099 is the anchor row 3 reads at column 1024), then block 5's.
+    stale = torch.tensor([5 * cr + cr - 1], device=DEV)
+    positions = torch.cat([pos, stale])
+    pages = args["block_table"][req[0], positions // tpb].long()
+    slots = positions % tpb
+    keys = torch.cat([key_of[3]] * rows + [key_of[0]])
+    anchor = (p0 + rows) // cr - 1
+    old = cache[pages, slots].clone()
+    # Compile both launches outside the timed pair (a compile would let the store finish).
+    _late_store(cache, pages, slots, old, delay_ns=0)
+    op(**{**group, "prefetch": True})
+    before = op(**group)
+    torch.cuda.synchronize()
+    fresh = visible.clone()
+    fresh[:, 5] = False
+    for attempt in range(5):
+        _late_store(cache, pages, slots, keys, delay_ns=500_000)
+        with _watch_launches() as watcher:
+            early = op(**{**group, "prefetch": True})
+        torch.cuda.synchronize()
+        assert watcher.branch == "request_group_prefetch"
+        plain = op(**group)  # over the stored keys, the wait first
+        cache[pages, slots] = old
+        torch.cuda.synchronize()
+        assert float(plain[3, anchor]) > 0.0 and float(before[3, anchor]) != float(plain[3, anchor])
+        assert float(plain[0, 5]) > 0.0 and float(before[0, 5]) != float(plain[0, 5])
+        # Every column but block 5 is the post-store bits, overlapped or not (the run's own
+        # slots are read again after the wait).
+        assert torch.equal(early[fresh].view(torch.int32), plain[fresh].view(torch.int32))
+        # Block 5 is read once, before the wait: the old key's score or the new one's.
+        if torch.equal(early[:, 5], before[:, 5]):
+            return  # overlapped: the check above ran on a schedule where it can fail
+        assert torch.equal(early[:, 5], plain[:, 5])
+    pytest.skip("the op and the late producer never overlapped here: the re-read is unobserved")
+
+
+#: A page index far past any pool: a load through it faults.
+_FAR_PAGE = 1 << 28
+
+
+def _far_page_mixed_run(seed: int, **spec_overrides):
+    """Two requests in one two-row run at positions 3 and 35 (ratio 4, 32-token pages): the
+    first sees one block, the second nine. The first request's table entries past its one page
+    name a page far past the pool, so a load through them faults."""
+    spec = _case(
+        2, 2, layout="decode", gen_positions=[3, 35], rows_per_request=1, only_visible_blocks=True,
+        q_layout="scratch_slice", call_rows_per_request=2,
+    )  # fmt: skip
+    spec.update(spec_overrides)
+    args = _build(spec, seed=seed)
+    short = int(args["request_indices"][0])
+    args["block_table"][short, 1:] = _FAR_PAGE
+    return args
+
+
+@pytest.mark.parametrize("prefetch", [True, False], ids=["prefetch", "request_group"])
+def test_a_short_request_in_a_mixed_run_reads_only_its_own_pages(prefetch) -> None:
+    """A run whose rows name two requests of different lengths: each row's pages and keys are
+    read only up to its own visible blocks, on the prefetching request-group kernel (with PDL)
+    and on the plain one. Both rows' visible scores match the reference."""
+    args = _far_page_mixed_run(97, use_pdl=prefetch, prefetch=prefetch)
+    with _watch_launches() as watcher:
+        got = op(**args)
+        torch.cuda.synchronize()
+    assert watcher.branch == ("request_group_prefetch" if prefetch else "request_group")
+    # The reference gathers every column of every row (then masks): it reads the table past
+    # the short sequence as the engine's (-1), not the far page the kernels must not touch.
+    table = args["block_table"]
+    table = torch.where(table == _FAR_PAGE, torch.full_like(table, -1), table)
+    _compare(got, op.reference(**{**args, "block_table": table}))
+
+
+def test_split_shape_is_a_launch_option_of_call_and_reference() -> None:
+    """`split_shape` is accepted by `__call__` and `reference` alike (catalog validation hands
+    both the same keywords). Rows that come 4 a request, consecutive and tile-aligned, at the
+    target's `(programs a SM, tile // 4)`: bitwise the default launch."""
+    spec = _case(
+        16, 4, layout="decode", gen_positions=[700, 3000, 64, 9000], rows_per_request=4,
+        only_visible_blocks=True, q_layout="scratch_slice", pages=300,
+    )  # fmt: skip
+    args = _build(spec, seed=131)
+    tile = min(16, SPLIT_DOT_WIDTH // args["q"].shape[1])
+    shape = (_entry._SPLIT_PROGRAMS_PER_SM, tile // 4)
+    with _watch_launches() as watcher:
+        default = op(**args)
+        torch.cuda.synchronize()
+    assert watcher.branch == "visible_split"
+    with _watch_launches() as watcher:
+        shaped = op(**args, split_shape=shape)
+        torch.cuda.synchronize()
+    assert watcher.branch == "visible_split" and watcher.grid[1] == tile // 4
+    visible = _visible(args)
+    assert torch.equal(shaped[visible].view(torch.int32), default[visible].view(torch.int32))
+    _compare(shaped, op.reference(**args, split_shape=shape))
 
 
 @pytest.mark.parametrize(

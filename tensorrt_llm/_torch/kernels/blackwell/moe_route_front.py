@@ -11,6 +11,10 @@ trtllm-gen pre-routed tables + NVFP4 quantization of the MoE input run in one la
 bitwise: ids / BF16 weights as :mod:`moe_decode_front`, xq / xsf as ``fp4_quantize`` (linear scale layout), tables
 (``prerouted_table_sizes`` order) as the Triton route kernel's up to the row order inside an expert's block. ``lean``
 builds the same tables with a cheaper count exchange and releases its dependent (FC1) at kernel start.
+
+``ids_in`` (the routing-only launch, clusters of 16): the rows arrive already routed by their owners
+(:func:`route_one_token`, the same statements as the routing warps here) as ``IDS_ROW_SLOTS`` 16-bit slots a row,
+and the routing cluster only builds the masks, picks and tables from them.
 """
 
 from __future__ import annotations
@@ -93,8 +97,12 @@ ROUTE_THREADS = 1024
 # Clusters of 16 (route mode; a non-portable size, which the DSL allows on every kernel) take 257..512 tokens with
 # the same one-warp-per-token routing and 32-bit per-CTA token masks (TPC = ceil(M / 16) <= 32). The launcher then
 # uses 3 quantization clusters, so the grid stays at 64 CTAs. 513..1024 tokens: TPC <= 64, two tokens per warp
-# (the full-sort routing path) and two-word per-expert token masks.
+# (the full-sort routing path) and two-word per-expert token masks. 1025..2048 tokens (`WIDE_MAX_ROWS`): TPC <= 128,
+# three or four tokens per warp (only on the one-token fast path, ``fast2``, or over routed rows, ``ids_in``) and three
+# or four mask words per expert.
 ROUTE_CLUSTER_WIDE = 16
+#: The most rows a launch takes (clusters of 16, four tokens a warp, four mask words an expert).
+WIDE_MAX_ROWS = 2048
 
 
 @dsl_user_op
@@ -165,6 +173,21 @@ def _ld_cg_v4w(addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_u16(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """The 16-bit word at ``addr``, zero-extended (after the dependency wait: its producer is an earlier grid)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i64(addr, loc, ip)],
+            "{\n\t.reg .u16 h;\n\tld.global.u16 h, [$1];\n\tcvt.u32.u16 $0, h;\n\t}",
+            "=r,l,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _cluster_arrive_relaxed(*, loc=None, ip=None) -> None:
     _asm(None, [], "barrier.cluster.arrive.relaxed.aligned;", "~{memory}", loc=loc, ip=ip)
 
@@ -226,6 +249,93 @@ def _top4of8(a, b):
     return (v0, v1, v2, v3)
 
 
+#: ``ids_in``'s row: 16-bit slots ``[0, top_k)`` the experts, ``[top_k, 2 top_k)`` their BF16 weight bits, then
+#: zeros to three 16-byte vectors (the attention-DP packed gather carries a row's routing as those vectors).
+IDS_ROW_SLOTS = 24
+IDS_ROW_BYTES = 2 * IDS_ROW_SLOTS
+
+
+@cute.jit
+def _topk_sorted(packed, e0, sel: cute.Tensor, val: cute.Tensor, top_k: cutlass.Constexpr) -> None:
+    """Full per-lane sort + pop top-k into sel / val: fallback of :func:`route_one_token`."""
+    keys = cute.make_rmem_tensor(cute.make_layout((16,)), Int32)
+    for jw in cutlass.range_constexpr(8):
+        keys[2 * jw] = _key1(packed[jw], e0 + 2 * jw)
+        keys[2 * jw + 1] = _key1(packed[jw] >> Int32(16), e0 + 2 * jw + 1)
+    for pi in cutlass.range_constexpr(len(_SORT16)):
+        i, jj, imax = _SORT16[pi]
+        x = keys[i]
+        y = keys[jj]
+        hi = _max_u32(x, y)
+        lo = _min_u32(x, y)
+        if const_expr(imax):
+            keys[i] = hi
+            keys[jj] = lo
+        else:
+            keys[i] = lo
+            keys[jj] = hi
+    for k in cutlass.range_constexpr(top_k):
+        head = keys[0]
+        gmax = _redux_max_u32(head)
+        sel[k] = Int32(65535) - (gmax & Int32(65535))
+        val[k] = _key_val(gmax)
+        if const_expr(k < top_k - 1):
+            for jk in cutlass.range_constexpr(top_k - 1):
+                keys[jk] = _sel_eq(head, gmax, keys[jk + 1], keys[jk])
+
+
+@cute.jit
+def route_one_token(packed, lane, top_k: cutlass.Constexpr):
+    """One token's top-k by one whole warp, from its 512 BF16 logits (``packed``: the 8 words of lane ``lane``'s
+    16 logits, experts ``16 lane ..``): each lane keeps only its 4 largest keys; a lane that runs dry before the last
+    round (holds >= 5 of the top 10) sends the warp to the full sort. Returns (expert id, BF16 Renormalize weight
+    bits) of pick ``lane`` (lanes < top_k). The routing warps of :class:`MoeRouteFrontKernel` run it; the
+    attention-DP packed gather runs it on a row's owner for ``ids_in``."""
+    e0 = lane * 16
+    pairs = []
+    for jw in cutlass.range_constexpr(8):
+        klo, khi = _keys2(packed[jw], e0 + 2 * jw)
+        pairs.append(_cas(klo, khi))
+    quads = []
+    for qd in cutlass.range_constexpr(4):
+        quads.append(_merge22(pairs[2 * qd], pairs[2 * qd + 1]))
+    c0, c1, c2, c3 = _top4of8(_top4of8(quads[0], quads[1]), _top4of8(quads[2], quads[3]))
+    sel = cute.make_rmem_tensor(cute.make_layout((top_k,)), Int32)
+    val = cute.make_rmem_tensor(cute.make_layout((top_k,)), Float32)
+    zero = Int32(0)
+    bad = Int32(0)
+    for k in cutlass.range_constexpr(top_k):
+        gmax = _redux_max_u32(c0)
+        sel[k] = Int32(65535) - (gmax & Int32(65535))
+        val[k] = _key_val(gmax)
+        if const_expr(k < top_k - 1):
+            # the owner lane's candidates move up by one (keys are unique)
+            c0, c1, c2, c3 = (
+                _sel_eq(c0, gmax, c1, c0),
+                _sel_eq(c0, gmax, c2, c1),
+                _sel_eq(c0, gmax, c3, c2),
+                _sel_eq(c0, gmax, zero, c3),
+            )
+        if const_expr(k == top_k - 2):
+            bad = _vote_any(_sel_eq(c0, zero, Int32(1), zero))
+    if bad != 0:
+        _topk_sorted(packed, e0, sel, val, top_k)
+    my_sel = sel[0]
+    my_v = val[0]
+    for k in cutlass.range_constexpr(top_k - 1):
+        my_sel = _sel_eq(lane, Int32(k + 1), sel[k + 1], my_sel)
+        my_v = _sel_eq_f(lane, Int32(k + 1), val[k + 1], my_v)
+    my_e = _exp_tr(_sub(my_v, val[0]))
+    ex = []
+    for k in cutlass.range_constexpr(top_k):
+        ex.append(_shfl_idx_f32(my_e, k))
+    ssum = _add(
+        _add(_add(_add(ex[0], ex[8]), ex[4]), _add(ex[2], ex[6])),
+        _add(_add(_add(ex[1], ex[9]), ex[5]), _add(ex[3], ex[7])),
+    )
+    return my_sel, _div_bf16(my_e, ssum)
+
+
 def _shape_error(
     *,
     num_rows: int,
@@ -239,13 +349,16 @@ def _shape_error(
     threads: int = ROUTE_THREADS,
     cluster: int = ROUTE_CLUSTER,
     lean: bool = False,
+    ids_in: bool = False,
+    fast2: Union[bool, int] = False,
 ) -> Optional[str]:
     """Why :class:`MoeRouteFrontKernel` does not take these arguments, or None."""
     if threads % 32 or not 256 <= threads <= 1024:
         return f"threads={threads} must be a multiple of 32 in [256, 1024]"
     if cluster not in (ROUTE_CLUSTER, ROUTE_CLUSTER_WIDE):
         return f"cluster={cluster} must be {ROUTE_CLUSTER} or {ROUTE_CLUSTER_WIDE}"
-    max_tpc = 64 if cluster == ROUTE_CLUSTER_WIDE else 32  # token-mask words per expert: 2 / 1
+    # token-mask words per expert: up to 4 / 1
+    max_tpc = 128 if cluster == ROUTE_CLUSTER_WIDE else 32
     if not 1 <= num_rows <= cluster * max_tpc:
         return f"num_rows={num_rows} must be in [1, {cluster * max_tpc}] with clusters of {cluster}"
     if top_k != 10:
@@ -265,10 +378,14 @@ def _shape_error(
     if num_local * mw > threads:
         return "one thread per token-mask word: num_local * ceil(TPC / 32) <= threads"
     tpw = -(-tpc // (threads // 32))
-    if tpw > 2:
-        return "at most two tokens per warp"
+    if tpw > 4:
+        return "at most four tokens per warp"
+    if tpw > 2 and not (ids_in or int(fast2)):
+        return "three or four tokens a warp only on the one-token fast path (fast2) or over routed rows (ids_in)"
     if lean and (cluster != ROUTE_CLUSTER or mw != 1 or tpw != 1):
         return "the lean table build takes clusters of 8 with one token per warp (<= 256 rows)"
+    if ids_in and lean:
+        return "routed rows (ids_in) take the default table build, not the lean one"
     return None
 
 
@@ -294,12 +411,33 @@ class MoeRouteFrontKernel:
     the cluster's count vectors; after routing each CTA bulk-copies its counts into every peer's receive buffer
     (instead of the cluster barrier + 8 remote loads) and sums the 8 vectors in slot order, the same integer sums.
     It releases its dependent (FC1) at kernel start: FC1's grid is resident while this kernel runs, and its
-    ``griddepcontrol.wait`` still waits for this grid's completion."""
+    ``griddepcontrol.wait`` still waits for this grid's completion. ``lean_wait`` moves that release to right
+    after each CTA's ``griddepcontrol.wait`` (the same bits): FC1's persistent grid, one CTA an SM, then parks on
+    the SMs only once the predecessor has completed, so side-stream kernels launched meanwhile (the shared
+    expert's activation and down projection) are not held off the SMs until FC1 drains.
+
+    ``early`` (the default table build, with PDL): the kernel's first statement is ``griddepcontrol.wait``, before
+    any global access or branch (the experts' input scale too), and every CTA releases its dependent (FC1) right
+    after it instead of after its last global access. As with ``lean``, FC1's own wait still holds its reads until
+    this grid has completed; only FC1's launch and prologue move ahead.
+
+    ``fast2`` (two tokens a warp, past 512 rows): each of a warp's tokens is routed on the one-token fast path
+    instead of both on the full per-lane sort, the same bits. ``fast2=2`` also loads the warp's second token's
+    logits before its first token is routed (8 more registers a thread), so the second load is off the first
+    token's dependency chain.
+
+    ``route_only``: only cluster 0 is launched (the routing, the tables); the caller has the NVFP4 rows already
+    (no CTA waits for another cluster, so the routing cluster runs alone unchanged).
+
+    ``ids_in`` (with ``route_only``, not ``lean``): ``logits_ptr`` holds each token's routing, not its logits: a row
+    of ``IDS_ROW_SLOTS`` 16-bit slots (experts, then their BF16 weight bits) that :func:`route_one_token` formed
+    from the token's logits. Each routing warp stores them out and runs the same mask / pick statements, so the
+    experts, weights and tables are the bits the routing warps write from those logits."""
 
     @staticmethod
     def supports(**kw: Union[int, bool]) -> bool:
         """Whether the constructor takes these keyword arguments (``use_pdl`` aside): ``__init__``'s integer shape
-        arguments and its ``lean`` / ``use_pdl`` flags."""
+        arguments and its ``lean`` / ``ids_in`` / ``use_pdl`` / ``fast2`` flags."""
         kw.pop("use_pdl", None)
         return _shape_error(**kw) is None
 
@@ -318,7 +456,16 @@ class MoeRouteFrontKernel:
         threads: int = ROUTE_THREADS,
         cluster: int = ROUTE_CLUSTER,
         lean: bool = False,
+        fast2: Union[bool, int] = False,
+        route_only: bool = False,
+        ids_in: bool = False,
+        early: bool = False,
+        lean_wait: bool = False,
     ) -> None:
+        if ids_in and not route_only:
+            raise ValueError("routed rows (ids_in) take the routing-only launch")
+        if int(fast2) not in (0, 1, 2):
+            raise ValueError(f"fast2={fast2!r} must be 0 / False, 1 / True or 2")
         err = _shape_error(
             num_rows=num_rows,
             k_extent=k_extent,
@@ -331,6 +478,8 @@ class MoeRouteFrontKernel:
             threads=threads,
             cluster=cluster,
             lean=lean,
+            ids_in=ids_in,
+            fast2=fast2,
         )
         if err is not None:
             raise ValueError(err)
@@ -348,8 +497,19 @@ class MoeRouteFrontKernel:
         self.mw = -(-self.tpc // 32)  # token-mask words per expert (TPC > 32: two)
         self.warps = threads // 32
         self.tpw = -(-self.tpc // self.warps)
+        # Two tokens a warp, each routed on the one-token fast path (`_route_warp_fast`) instead
+        # of both on the full per-lane sort (`_route_warp`): the same bits, fewer issued sorts.
+        # 2: the second token's logits are loaded before the first token is routed.
+        self.fast2 = int(fast2) if self.tpw >= 2 else 0
+        # The release right after the kernel's first statement, the wait (the lean form releases at
+        # its start already).
+        self.early = bool(early) and use_pdl and not lean
+        # The lean form's release after the wait instead of at kernel start.
+        self.lean_wait = bool(lean_wait) and use_pdl and lean
         self.quant_clusters = quant_clusters
-        self.ctas = cluster * (1 + quant_clusters)
+        self.route_only = route_only
+        self.ids_in = ids_in
+        self.ctas = cluster if route_only else cluster * (1 + quant_clusters)
         self.q_ctas = cluster * quant_clusters
         self.blocks = num_rows * (k_extent // 16)
         self.q_passes = -(-self.blocks // (self.q_ctas * threads))
@@ -430,7 +590,7 @@ class MoeRouteFrontKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         if const_expr(self.lean):
-            if const_expr(self.use_pdl):
+            if const_expr(self.use_pdl and not self.lean_wait):
                 _gdc_launch()
             smem = _SmemAllocator()
             # the word buffer (everything up to o_mbar), then the mbarrier in its own 8-byte allocation; smem_words
@@ -453,6 +613,11 @@ class MoeRouteFrontKernel:
             else:
                 self._quant_cta(x_ptr, gs_ptr, xq_ptr, xsf_ptr, bidx - self.cluster, tidx)
         else:
+            if const_expr(self.early):
+                # Before any global access or branch: no CTA reads anything the predecessor still
+                # writes, and every CTA's dependent may be scheduled from here on.
+                _gdc_wait()
+                _gdc_launch()
             smem = _SmemAllocator()
             buf = smem.allocate_tensor(
                 Int32, cute.make_layout((self.smem_words,)), byte_alignment=16
@@ -470,9 +635,13 @@ class MoeRouteFrontKernel:
         self, x_ptr: Int64, gs_ptr: Int64, xq_ptr: Int64, xsf_ptr: Int64, qc, tidx
     ) -> None:
         bpr: cutlass.Constexpr = self.k_extent // 16
-        gs = _ld_f32(gs_ptr)  # static (the experts' input scale): before the wait
-        if const_expr(self.use_pdl):
+        # static (the experts' input scale): before the wait, except with `early`, whose wait is the
+        # kernel's first statement
+        gs = _ld_f32(gs_ptr)
+        if const_expr(self.use_pdl and not self.early):
             _gdc_wait()
+            if const_expr(self.lean_wait):
+                _gdc_launch()
         for p in cutlass.range_constexpr(self.q_passes):
             blk = (p * self.q_ctas + qc) * self.threads + tidx
             if blk < self.blocks:
@@ -487,7 +656,7 @@ class MoeRouteFrontKernel:
                 )
                 _st_u8(xsf_ptr + Int64(row) * Int64(bpr) + Int64(cb), sf)
         cute.arch.sync_threads()
-        if const_expr(self.use_pdl):
+        if const_expr(self.use_pdl and not self.early):
             _gdc_launch()
 
     @cute.jit
@@ -521,18 +690,78 @@ class MoeRouteFrontKernel:
         # this CTA's tokens [c TPC, c TPC + n_tok)
         t_first = c * tpc
         n_tok = cutlass.min(Int32(tpc), Int32(self.num_rows) - t_first)
-        if const_expr(self.use_pdl):
+        if const_expr(self.use_pdl and not self.early):
             _gdc_wait()
         cute.arch.sync_threads()
         my_sel = Int32(0)
         my_w = Int32(0)
-        if const_expr(self.tpw == 1):
+        if const_expr(self.ids_in):
+            # tokens warp (and warp + #warps), routed by their owners; stored here
+            for rr in cutlass.range_constexpr(self.tpw):
+                ids_tok = warp + Int32(self.warps * rr)
+                if ids_tok < n_tok:
+                    self._route_warp_ids(
+                        logits_ptr,
+                        ids_ptr,
+                        wts_ptr,
+                        local_start,
+                        smask,
+                        spick,
+                        t_first,
+                        ids_tok,
+                        lane,
+                    )
+        elif const_expr(self.tpw == 1):
             # one token per warp; its ids / weights are stored after the cluster barrier (the barrier's release
             # then only waits for shared memory)
             if warp < n_tok:
                 my_sel, my_w = self._route_warp_fast(
                     logits_ptr, local_start, smask, spick, t_first, warp, lane
                 )
+        elif const_expr(self.fast2 == 2):
+            # tokens warp + 2 p #warps and warp + (2 p + 1) #warps (pair p; one pair up to 1024 rows) on the
+            # fast path, each pair's second token's logits loaded first (from a row of this CTA: n_tok > 16
+            # here, so its last row when it has none)
+            for pp in cutlass.range_constexpr(-(-self.tpw // 2)):
+                pre_first = warp + Int32(self.warps * 2 * pp)
+                pre_tok = pre_first + Int32(self.warps)
+                pre_logits = self._load_logits(
+                    logits_ptr, t_first + cutlass.min(pre_tok, n_tok - Int32(1)), lane
+                )
+                if pre_first < n_tok:
+                    pre_sel, pre_w = self._route_loaded(
+                        self._load_logits(logits_ptr, t_first + pre_first, lane),
+                        local_start,
+                        smask,
+                        spick,
+                        pre_first,
+                        lane,
+                    )
+                    if lane < top_k:
+                        pre_o = Int64(t_first + pre_first) * Int64(top_k) + Int64(lane)
+                        _st_b32(ids_ptr + pre_o * Int64(4), pre_sel)
+                        _st_b16(wts_ptr + pre_o * Int64(2), pre_w)
+                if pre_tok < n_tok:
+                    pre_sel2, pre_w2 = self._route_loaded(
+                        pre_logits, local_start, smask, spick, pre_tok, lane
+                    )
+                    if lane < top_k:
+                        pre_o2 = Int64(t_first + pre_tok) * Int64(top_k) + Int64(lane)
+                        _st_b32(ids_ptr + pre_o2 * Int64(4), pre_sel2)
+                        _st_b16(wts_ptr + pre_o2 * Int64(2), pre_w2)
+        elif const_expr(self.fast2):
+            # tokens warp, warp + #warps (, warp + 2 #warps, warp + 3 #warps past 1024 rows), one after
+            # the other on the fast path; stored here
+            for rr in cutlass.range_constexpr(self.tpw):
+                fast_tok = warp + Int32(self.warps * rr)
+                if fast_tok < n_tok:
+                    fast_sel, fast_w = self._route_warp_fast(
+                        logits_ptr, local_start, smask, spick, t_first, fast_tok, lane
+                    )
+                    if lane < top_k:
+                        fast_o = Int64(t_first + fast_tok) * Int64(top_k) + Int64(lane)
+                        _st_b32(ids_ptr + fast_o * Int64(4), fast_sel)
+                        _st_b16(wts_ptr + fast_o * Int64(2), fast_w)
         else:
             if warp < n_tok:
                 self._route_warp(
@@ -551,16 +780,22 @@ class MoeRouteFrontKernel:
         if tidx < num_local:
             if const_expr(mw == 1):
                 _st_shared(scnt + tidx * 4, _popc(_ld_shared(smask + tidx * 4)))
-            else:
+            elif const_expr(mw == 2):
                 _st_shared(
                     scnt + tidx * 4,
                     _popc(_ld_shared(smask + (tidx * 2) * 4))
                     + _popc(_ld_shared(smask + (tidx * 2 + 1) * 4)),
                 )
+            else:
+                # three or four mask words an expert (past 1024 rows)
+                wcnt = Int32(0)
+                for wi in cutlass.range_constexpr(mw):
+                    wcnt = wcnt + _popc(_ld_shared(smask + (tidx * Int32(mw) + Int32(wi)) * 4))
+                _st_shared(scnt + tidx * 4, wcnt)
         # The 8 CTAs' counts through distributed shared memory.
         _cluster_arrive_release()
         _cluster_wait_acquire()
-        if const_expr(self.tpw == 1):
+        if const_expr(self.tpw == 1 and not self.ids_in):
             if warp < n_tok:
                 if lane < top_k:
                     o = Int64(t_first + warp) * Int64(top_k) + Int64(lane)
@@ -626,6 +861,19 @@ class MoeRouteFrontKernel:
                         rank = _ld_shared(spre + pick * 4) + _popc(
                             _ld_shared(smask + pick * 4) & _below(tl)
                         )
+                    elif const_expr(mw > 2):
+                        # tokens before tl over three or four words: every word below tl // 32 whole,
+                        # word tl // 32 below tl % 32, none above
+                        rank = _ld_shared(spre + pick * 4)
+                        for wi in cutlass.range_constexpr(mw):
+                            mw_wi = _ld_shared(smask + (pick * Int32(mw) + Int32(wi)) * 4)
+                            mw_below = _sel_lt(
+                                tl,
+                                Int32(32 * wi + 32),
+                                _popc(mw_wi & _below(tl - Int32(32 * wi))),
+                                _popc(mw_wi),
+                            )
+                            rank = rank + _sel_lt(tl, Int32(32 * wi), Int32(0), mw_below)
                     else:
                         # tokens before tl: in word 0 (all of word 0 from tl 32 on), in word 1 below tl - 32
                         mw_w0 = _ld_shared(smask + (pick * 2) * 4)
@@ -642,7 +890,7 @@ class MoeRouteFrontKernel:
                 )
         _cluster_wait_acquire()  # every peer has read this CTA's counts
         cute.arch.sync_threads()
-        if const_expr(self.use_pdl):
+        if const_expr(self.use_pdl and not self.early):
             _gdc_launch()
 
     @cute.jit
@@ -689,6 +937,8 @@ class MoeRouteFrontKernel:
         n_tok = cutlass.min(Int32(tpc), Int32(self.num_rows) - t_first)
         if const_expr(self.use_pdl):
             _gdc_wait()
+            if const_expr(self.lean_wait):
+                _gdc_launch()
         cute.arch.sync_threads()
         my_sel = Int32(0)
         my_w = Int32(0)
@@ -793,93 +1043,81 @@ class MoeRouteFrontKernel:
     ):
         """Token ``t_first + warp``: the same bits as :meth:`_route_warp`, but each lane keeps only its 4 largest
         keys; a lane that runs dry before the last round (holds >= 5 of the top 10) sends the warp to the full
-        sort. Returns (expert id, BF16 weight bits) of pick ``lane`` (lanes < top_k)."""
-        top_k: cutlass.Constexpr = self.top_k
-        num_local: cutlass.Constexpr = self.num_local
+        sort. Returns (expert id, BF16 weight bits) of pick ``lane`` (lanes < top_k). ``warp`` is the token's index
+        in the CTA (up to 2 x #warps - 1 with ``fast2``)."""
+        return self._route_loaded(
+            self._load_logits(logits_ptr, t_first + warp, lane),
+            local_start,
+            smask,
+            spick,
+            warp,
+            lane,
+        )
+
+    @cute.jit
+    def _load_logits(self, logits_ptr: Int64, tok, lane):
+        """Token ``tok``'s 16 BF16 logits of lane ``lane`` (experts 16 lane .. 16 lane + 15) as 8 words."""
         num_experts: cutlass.Constexpr = self.num_experts
         e0 = lane * 16
-        src = logits_ptr + (Int64(t_first + warp) * Int64(num_experts) + Int64(e0)) * Int64(2)
+        src = logits_ptr + (Int64(tok) * Int64(num_experts) + Int64(e0)) * Int64(2)
         p0, p1, p2, p3 = _ld_cg_v4w(src)
         p4, p5, p6, p7 = _ld_cg_v4w(src + Int64(16))
-        packed = (p0, p1, p2, p3, p4, p5, p6, p7)
-        pairs = []
-        for jw in cutlass.range_constexpr(8):
-            klo, khi = _keys2(packed[jw], e0 + 2 * jw)
-            pairs.append(_cas(klo, khi))
-        quads = []
-        for qd in cutlass.range_constexpr(4):
-            quads.append(_merge22(pairs[2 * qd], pairs[2 * qd + 1]))
-        c0, c1, c2, c3 = _top4of8(_top4of8(quads[0], quads[1]), _top4of8(quads[2], quads[3]))
-        sel = cute.make_rmem_tensor(cute.make_layout((top_k,)), Int32)
-        val = cute.make_rmem_tensor(cute.make_layout((top_k,)), Float32)
-        zero = Int32(0)
-        bad = Int32(0)
-        for k in cutlass.range_constexpr(top_k):
-            gmax = _redux_max_u32(c0)
-            sel[k] = Int32(65535) - (gmax & Int32(65535))
-            val[k] = _key_val(gmax)
-            if const_expr(k < top_k - 1):
-                # the owner lane's candidates move up by one (keys are unique)
-                c0, c1, c2, c3 = (
-                    _sel_eq(c0, gmax, c1, c0),
-                    _sel_eq(c0, gmax, c2, c1),
-                    _sel_eq(c0, gmax, c3, c2),
-                    _sel_eq(c0, gmax, zero, c3),
-                )
-            if const_expr(k == top_k - 2):
-                bad = _vote_any(_sel_eq(c0, zero, Int32(1), zero))
-        if bad != 0:
-            self._topk_full(packed, e0, sel, val)
-        my_sel = sel[0]
-        my_v = val[0]
-        for k in cutlass.range_constexpr(top_k - 1):
-            my_sel = _sel_eq(lane, Int32(k + 1), sel[k + 1], my_sel)
-            my_v = _sel_eq_f(lane, Int32(k + 1), val[k + 1], my_v)
-        my_e = _exp_tr(_sub(my_v, val[0]))
-        ex = []
-        for k in cutlass.range_constexpr(top_k):
-            ex.append(_shfl_idx_f32(my_e, k))
-        ssum = _add(
-            _add(_add(_add(ex[0], ex[8]), ex[4]), _add(ex[2], ex[6])),
-            _add(_add(_add(ex[1], ex[9]), ex[5]), _add(ex[3], ex[7])),
-        )
-        my_w = _div_bf16(my_e, ssum)
+        return (p0, p1, p2, p3, p4, p5, p6, p7)
+
+    @cute.jit
+    def _route_loaded(self, packed, local_start: Int32, smask: Int32, spick: Int32, tl, lane):
+        """:meth:`_route_warp_fast` on CTA token ``tl``'s loaded logits ``packed``: the fast top-k, then the pick
+        into the expert's mask word ``tl // 32`` and the CTA's pick list."""
+        top_k: cutlass.Constexpr = self.top_k
+        num_local: cutlass.Constexpr = self.num_local
+        my_sel, my_w = route_one_token(packed, lane, top_k)
         if lane < top_k:
             lid = my_sel - local_start
             pick = _sel_lt(lid, Int32(num_local), lid, Int32(-1))
             if pick >= Int32(0):
-                _red_or_shared(smask + pick * 4, _bit(warp))
-            _st_shared(spick + (warp * top_k + lane) * 4, pick)
+                if const_expr(self.mw == 1):
+                    _red_or_shared(smask + pick * 4, _bit(tl))
+                else:
+                    # token tl's bit in word tl // 32 of the expert's mask words (`fast2`)
+                    _red_or_shared(
+                        smask + (pick * Int32(self.mw) + tl // Int32(32)) * 4,
+                        _bit(tl % Int32(32)),
+                    )
+            _st_shared(spick + (tl * top_k + lane) * 4, pick)
         return my_sel, my_w
 
     @cute.jit
-    def _topk_full(self, packed, e0, sel: cute.Tensor, val: cute.Tensor) -> None:
-        """Full per-lane sort + pop top-k into sel / val: fallback of :meth:`_route_warp_fast`."""
+    def _route_warp_ids(
+        self,
+        idw_ptr: Int64,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        local_start: Int32,
+        smask: Int32,
+        spick: Int32,
+        t_first,
+        tl,
+        lane,
+    ) -> None:
+        """``ids_in``: token ``t_first + tl``'s experts and weight bits from its row of slots
+        (``IDS_ROW_SLOTS``), stored out, then the routing warps' mask / pick statements."""
         top_k: cutlass.Constexpr = self.top_k
-        keys = cute.make_rmem_tensor(cute.make_layout((16,)), Int32)
-        for jw in cutlass.range_constexpr(8):
-            keys[2 * jw] = _key1(packed[jw], e0 + 2 * jw)
-            keys[2 * jw + 1] = _key1(packed[jw] >> Int32(16), e0 + 2 * jw + 1)
-        for pi in cutlass.range_constexpr(len(_SORT16)):
-            i, jj, imax = _SORT16[pi]
-            x = keys[i]
-            y = keys[jj]
-            hi = _max_u32(x, y)
-            lo = _min_u32(x, y)
-            if const_expr(imax):
-                keys[i] = hi
-                keys[jj] = lo
-            else:
-                keys[i] = lo
-                keys[jj] = hi
-        for k in cutlass.range_constexpr(top_k):
-            head = keys[0]
-            gmax = _redux_max_u32(head)
-            sel[k] = Int32(65535) - (gmax & Int32(65535))
-            val[k] = _key_val(gmax)
-            if const_expr(k < top_k - 1):
-                for jk in cutlass.range_constexpr(top_k - 1):
-                    keys[jk] = _sel_eq(head, gmax, keys[jk + 1], keys[jk])
+        num_local: cutlass.Constexpr = self.num_local
+        if lane < top_k:
+            row = idw_ptr + Int64(t_first + tl) * Int64(IDS_ROW_BYTES)
+            my_sel = _ld_u16(row + Int64(lane) * Int64(2))
+            my_w = _ld_u16(row + (Int64(top_k) + Int64(lane)) * Int64(2))
+            o = Int64(t_first + tl) * Int64(top_k) + Int64(lane)
+            _st_b32(ids_ptr + o * Int64(4), my_sel)
+            _st_b16(wts_ptr + o * Int64(2), my_w)
+            lid = my_sel - local_start
+            pick = _sel_lt(lid, Int32(num_local), lid, Int32(-1))
+            if pick >= Int32(0):
+                # token tl's bit in word tl // 32 of the expert's ceil(TPC / 32) mask words
+                _red_or_shared(
+                    smask + (pick * Int32(self.mw) + tl // Int32(32)) * 4, _bit(tl % Int32(32))
+                )
+            _st_shared(spick + (tl * top_k + lane) * 4, pick)
 
     @cute.jit
     def _route_warp(

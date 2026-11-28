@@ -57,15 +57,29 @@ def _build(spec, seed):
     return low, up_w.t(), normed, hc
 
 
+def _rstd(rows, hc, seed):
+    """A deferred-rstd form's rstd, `[rows rounded up to 128, C]` fp32, the site's range (the
+    stream before its rstd then has the normed stream's scale over 1 / rstd)."""
+    g = torch.Generator(device=DEV).manual_seed(seed + 1)
+    pad = -(-rows // 128) * 128
+    return torch.rand(pad, hc, generator=g, device=DEV) * 0.5 + 0.05
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
-    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
-    mixed = op(*args)
+    seed = zlib.crc32(cell.why.encode()) % (2**31)
+    args = _build(cell.spec, seed=seed)
+    kw = {k: cell.spec[k] for k in ("release_early", "tm") if k in cell.spec}
+    if cell.spec.get("ss"):
+        kw["rstd"] = _rstd(cell.spec["rows"], args[3], seed)
+    mixed = op(*args, **kw)
     assert mixed.shape == (cell.spec["rows"], cell.spec.get("hidden", 2560))
     # The answer came from the CuTe DSL kernel, JIT-compiled for this device.
-    assert (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False, False) in _COMPILED
-    _compare(mixed, op.reference(*args))
+    key = (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False, False)
+    key += (kw.get("release_early", False), kw.get("tm", 128), "rstd" in kw)
+    assert key in _COMPILED
+    _compare(mixed, op.reference(*args, **kw))
 
 
 def test_guard_refuses_a_contiguous_up() -> None:
@@ -109,3 +123,49 @@ def test_wide_epilogue_is_bitwise_the_four_warp_one(rows) -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, op(fresh, up, normed, hc))
+
+
+@pytest.mark.parametrize("rows", [5, 17, 36, 63, 64, 65, 96, 105, 127, 128])
+@pytest.mark.parametrize("release_early", [False, True])
+def test_tile64_is_bitwise_the_128_row_kernel(rows, release_early) -> None:
+    """`tm=64` (one tile up to 64 rows, two above) and `release_early` give the default
+    kernel's bits, eagerly and replayed from a CUDA graph; the output is `[rows, H]` with
+    unit column stride whatever its padded allocation."""
+    low, up, normed, hc = _build(dict(rows=rows), seed=4300 + rows)
+    ref = op(low, up, normed, hc)
+    got = op(low, up, normed, hc, release_early=release_early, tm=64)
+    torch.cuda.synchronize()
+    assert got.shape == ref.shape and got.is_contiguous()
+    assert torch.equal(ref, got)
+    static = low.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, up, normed, hc, release_early=release_early, tm=64)
+    fresh, _, _, _ = _build(dict(rows=rows), seed=4400 + rows)
+    static.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, op(fresh, up, normed, hc))
+
+
+@pytest.mark.parametrize("rows, tm", [(20, 64), (80, 64), (144, 128)])
+def test_rstd_form_is_the_default_kernel_on_the_normed_stream(rows, tm) -> None:
+    """With `rstd` all ones the deferred-rstd form is the default kernel bit for bit (one fp32
+    multiply by 1.0 is exact)."""
+    low, up, normed, c = _build(dict(rows=rows), seed=rows)
+    ones = torch.ones(-(-rows // 128) * 128, c, device=DEV)
+    assert torch.equal(op(low, up, normed, c, tm=tm, rstd=ones), op(low, up, normed, c, tm=tm))
+
+
+def test_rstd_form_graph_replay() -> None:
+    low, up, normed, c = _build(dict(rows=48), seed=9)
+    rstd = _rstd(48, c, 9)
+    op(low, up, normed, c, tm=64, rstd=rstd)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(low, up, normed, c, tm=64, rstd=rstd)
+    rstd.copy_(_rstd(48, c, 10))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, op(low, up, normed, c, tm=64, rstd=rstd))

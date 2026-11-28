@@ -21,10 +21,14 @@ SERVED = frozenset({SM_103, SM_107})
 #: `ARCHS` of the family's op entries.
 SERVED_ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
-FastPath = Literal["qsa_nvfp4_verify", "qsa_index_scores", "qsa_grouped_decode", "cute_dsl_moe"]
+FastPath = Literal[
+    "qsa_nvfp4_verify", "qsa_fp8_verify", "qsa_index_scores", "qsa_grouped_decode", "cute_dsl_moe"
+]
 
 FAST_PATHS: dict[FastPath, frozenset[tuple[int, int]]] = {
     "qsa_nvfp4_verify": SERVED,
+    # The bitmap-union e4m3 verify kernel was measured on GB300 only.
+    "qsa_fp8_verify": frozenset({SM_103}),
     "qsa_index_scores": SERVED,
     "qsa_grouped_decode": SERVED,
     # Its grouped-GEMM runners are built for sm_100 and sm_103 only.

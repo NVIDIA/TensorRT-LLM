@@ -590,9 +590,14 @@ def test_a_misspelled_ple_host_table_mode_fails_at_routing(monkeypatch):
 # --- the family's GPUs and fast paths (`archs.py`) ------------------------------------
 
 
+_SM103_ONLY = ("cute_dsl_moe", "qsa_fp8_verify")
+
+
 def test_the_gpus_the_family_serves_and_each_fast_path_runs_on():
     assert {f"sm_{a}{b}" for a, b in archs.SERVED} == {a.value for a in archs.SERVED_ARCHS}
     assert archs.served_names() == "sm_103, sm_107" and not archs.served((10, 0))
     for name, capabilities in archs.FAST_PATHS.items():
         assert capabilities <= archs.SERVED, name
-        assert archs.fast_path(name, archs.SM_107) is (name != "cute_dsl_moe"), name
+        # On sm_107 every fast path runs but the CuTe DSL MoE (no sm_107 runners) and the
+        # bitmap-union e4m3 verify kernel (measured on GB300 only).
+        assert archs.fast_path(name, archs.SM_107) is (name not in _SM103_ONLY), name

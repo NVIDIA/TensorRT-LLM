@@ -8,10 +8,12 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import QsaRuntimePolicy
 
 from .constants import QSA_KEY_ROLE_INDEX
 from .kernels import (
     QSA_GENERATION_MAPPING_MAX_SEQS,
+    triton_qsa_copy_block_offsets,
     triton_qsa_generation_token_mapping,
     triton_qsa_unscale_block_table,
 )
@@ -32,6 +34,12 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
     qsa_has_local_layers: bool = field(
         init=False,
         default=False,
+        repr=False,
+    )
+    # The model's RuntimeHooks.qsa, set by the decoder metadata (CUDA-graph copies inherit it).
+    qsa_policy: QsaRuntimePolicy = field(
+        init=False,
+        default=QsaRuntimePolicy(),
         repr=False,
     )
 
@@ -382,6 +390,108 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         self._refresh_qsa_speculative_snapshot_state()
         self._refresh_qsa_device_state()
 
+    @property
+    def supports_steady_decode_step(self) -> bool:
+        """With ``qsa_policy.steady_decode``: whether ``prepare_steady_decode_step`` below stands in for this
+        class's ``prepare()`` (the parent's conditions, with QSA's own prepare). Without it, the parent's
+        answer, which is False for this class."""
+        if not self.qsa_policy.steady_decode:
+            return TrtllmAttentionMetadata.supports_steady_decode_step.fget(self)
+        return (
+            type(self).prepare is QSAAttentionMetadata.prepare
+            and self.qsa_has_local_layers
+            and self._steady_decode_config_supported()
+        )
+
+    def prepare_steady_decode_step(self, kv_lens, prompt_lens=None) -> None:
+        """``prepare()`` of a steady decode step (requires ``supports_steady_decode_step``): the parent's
+        steady step (KV lengths from the staging kernel, a manager's block offsets copied only when its
+        ``batch_block_table_key`` changed; ``prompt_lens`` as the parent takes them), then QSA's device
+        state with an unscale only of a table that was copied (an unchanged offset table unscales to the
+        same slot table) and the row mapping over the new lengths. With ``qsa_policy.steady_replay_gap``
+        on a CUDA-graph decode step: a changed table is copied and unscaled in one launch where the
+        manager's copy is the plain one, and the row mapping is left to the forward, which rewrites it
+        before any reader (the overlap scheduler's KV-length correction and ``on_update_kv_lens``, or a
+        decode prologue that writes it)."""
+        if not self.qsa_policy.steady_decode:
+            super().prepare_steady_decode_step(kv_lens, prompt_lens)
+            return
+        replay_gap = (
+            self.qsa_policy.steady_replay_gap
+            and self.qsa_has_local_layers
+            and self.is_cuda_graph
+            and self.num_contexts == 0
+        )
+        last = tuple(self._steady_block_table_keys)
+        fused = self._copy_changed_block_offsets(last) if replay_gap else (False, False)
+        super().prepare_steady_decode_step(kv_lens, prompt_lens)
+        if not self.qsa_has_local_layers:
+            return
+        new = tuple(self._steady_block_table_keys)
+        self._refresh_qsa_speculative_snapshot_state()
+        if (new[0] is None or new[0] != last[0]) and not fused[0]:
+            self._refresh_qsa_block_table()
+        if (
+            self.draft_kv_cache_manager is not None
+            and (new[1] is None or new[1] != last[1])
+            and not fused[1]
+        ):
+            self._refresh_qsa_draft_block_table()
+        if not replay_gap:
+            self._refresh_qsa_token_mapping()
+
+    def _copy_changed_block_offsets(self, last: tuple) -> tuple[bool, bool]:
+        """Before the parent's steady step: for each manager whose ``batch_block_table_key`` changed (and is
+        not None), its block-offset copy and QSA unscale in one launch (``triton_qsa_copy_block_offsets``),
+        where its copy is ``KVCacheManagerV2``'s plain one. The key is then recorded, so the parent skips its
+        own copy of that table. Returns, per manager (target, draft), whether its table was taken here."""
+        managers = (self.kv_cache_manager, self.draft_kv_cache_manager)
+        offsets = (self.kv_cache_block_offsets, self.draft_kv_cache_block_offsets)
+        tables = (
+            (self.qsa_block_table, self._qsa_attention_pool_id, self._qsa_page_index_scale),
+            (
+                (
+                    self.qsa_draft_block_table,
+                    self._qsa_draft_attention_pool_id,
+                    self._qsa_draft_page_index_scale,
+                )
+                if self.qsa_draft_block_table is not None
+                else None
+            ),
+        )
+        keys = list(last)
+        taken = [False, False]
+        for i, (manager, block_offsets, table) in enumerate(zip(managers, offsets, tables)):
+            if (
+                manager is None
+                or table is None
+                or not _plain_block_offsets_copy(manager, block_offsets)
+            ):
+                continue
+            key = manager.batch_block_table_key(self.request_ids)
+            if key is None or key == last[i]:
+                continue
+            qsa_table, pool, scale = table
+            num_seqs = self.num_seqs
+            copy_index = manager.index_mapper.get_copy_index(self.request_ids, 0, 1, False)
+            assert copy_index.shape[0] == num_seqs
+            triton_qsa_copy_block_offsets(
+                host_block_offsets=manager.host_kv_cache_block_offsets,
+                block_offsets=block_offsets,
+                copy_index=copy_index,
+                index_scales=manager.index_scales,
+                kv_offset=manager.kv_offset,
+                num_seqs=num_seqs,
+                qsa_table=qsa_table,
+                qsa_pool=pool,
+                qsa_page_index_scale=scale,
+                qsa_role=QSA_KEY_ROLE_INDEX,
+            )
+            keys[i] = key
+            taken[i] = True
+        self._steady_block_table_keys = tuple(keys)
+        return taken[0], taken[1]
+
     def on_update_kv_lens(self) -> None:
         """Refresh row limits after speculative decoding advances KV lengths."""
         super().on_update_kv_lens()
@@ -401,6 +511,45 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         """
         super().update_for_spec_dec()
         self.on_update_kv_lens()
+
+
+def _plain_block_offsets_copy(manager, block_offsets: Optional[torch.Tensor]) -> bool:
+    """Whether ``manager.copy_batch_block_offsets`` of a beam-1 generation batch into ``block_offsets`` is
+    ``KVCacheManagerV2``'s plain host-table copy (``copy_batch_block_offsets_to_device`` on the current
+    stream), which ``triton_qsa_copy_block_offsets`` reproduces: not overridden, no per-layer page tables,
+    no device expansion, not cross KV, contiguous int32 tables of one width, a width whole native 4-entry
+    packs cover (the native copy's last partial pack is not a plain copy)."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+        CacheTypeCpp,
+        KVCacheManagerV2,
+    )
+
+    if type(manager).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets:
+        return False
+    materializer = getattr(manager, "_page_table_materializer", None)
+    if (
+        getattr(manager, "_use_per_layer_page_tables", True)
+        or materializer is None
+        or materializer.uses_device_expansion
+        or manager.kv_cache_type == CacheTypeCpp.CROSS
+    ):
+        return False
+    host = manager.host_kv_cache_block_offsets
+    return (
+        block_offsets is not None
+        and block_offsets.dtype == torch.int32
+        and host.dtype == torch.int32
+        and block_offsets.dim() == 4
+        and host.dim() == 4
+        and block_offsets.is_contiguous()
+        and host.is_contiguous()
+        and block_offsets.shape[0] == host.shape[0]
+        and block_offsets.shape[2] == 2
+        and host.shape[2] == 2
+        and block_offsets.shape[3] == host.shape[3]
+        and host.shape[3] % 4 == 0
+        and manager._stream.cuda_stream == torch.cuda.current_stream().cuda_stream
+    )
 
 
 __all__ = ["QSAAttentionMetadata"]

@@ -327,6 +327,10 @@ class CUDAGraphRunner:
         self._pre_replay_hooks: List[Callable[
             [KeyType, int, Dict[str, Any], Dict[str, Any]], None]] = []
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
+        # What the MRoPE delta read-slot buffer is known to hold: (buffer address, the dummy seq
+        # slot, leading rows). Only replay() writes the buffer; it skips refilling rows that
+        # already hold the dummy slot.
+        self._mrope_dummy_rows: Optional[Tuple[int, int, int]] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         # Graphs captured with a step-input pack's prologue, and that pack (step_inputs.capture_prologue).
@@ -1380,6 +1384,27 @@ class CUDAGraphRunner:
         else:
             step_inputs.copy_(dst, src)
 
+    def _fill_mrope_dummy_slots(self, buf: torch.Tensor, num_slots: int,
+                                dummy_slot: int) -> None:
+        """Fill the first ``num_slots`` MRoPE delta read slots with the dummy seq slot, unless
+        they already hold it: a generation-only decode step without multimodal requests
+        omits the slots on every replay, and the fill is then a launch a step that rewrites
+        the same values. Every other write of the buffer is replay()'s copy, which forgets
+        what it held; a capture never writes it."""
+        known = self._mrope_dummy_rows
+        if (known is not None and known[0] == buf.data_ptr()
+                and known[1] == dummy_slot and known[2] >= num_slots
+                and not torch.cuda.is_current_stream_capturing()):
+            return
+        buf[:num_slots].fill_(dummy_slot)
+        if torch.cuda.is_current_stream_capturing():
+            return
+        rows = num_slots
+        if (known is not None and known[0] == buf.data_ptr()
+                and known[1] == dummy_slot):
+            rows = max(rows, known[2])
+        self._mrope_dummy_rows = (buf.data_ptr(), dummy_slot, rows)
+
     def replay(
         self,
         key: KeyType,
@@ -1481,6 +1506,7 @@ class CUDAGraphRunner:
                                                   shape[0]].copy_(
                                                       mrope_delta_read_seq_slots,
                                                       non_blocking=True)
+                self._mrope_dummy_rows = None
             else:
                 # Omission means every slot reads the dummy seq slot's
                 # permanently-zero delta (DecoderInputPreparer's mrope_dummy_seq_slot
@@ -1491,7 +1517,8 @@ class CUDAGraphRunner:
                     "dummy seq slot instead of copying real values.")
                 mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
                     self.config.max_num_tokens, self.config.mapping.pp_size)
-                static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
+                self._fill_mrope_dummy_slots(
+                    static_tensors['mrope_delta_read_seq_slots'], num_slots,
                     mrope_dummy_seq_slot)
         else:
             expected_position_ids_shape = (1, seqlen)
@@ -2162,6 +2189,7 @@ class CUDAGraphRunner:
         self.forward_scratch_buffers.buffers.clear()
         self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
+        self._mrope_dummy_rows = None
         self._step_input_prologue_keys.clear()
         self._prologue_copiers.clear()
         self.reset_padding_dummies()

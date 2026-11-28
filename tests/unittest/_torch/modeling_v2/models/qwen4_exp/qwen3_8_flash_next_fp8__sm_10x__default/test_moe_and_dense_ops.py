@@ -10,8 +10,14 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.embed_rows__decode import (  # noqa: E501
+    embed_rows,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (  # noqa: E501
     qwen4_exp_post_inject,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.mtp_moe_combine_inject__decode import (  # noqa: E501
+    mtp_moe_combine_inject,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
     renorm_moe_routing_op,
@@ -21,9 +27,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quant
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default import (  # noqa: E501
     modeling as M,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.embedding.embed_rows__decode import (  # noqa: E501
-    embed_rows,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.gemm.low_m_bf16_mm__decode import (  # noqa: E501
     low_m_bf16_mm,
@@ -50,9 +53,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.moe.moe_front_router_quant__decode import (  # noqa: E501
     moe_front_router_quant,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.moe.mtp_moe_combine_inject__decode import (  # noqa: E501
-    mtp_moe_combine_inject,
 )
 from tensorrt_llm._torch.moe.fused_shared_expert import fused_sigmoid_gate_mul_add
 

@@ -281,6 +281,10 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
             why="16384 rows: max_num_tokens of the tuned config; past the 8192 tuning bucket",
             spec=_ckpt(16384),
         ),
+        Cell(
+            why="24576 rows: a CTX's max_num_tokens of 24576 stepped in one launch",
+            spec=_ckpt(24576),
+        ),
         # The windows: tep4 / dep4 a 128-expert window at I 640, tep2 / dep2 a 256-expert window,
         # dep8 a 64-expert window, tp4 all 512 experts at its 160-wide slice padded to 256, tp2 at
         # its 320-wide slice padded to 384. Rows: 1 (decode), 4 (an MTP-3 verify step), 5 (past
@@ -333,7 +337,7 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
     (`renorm_moe_routing_op` -> pre-routed runner): bitwise-equal finalized
     output at every cell (the test re-drives this), and at bring-up on randn /
     coarse / large-magnitude / all-equal logits, bf16 and fp32 logits,
-    1..16384 rows. Both kernels rank by a packed
+    1..24576 rows. Both kernels rank by a packed
     (twiddled value, 65535 - index) key (ties to the lower expert index), take
     an fp32 `expf` softmax over the k with the same 32-lane warp reduction, and
     round the weight to bf16 once.
@@ -369,8 +373,8 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
       window       the whole 512 at I 640 (tp1), 128 of 512 at I 640 (every offset), 256 of
                    512 at I 640 (both offsets), 64 of 512 at I 640 (offsets 0, 192 and 448),
                    512 at I 256 (tp4) and at I 384 (tp2)
-      T            the whole layer certified at 1, 128 and 16384 (max_num_tokens of the tuned
-                   config), the windows at their cells' rows, 1 to 8192.
+      T            the whole layer certified at 1, 128, 16384 (max_num_tokens of the tuned
+                   config) and 24576, the windows at their cells' rows, 1 to 8192.
                    Autotuner buckets stop at 8192, the op's
                    `tune_max_num_tokens` default, which this entry does not
                    pass: a call past 8192 rows runs the 8192 bucket's tactic

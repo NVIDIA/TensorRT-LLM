@@ -5,6 +5,12 @@
 Each CTA holds a slice of the row's window in registers; radix passes (12, 11, 8 bits, top down)
 narrow to the threshold class, every CTA adding its histogram into every CTA's copy through
 distributed shared memory so the cluster narrows in step.
+
+`cowrite`: a CTA's selected blocks take consecutive positions of the row's block list, so the CTA
+first writes them into a shared position -> block map and then stores its stretch of
+`topk_indices` and of the token selection with all its threads, consecutive threads at
+consecutive columns, instead of each key's thread storing its block and its `compress_ratio`
+tokens at scattered columns. The same values at the same columns.
 """
 
 from __future__ import annotations
@@ -29,6 +35,15 @@ _PASSES = ((19, 12), (8, 11), (0, 8))
 _HIST = 1 << 12
 #: Most rows a launch serves (148 CTAs in clusters of 4); more take the family's one-CTA kernel.
 MAX_ROWS = 37
+#: Most rows a caller may ask `supports` to serve (`max_rows`): past `MAX_ROWS` a row takes a
+#: cluster of two CTAs, one wave up to 74 rows on 148 SMs and several past it. A CTA then holds
+#: half the window (below 2^16 keys at `MAX_WIDTH`, the width of its packed counts).
+PAIR_MAX_ROWS = 256
+#: Rows a row-mapped launch (`pairs`) ranks: its scratch (windows, ranks and the rows by rank)
+#: sits in the first pass's histogram before the histogram is zeroed.
+MAP_MAX_ROWS = 152
+#: Threads that rank one row of the map, each over every `_MAP_PARTS`-th other row.
+_MAP_PARTS = 6
 #: Narrowest table this entry serves: narrower ones take the family's one-CTA kernel.
 MIN_WIDTH = 4096 + KPT
 #: Widest table (8192 + 128 pages): keeps a CTA's keys below 2^16, the width of its packed counts.
@@ -80,8 +95,11 @@ def _dsmem(ptr, rank):
 
 
 def cluster_size(rows: int) -> int:
-    """CTAs a row: 8 up to 12 rows (16 clusters of 8 overflow GB300's GPCs in one wave), else 4."""
-    return 8 if rows <= 12 else 4
+    """CTAs a row: 8 up to 12 rows (16 clusters of 8 overflow GB300's GPCs in one wave), 4 up to
+    `MAX_ROWS`, 2 past it (a caller's `max_rows`)."""
+    if rows <= 12:
+        return 8
+    return 4 if rows <= MAX_ROWS else 2
 
 
 def geometry(width: int, cluster: int) -> tuple[int, int]:
@@ -95,7 +113,20 @@ def geometry(width: int, cluster: int) -> tuple[int, int]:
 
 
 class _TopkExpandClusterKernel:
-    def __init__(self, *, width, key_stride, block_topk, compress, token_topk, pdl, cluster):
+    def __init__(
+        self,
+        *,
+        width,
+        key_stride,
+        block_topk,
+        compress,
+        token_topk,
+        pdl,
+        cluster,
+        solo=0,
+        pairs=0,
+        cowrite=False,
+    ):
         self.width, self.key_stride, self.k, self.cr, self.token_topk, self.pdl = (
             width,
             key_stride,
@@ -108,6 +139,18 @@ class _TopkExpandClusterKernel:
         self.threads, self.groups = geometry(width, cluster)
         self.warps = self.threads // 32
         self.final = token_topk + compress - 1
+        #: Keys one CTA holds in registers: a row of at most this many blocks fits one CTA.
+        self.cap = self.threads * self.groups * KPT
+        #: Clusters of 2 only (`launch`): a row of at most `solo` blocks is selected by the
+        #: cluster's first CTA alone (the other returns at once), and with `pairs` P the rows map
+        #: onto P clusters (`_row_map`). Both 0: every row on its own cluster (the base launch).
+        self.solo = min(int(solo), self.cap) if cluster == 2 else 0
+        self.pairs = int(pairs) if cluster == 2 else 0
+        assert 0 <= self.pairs <= MAP_MAX_ROWS, pairs
+        #: The coalesced write (step 5): the position -> block map sits in the first pass's local
+        #: histogram, free once the passes are done.
+        self.cowrite = bool(cowrite)
+        assert not self.cowrite or block_topk <= _HIST, block_topk
 
     def smem_bytes(self) -> int:
         words = _HIST + sum(1 << bits for _, bits in _PASSES) + 32 + 32 + 32 * self.groups + 16
@@ -219,14 +262,19 @@ class _TopkExpandClusterKernel:
         shift: cutlass.Constexpr,
         bits: cutlass.Constexpr,
         q4,
+        alone: cutlass.Constexpr = False,
     ):
         """One radix pass unless narrowing is done: count this CTA's class keys, add the counts
-        into every CTA's `merged`, cluster barrier, scan. Slot j holds keys only while
-        `j * threads < q4`."""
+        into every CTA's `merged`, cluster barrier, scan (`alone`: a CTA holding its whole row
+        counts straight into `merged`). Slot j holds keys only while `j * threads < q4`."""
         nbins: cutlass.Constexpr = 1 << bits
         if state[4] == 0:
             prefix = state[0]
             mask = state[1]
+            if const_expr(alone):
+                hist = merged
+            else:
+                hist = local
             for j in cutlass.range_constexpr(self.groups):
                 if j * self.threads < q4:
                     for c in cutlass.range_constexpr(KPT):
@@ -234,22 +282,69 @@ class _TopkExpandClusterKernel:
                         if kv >= 0:
                             if (kv & mask) == prefix:
                                 cute.arch.atomic_add(
-                                    local.iterator + ((kv >> shift) & (nbins - 1)),
+                                    hist.iterator + ((kv >> shift) & (nbins - 1)),
                                     cutlass.Int32(1),
                                     scope="cta",
                                 )
             cute.arch.sync_threads()
-            for b in cutlass.range_constexpr(-(-nbins // self.threads)):
-                i = tidx + b * self.threads
-                if i < nbins:
-                    v = local[i]
-                    if v != 0:
-                        local[i] = cutlass.Int32(0)
-                        for r in cutlass.range_constexpr(self.C):
-                            _red_add_cluster(_dsmem(merged.iterator + i, r), v)
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+            if const_expr(not alone):
+                for b in cutlass.range_constexpr(-(-nbins // self.threads)):
+                    i = tidx + b * self.threads
+                    if i < nbins:
+                        v = local[i]
+                        if v != 0:
+                            local[i] = cutlass.Int32(0)
+                            for r in cutlass.range_constexpr(self.C):
+                                _red_add_cluster(_dsmem(merged.iterator + i, r), v)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             self._narrow(merged, tidx, warp, lane, wsum, state, shift, bits)
+
+    @cute.jit
+    def _write_coalesced(
+        self, keys, pre, smap, mTopk, mSel, tidx, row, g_lo, base, skip, run, prefix, mask, seqlen
+    ):
+        """Step 5 with `cowrite`: this CTA's selected blocks hold positions `base .. base + m - 1`
+        (m = its keys above the class plus its class keys past `skip`). Each key's thread puts its
+        block at its position in `smap` (the first pass's local histogram, free once the passes are
+        done; no peer writes it), then all threads store `topk_indices[row, base .. base + m)` and
+        the token selection's `[base * cr, (base + m) * cr)`, consecutive threads at consecutive
+        columns: the values and columns of the scattered stores."""
+        nt: cutlass.Constexpr = self.threads
+        G: cutlass.Constexpr = self.groups
+        cr: cutlass.Constexpr = self.cr
+        for j in cutlass.range_constexpr(G):
+            gl = g_lo + j * nt + tidx
+            ab = pre[j] & 0xFFFF
+            cb = (pre[j] >> 16) & 0xFFFF
+            for c in cutlass.range_constexpr(KPT):
+                kv = keys[c, j]
+                if kv >= 0:
+                    mk = kv & mask
+                    sel = cutlass.Int32(0)
+                    pos = cutlass.Int32(0)
+                    if mk > prefix:
+                        sel = cutlass.Int32(1)
+                        pos = ab + cutlass.max(cb - skip, cutlass.Int32(0))
+                        ab = ab + 1
+                    if mk == prefix:
+                        if cb >= skip:
+                            sel = cutlass.Int32(1)
+                            pos = ab + cb - skip
+                        cb = cb + 1
+                    if sel == 1:
+                        smap[pos] = gl * KPT + c
+        cute.arch.sync_threads()
+        m = (run & 0xFFFF) + ((run >> 16) & 0xFFFF) - skip
+        for i in cutlass.range(tidx, m, nt):
+            mTopk[row, base + i] = smap[i]
+        for i in cutlass.range(tidx, m * cr, nt):
+            blk = i // cr
+            tok = smap[blk] * cr + (i - blk * cr)
+            val = cutlass.Int32(-1)
+            if tok < seqlen:
+                val = tok
+            mSel[row, base * cr + i] = val
 
     @cute.kernel
     def kernel(self, mKeys, mEnd, mPos, mLen, mTopk, mSel, ld_keys: cute.CopyAtom):
@@ -259,12 +354,7 @@ class _TopkExpandClusterKernel:
         lane = cute.arch.lane_idx()
         rank = cute.arch.block_idx_in_cluster()
         C: cutlass.Constexpr = self.C
-        nt: cutlass.Constexpr = self.threads
-        nw: cutlass.Constexpr = self.warps
         G: cutlass.Constexpr = self.groups
-        k: cutlass.Constexpr = self.k
-        cr: cutlass.Constexpr = self.cr
-        row = bidx // C
         smem = cutlass.utils.SmemAllocator()
         local = smem.allocate_tensor(
             cutlass.Int32, cute.make_layout((_HIST,), stride=(1,)), byte_alignment=128
@@ -291,11 +381,108 @@ class _TopkExpandClusterKernel:
             cutlass.Int32, cute.make_layout((16,), stride=(1,)), byte_alignment=128
         )
 
+        args = (mKeys, mEnd, mPos, mLen, mTopk, mSel, ld_keys)
+        bufs = (local, merged0, merged1, merged2, ex, wsum, wtot, state)
+        row = bidx // C
+        if const_expr(self.solo == 0 and self.pairs == 0):
+            self._select_row(args, bufs, tidx, warp, lane, rank, row, False)
+        else:
+            # 0 = the row on this cluster, 1 = a row on this CTA alone, 2 = nothing to do
+            role = cutlass.Int32(0)
+            if const_expr(self.pairs > 0):
+                row, role = self._row_map(mEnd, merged0, tidx, bidx, rank)
+            if const_expr(self.solo > 0):
+                if role == 0:
+                    if mEnd[row] <= self.solo:
+                        role = cutlass.Int32(
+                            cutlass.select_(rank == 0, cutlass.Int32(1), cutlass.Int32(2))
+                        )
+            if role == 0:
+                self._select_row(args, bufs, tidx, warp, lane, rank, row, False)
+            if role == 1:
+                self._select_row(args, bufs, tidx, warp, lane, rank, row, True)
+
+    @cute.jit
+    def _row_map(self, mEnd, scratch, tidx, bidx, rank):
+        """`(row, role)` of this CTA in a launch of `pairs` = P clusters' worth of work. Every
+        CTA ranks the launch's rows by window (ties by row) from their host-filled ends, read
+        before the wait as the base kernel reads its own row's. With q = rows - P > 0, 2q <= rows
+        and the 2q shortest windows within one CTA (`cap`), clusters below q take two of the
+        shortest rows, one a CTA alone (role 1), clusters q..P-1 the remaining rows one a
+        cluster (role 0) and the rest nothing (role 2): one wave of P clusters instead of rows.
+        Otherwise every row keeps its own cluster. The scratch (the first pass's histogram:
+        windows, ranks, rows by rank) is free again when this returns."""
+        nt: cutlass.Constexpr = self.threads
+        P: cutlass.Constexpr = self.pairs
+        R: cutlass.Constexpr = 160
+        nrows = cutlass.Int32(cute.arch.grid_dim()[0]) // 2
+        for b in cutlass.range_constexpr(-(-MAP_MAX_ROWS // nt)):
+            i = tidx + b * nt
+            if i < nrows:
+                scratch[i] = mEnd[i]
+                scratch[R + i] = cutlass.Int32(0)
+        cute.arch.sync_threads()
+        for b in cutlass.range_constexpr(-(-(MAP_MAX_ROWS * _MAP_PARTS) // nt)):
+            t = tidx + b * nt
+            ri = t // _MAP_PARTS
+            part = t - ri * _MAP_PARTS
+            if ri < nrows:
+                ni = scratch[ri]
+                cnt = cutlass.Int32(0)
+                for jj in cutlass.range_constexpr(-(-MAP_MAX_ROWS // _MAP_PARTS)):
+                    j = part + jj * _MAP_PARTS
+                    if j < nrows:
+                        nj = scratch[j]
+                        if nj < ni:
+                            cnt = cnt + 1
+                        if nj == ni:
+                            if j < ri:
+                                cnt = cnt + 1
+                if cnt > 0:
+                    cute.arch.atomic_add(scratch.iterator + R + ri, cnt, scope="cta")
+        cute.arch.sync_threads()
+        for b in cutlass.range_constexpr(-(-MAP_MAX_ROWS // nt)):
+            i = tidx + b * nt
+            if i < nrows:
+                scratch[2 * R + scratch[R + i]] = i
+        cute.arch.sync_threads()
+        cl = bidx // 2
+        q = nrows - P
+        row = cl
+        role = cutlass.Int32(0)
+        if q > 0:
+            if 2 * q <= nrows:
+                if scratch[scratch[2 * R + 2 * q - 1]] <= self.cap:
+                    if cl < q:
+                        row = scratch[2 * R + 2 * cl + rank]
+                        role = cutlass.Int32(1)
+                    else:
+                        if cl < P:
+                            row = scratch[2 * R + 2 * q + (cl - q)]
+                        else:
+                            row = cutlass.Int32(0)
+                            role = cutlass.Int32(2)
+        cute.arch.sync_threads()
+        return row, role
+
+    @cute.jit
+    def _select_row(self, args, bufs, tidx, warp, lane, rank, row, alone: cutlass.Constexpr):
+        """Steps 0-6 for `row`: on the whole cluster, or (`alone`) on this CTA by itself over the
+        row's whole window, without a cluster barrier or a store into another CTA."""
+        mKeys, mEnd, mPos, mLen, mTopk, mSel, ld_keys = args
+        local, merged0, merged1, merged2, ex, wsum, wtot, state = bufs
+        C: cutlass.Constexpr = self.C
+        nt: cutlass.Constexpr = self.threads
+        nw: cutlass.Constexpr = self.warps
+        G: cutlass.Constexpr = self.groups
+        k: cutlass.Constexpr = self.k
+        cr: cutlass.Constexpr = self.cr
         # 0. The histograms zeroed and the row's host-filled metadata read before the wait;
         # the arrive releases the zeroed counts before any peer adds into them.
         for b in cutlass.range_constexpr(-(-_HIST // nt)):
             if tidx + b * nt < _HIST:
-                local[tidx + b * nt] = cutlass.Int32(0)
+                if const_expr(not alone):
+                    local[tidx + b * nt] = cutlass.Int32(0)
                 merged0[tidx + b * nt] = cutlass.Int32(0)
         for b in cutlass.range_constexpr(-(-(1 << _PASSES[1][1]) // nt)):
             if tidx + b * nt < (1 << _PASSES[1][1]):
@@ -312,7 +499,8 @@ class _TopkExpandClusterKernel:
             state[2] = cutlass.min(n, cutlass.Int32(k))  # still needed from the class
             state[3] = n  # keys in the class
             state[4] = cutlass.Int32(cutlass.select_(n <= k, 1, 0))  # narrowing done
-        cute.arch.cluster_arrive()
+        if const_expr(not alone):
+            cute.arch.cluster_arrive()
         if const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
@@ -320,8 +508,12 @@ class _TopkExpandClusterKernel:
         # 1. This CTA's slice of the window: groups [g_lo, g_hi) of `KPT` consecutive keys,
         # group `g_lo + j * nt + tidx` in slot j of thread tidx; -1 past the window.
         n4 = (n + (KPT - 1)) // KPT
-        q4 = (n4 + (C - 1)) // C
-        g_lo = rank * q4
+        if const_expr(alone):
+            q4 = n4
+            g_lo = cutlass.Int32(0)
+        else:
+            q4 = (n4 + (C - 1)) // C
+            g_lo = rank * q4
         g_hi = cutlass.min(g_lo + q4, n4)
         gK = cute.logical_divide(mKeys, (None, KPT))
         keys = cute.make_rmem_tensor(cute.make_layout((KPT, G), stride=(1, KPT)), cutlass.Int32)
@@ -335,16 +527,52 @@ class _TopkExpandClusterKernel:
                 if (gl >= g_hi) | (gl * KPT + c >= n):
                     v = cutlass.Int32(-1)
                 keys[c, j] = v
-        cute.arch.cluster_wait()
+        if const_expr(alone):
+            cute.arch.sync_threads()
+        else:
+            cute.arch.cluster_wait()
 
         self._pass(
-            keys, tidx, warp, lane, local, merged0, wsum, state, _PASSES[0][0], _PASSES[0][1], q4
+            keys,
+            tidx,
+            warp,
+            lane,
+            local,
+            merged0,
+            wsum,
+            state,
+            _PASSES[0][0],
+            _PASSES[0][1],
+            q4,
+            alone,
         )
         self._pass(
-            keys, tidx, warp, lane, local, merged1, wsum, state, _PASSES[1][0], _PASSES[1][1], q4
+            keys,
+            tidx,
+            warp,
+            lane,
+            local,
+            merged1,
+            wsum,
+            state,
+            _PASSES[1][0],
+            _PASSES[1][1],
+            q4,
+            alone,
         )
         self._pass(
-            keys, tidx, warp, lane, local, merged2, wsum, state, _PASSES[2][0], _PASSES[2][1], q4
+            keys,
+            tidx,
+            warp,
+            lane,
+            local,
+            merged2,
+            wsum,
+            state,
+            _PASSES[2][0],
+            _PASSES[2][1],
+            q4,
+            alone,
         )
         prefix = state[0]
         mask = state[1]
@@ -352,7 +580,10 @@ class _TopkExpandClusterKernel:
 
         # 3. Block order within the CTA (slot j of every thread, then slot j + 1): each
         # (thread, slot)'s counts above and in the class, packed (above + class << 16), and their
-        # exclusive prefix. Slots past `q4` hold no keys in any thread (uniform skip).
+        # exclusive prefix. Slots past `q4` hold no keys in any thread (uniform skip). Each half
+        # is below 2^16 (a CTA's keys), but the class half can pass 2^15 in a cluster of 2 (up
+        # to 33280 keys a CTA): the Int32 sums then wrap into the sign bit, so the class half is
+        # read back with a mask, never with the arithmetic shift alone.
         pre = cute.make_rmem_tensor(cute.make_layout((G,), stride=(1,)), cutlass.Int32)
         pre.fill(0)
         for j in cutlass.range_constexpr(G):
@@ -388,68 +619,93 @@ class _TopkExpandClusterKernel:
                 run = run + cute.arch.warp_reduction_sum(v)
 
         # 4. Every CTA's totals into every CTA (lane r of warp 0 writes CTA r's slot `rank`).
-        if tidx < C:
-            _st_cluster(_dsmem(ex.iterator + rank, tidx), run)
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
         # The class's `need` are its highest blocks, so later CTAs fill first. `base`: selected
         # count of the CTAs before this one; `skip`: this CTA's lowest class keys left out.
         base = cutlass.Int32(0)
         skip = cutlass.Int32(0)
-        later = cutlass.Int32(0)
-        for rr in cutlass.range_constexpr(C):
-            r = C - 1 - rr
-            tot = ex[r]
-            e_r = tot >> 16
-            take = cutlass.max(cutlass.min(need - later, e_r), cutlass.Int32(0))
-            later = later + e_r
-            if r < rank:
-                base = base + (tot & 0xFFFF) + take
-            if r == rank:
-                skip = e_r - take
+        if const_expr(alone):
+            e_r = (run >> 16) & 0xFFFF
+            skip = e_r - cutlass.max(cutlass.min(need, e_r), cutlass.Int32(0))
+        else:
+            if tidx < C:
+                _st_cluster(_dsmem(ex.iterator + rank, tidx), run)
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            later = cutlass.Int32(0)
+            for rr in cutlass.range_constexpr(C):
+                r = C - 1 - rr
+                tot = ex[r]
+                e_r = (tot >> 16) & 0xFFFF
+                take = cutlass.max(cutlass.min(need - later, e_r), cutlass.Int32(0))
+                later = later + e_r
+                if r < rank:
+                    base = base + (tot & 0xFFFF) + take
+                if r == rank:
+                    skip = e_r - take
 
         # 5. Each selected block at its position, with its tokens below the sequence length.
-        for j in cutlass.range_constexpr(G):
-            gl = g_lo + j * nt + tidx
-            ab = pre[j] & 0xFFFF
-            cb = pre[j] >> 16
-            for c in cutlass.range_constexpr(KPT):
-                kv = keys[c, j]
-                if kv >= 0:
-                    mk = kv & mask
-                    sel = cutlass.Int32(0)
-                    pos = cutlass.Int32(0)
-                    if mk > prefix:
-                        sel = cutlass.Int32(1)
-                        pos = base + ab + cutlass.max(cb - skip, cutlass.Int32(0))
-                        ab = ab + 1
-                    if mk == prefix:
-                        if cb >= skip:
+        if const_expr(self.cowrite):
+            self._write_coalesced(
+                keys,
+                pre,
+                local,
+                mTopk,
+                mSel,
+                tidx,
+                row,
+                g_lo,
+                base,
+                skip,
+                run,
+                prefix,
+                mask,
+                seqlen,
+            )
+        else:
+            for j in cutlass.range_constexpr(G):
+                gl = g_lo + j * nt + tidx
+                ab = pre[j] & 0xFFFF
+                cb = (pre[j] >> 16) & 0xFFFF
+                for c in cutlass.range_constexpr(KPT):
+                    kv = keys[c, j]
+                    if kv >= 0:
+                        mk = kv & mask
+                        sel = cutlass.Int32(0)
+                        pos = cutlass.Int32(0)
+                        if mk > prefix:
                             sel = cutlass.Int32(1)
-                            pos = base + ab + cb - skip
-                        cb = cb + 1
-                    if sel == 1:
-                        col = gl * KPT + c
-                        mTopk[row, pos] = col
-                        for tt in cutlass.range_constexpr(cr):
-                            tok = col * cr + tt
-                            val = cutlass.Int32(-1)
-                            if tok < seqlen:
-                                val = tok
-                            mSel[row, pos * cr + tt] = val
+                            pos = base + ab + cutlass.max(cb - skip, cutlass.Int32(0))
+                            ab = ab + 1
+                        if mk == prefix:
+                            if cb >= skip:
+                                sel = cutlass.Int32(1)
+                                pos = base + ab + cb - skip
+                            cb = cb + 1
+                        if sel == 1:
+                            col = gl * KPT + c
+                            mTopk[row, pos] = col
+                            for tt in cutlass.range_constexpr(cr):
+                                tok = col * cr + tt
+                                val = cutlass.Int32(-1)
+                                if tok < seqlen:
+                                    val = tok
+                                mSel[row, pos * cr + tt] = val
 
-        # 6. Over the cluster's threads: the block list's -1 padding, then the causal tail and -1.
+        # 6. Over the cluster's threads (this CTA's alone): the block list's -1 padding, then the
+        # causal tail and -1.
+        Cw: cutlass.Constexpr = 1 if alone else C
+        rw = cutlass.Int32(0) if const_expr(alone) else rank
         total = cutlass.min(n, cutlass.Int32(k))
-        for b in cutlass.range_constexpr(-(-k // (C * nt))):
-            slot = (b * C + rank) * nt + tidx
+        for b in cutlass.range_constexpr(-(-k // (Cw * nt))):
+            slot = (b * Cw + rw) * nt + tidx
             if slot < k:
                 if slot >= total:
                     mTopk[row, slot] = cutlass.Int32(-1)
         tail_start = (visible // cr) * cr
         tail_count = visible - tail_start
         body = cutlass.min(total * cr, cutlass.Int32(self.token_topk))
-        for b in cutlass.range_constexpr(-(-self.final // (C * nt))):
-            col = (b * C + rank) * nt + tidx
+        for b in cutlass.range_constexpr(-(-self.final // (Cw * nt))):
+            col = (b * Cw + rw) * nt + tidx
             if col < self.final:
                 if col >= body:
                     off = col - body
@@ -475,8 +731,15 @@ def launch(
     compress_ratio,
     token_topk,
     out=None,
+    solo_blocks=0,
+    pairs=0,
+    cowrite=False,
 ):
-    """Writes `topk_indices`; returns the int32 token selection (`out` when given)."""
+    """Writes `topk_indices`; returns the int32 token selection (`out` when given). In clusters
+    of 2 (past `MAX_ROWS` rows) a row of at most `solo_blocks` blocks takes one CTA alone, and
+    `pairs` P > 0 maps up to `MAP_MAX_ROWS` rows onto P clusters (`_row_map`); both change the
+    work's placement only, never the selection. Ignored in clusters of 4 or 8. `cowrite`: the
+    selected blocks and tokens are stored through a shared map, coalesced (the same values)."""
     rows, width = scores.shape
     block_topk = topk_indices.shape[1]
     sel = out
@@ -489,6 +752,10 @@ def launch(
     pdl = bool(get_env_enable_pdl())
     keys = scores.view(torch.int32)
     cluster = cluster_size(rows)
+    if cluster != 2 or rows > MAP_MAX_ROWS:
+        pairs = 0
+    if cluster != 2:
+        solo_blocks = 0
     key = (
         width,
         scores.stride(0),
@@ -499,7 +766,9 @@ def launch(
         sequence_lengths.dtype,
         pdl,
         cluster,
-    )
+        int(solo_blocks),
+        int(pairs),
+    ) + (("cowrite",) if cowrite else ())
     ptrs = (
         row_ends.data_ptr(),
         query_positions.data_ptr(),
@@ -518,6 +787,9 @@ def launch(
             token_topk=token_topk,
             pdl=pdl,
             cluster=cluster,
+            solo=int(solo_blocks),
+            pairs=int(pairs),
+            cowrite=bool(cowrite),
         )
         fn = _COMPILED[key] = cute.compile(
             kernel,
@@ -545,10 +817,13 @@ def launch(
     return sel
 
 
-def supports(scores) -> bool:
-    """Whether this entry serves a decode call over this score table (see `is_valid`)."""
+def supports(scores, max_rows: int = MAX_ROWS) -> bool:
+    """Whether this entry serves a decode call over this score table (see `is_valid`): up to
+    `MAX_ROWS` rows, or up to `max_rows` (at most `PAIR_MAX_ROWS`) for a caller that asks."""
+    if not 0 < int(max_rows) <= PAIR_MAX_ROWS:
+        raise ValueError(f"max_rows={max_rows}: expected 1..{PAIR_MAX_ROWS}")
     rows, width = scores.shape
-    return 0 < rows <= MAX_ROWS and width % KPT == 0 and MIN_WIDTH <= width <= MAX_WIDTH
+    return 0 < rows <= int(max_rows) and width % KPT == 0 and MIN_WIDTH <= width <= MAX_WIDTH
 
 
 #: Score-table widths: 262144 tokens with / without MTP's extra pages, and 131072 tokens.
@@ -633,18 +908,127 @@ class QsaTopkExpandClusterDecode(OpWrapper):
                 rows=4, requests=((131068, 4),), relu_sum=True, width=_HALF_WIDTH, graph=True
             ),
         ),
+        Cell(
+            why="48 rows in clusters of 2 (a caller's max_rows): dep4 / dep8 verify, 12 requests "
+            "x 4 rows spread to ~250k tokens, relu-sum, graph",
+            spec=dict(
+                rows=48,
+                requests=tuple((2000 + 21000 * r, 4) for r in range(12)),
+                relu_sum=True,
+                width=_TUNE_WIDTH,
+                graph=True,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
+        Cell(
+            why="208 rows in clusters of 2 over three waves (a caller's max_rows): dep4 verify "
+            "at 52 a rank, 52 x 4 rows, with ties at the threshold (log-normal)",
+            spec=dict(
+                rows=208,
+                requests=tuple((5000 + 4800 * r, 4) for r in range(52)),
+                lognormal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
+        Cell(
+            why="40 rows of equal scores at the table's deepest windows (65568..65529 blocks) in "
+            "clusters of 2: a CTA's tie class holds up to 32784 keys, past the packed counts' "
+            "2^15 (their sign bit)",
+            spec=dict(
+                rows=40,
+                pos=tuple(262271 - 4 * r for r in range(40)),
+                equal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
+        Cell(
+            why="208 rows in clusters of 2, a row of up to 32768 blocks on one CTA alone "
+            "(`solo_blocks`): dep4 verify at 52 a rank, windows 2k..62k blocks, relu-sum",
+            spec=dict(
+                rows=208,
+                requests=tuple((8000 + 4800 * r, 4) for r in range(52)),
+                relu_sum=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+                solo_blocks=32768,
+            ),
+        ),
+        Cell(
+            why="96 rows mapped onto 74 clusters (`pairs`): the 44 shortest rows one a CTA, the "
+            "rest one a cluster or (up to 8192 blocks) one a CTA, relu-sum, graph",
+            spec=dict(
+                rows=96,
+                requests=tuple(
+                    ((3000 + 5000 * r) if r % 2 else (150000 + 4000 * r), 4) for r in range(24)
+                ),
+                relu_sum=True,
+                width=_TUNE_WIDTH,
+                graph=True,
+                max_rows=PAIR_MAX_ROWS,
+                solo_blocks=8192,
+                pairs=74,
+            ),
+        ),
+        Cell(
+            why="96 rows whose 44 shortest windows exceed one CTA (the map does not apply): "
+            "every row on its own cluster, log-normal ties",
+            spec=dict(
+                rows=96,
+                requests=tuple((140000 + 1000 * r, 4) for r in range(24)),
+                lognormal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+                solo_blocks=8192,
+                pairs=74,
+            ),
+        ),
+        Cell(
+            why="40 rows of equal scores at the one-CTA bound: windows 32766..32769 blocks "
+            "alone and in pairs, the tie class the highest blocks either way",
+            spec=dict(
+                rows=40,
+                pos=tuple(131063 + 4 * (r % 4) for r in range(40)),
+                equal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+                solo_blocks=32768,
+            ),
+        ),
+        Cell(
+            why="a 131072-token engine's 32800-wide table at 80 rows mapped onto 74 clusters "
+            "(one CTA holds 16640 blocks), relu-sum",
+            spec=dict(
+                rows=80,
+                requests=tuple((1000 + 6000 * r, 4) for r in range(20)),
+                relu_sum=True,
+                width=_HALF_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+                solo_blocks=8192,
+                pairs=74,
+            ),
+        ),
     )
 
     note = """
-    Source: this target's CuTe DSL kernel, `cute.compile`d (`--enable-tvm-ffi`) on first call
+    Source: this module's CuTe DSL kernel, `cute.compile`d (`--enable-tvm-ffi`) on first call
     per table width and row stride, k, compress ratio, token budget, index dtypes, PDL and
     cluster size.
 
     Preconditions: zero row starts; `scores` fp32 `[rows, W]`, unit column stride, 16-byte
     aligned rows, `W % 4 == 0`; `topk_indices` int32 `[rows, K]` contiguous; `row_ends` int32
     (each at most `W`), positions and lengths int32 or int64, each a contiguous `[rows]`; the
-    call within `supports` (1..37 rows, 4100 <= W <= 66560). Ties go to the higher block; a
+    call within `supports` (1..37 rows, or up to `max_rows` <= 256 when the caller asks: clusters
+    of 2 past 37 rows; 4100 <= W <= 66560). Ties go to the higher block; a
     negative zero ranks as zero. Limits: rows x row stride below 2^31, positions read as Int32.
+
+    Placement in clusters of 2 (`solo_blocks`, `pairs`; the selection is the same): a row of at
+    most `solo_blocks` blocks (capped at what one CTA holds) is selected by its cluster's first
+    CTA alone; `pairs` P maps up to `MAP_MAX_ROWS` rows onto P clusters, the 2 (rows - P)
+    shortest one a CTA, where they fit one CTA. The map reads every row's end before the PDL
+    wait, as the base launch reads its own row's: the ends must be host-filled (or written
+    before the launch in front released its dependents).
 
     Not certified: NaN scores inside the window (they rank above every finite score).
     """
@@ -659,6 +1043,9 @@ class QsaTopkExpandClusterDecode(OpWrapper):
         compress_ratio,
         token_topk,
         out=None,
+        solo_blocks=0,
+        pairs=0,
+        cowrite=False,
     ):
         return launch(
             scores,
@@ -669,6 +1056,9 @@ class QsaTopkExpandClusterDecode(OpWrapper):
             compress_ratio,
             token_topk,
             out=out,
+            solo_blocks=solo_blocks,
+            pairs=pairs,
+            cowrite=cowrite,
         )
 
     def reference(
@@ -681,8 +1071,13 @@ class QsaTopkExpandClusterDecode(OpWrapper):
         compress_ratio,
         token_topk,
         out=None,
+        solo_blocks=0,
+        pairs=0,
+        cowrite=False,
     ):
-        """`(topk_indices_after, selection)` via a stable descending sort per row; ignores `out`."""
+        """`(topk_indices_after, selection)` via a stable descending sort per row; ignores `out`,
+        the placement knobs (`solo_blocks`, `pairs`) and the write form (`cowrite`), which do not
+        change the result."""
         rows, _ = scores.shape
         k = topk_indices.shape[1]
         device = scores.device
@@ -725,7 +1120,14 @@ class QsaTopkExpandClusterDecode(OpWrapper):
         compress_ratio,
         token_topk,
         out=None,
+        solo_blocks=0,
+        pairs=0,
+        cowrite=False,
     ):
+        assert not cowrite or topk_indices.shape[1] <= _HIST, "cowrite: k <= 4096"
+        assert int(solo_blocks) >= 0 and 0 <= int(pairs) <= MAP_MAX_ROWS, (
+            "solo_blocks >= 0, pairs in 0..MAP_MAX_ROWS"
+        )
         assert scores.dtype == torch.float32 and scores.stride(1) == 1, (
             "fp32 scores, unit column stride"
         )

@@ -8,7 +8,7 @@ Called by the qwen4_exp target's MTP layer at every layout."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -63,6 +63,62 @@ def _geom(hidden, inter, num_experts, top_k, offset=0, local=None):
 #: The MTP draft layer's routed experts: H 2560, I 640, 512 experts, top-10,
 #: every expert local (tp1).
 _CKPT = _geom(2560, 640, 512, 10)
+
+
+#: The trtllm-gen runner instances `tactic=` calls enter, one per routing geometry.
+_PINNED_RUNNERS: dict = {}
+
+
+def _pinned_runner(
+    num_experts, top_k, intermediate_size, local_expert_offset, local_num_experts, clamp
+):
+    """The upstream runner class for one routing geometry (pre-routed, renormalize, no
+    shared or grouped experts), built once."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP8BlockScaleMoERunner
+
+    key = (num_experts, top_k, intermediate_size, local_expert_offset, local_num_experts, clamp)
+    runner = _PINNED_RUNNERS.get(key)
+    if runner is None:
+        runner = FP8BlockScaleMoERunner(
+            num_experts,
+            top_k,
+            None,
+            None,
+            None,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            None,
+            _ROUTING_RENORM,
+            0,
+            gemm1_clamp_limit_value=clamp,
+        )
+        _PINNED_RUNNERS[key] = runner
+    return runner
+
+
+#: `RoutingMethodType.Renormalize`: what the MTP layer passes; inert on the pre-routed path.
+_ROUTING_RENORM = 1
+
+
+def valid_tactics(
+    top_k: int, hidden: int, intermediate_size: int, local_num_experts: int, tokens: int
+) -> list:
+    """The `(token tile, config)` tactics the runner offers for a call of `tokens` rows, as
+    `[tile, config]` lists (host only; the AutoTuner's candidate set)."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP8BlockScaleMoERunner
+
+    runner = FP8BlockScaleMoERunner.runner_dict.get(())
+    if runner is None:
+        runner = FP8BlockScaleMoERunner(
+            512, top_k, None, None, None, intermediate_size, 0, local_num_experts, None, 1, 0
+        ).get_runner()
+    return [
+        list(t)
+        for t in runner.get_valid_configs(
+            top_k, None, hidden, intermediate_size, local_num_experts, tokens
+        )
+    ]
 
 
 def _window(offset: int, local: int = 128) -> dict:
@@ -175,6 +231,17 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
             why="dep8: 8192 rows, a chunk of the group's gathered context rows; window 448",
             spec=dict(tokens=8192, **_window(448, 64)),
         ),
+        # `tactic=`: dep8's draft MoE at 12..24 requests a rank (96..192 gathered rows) enters
+        # the runner on the token tile 16 with config 8 instead of the cold fallback's widest
+        # tile (the target's `_DRAFT_MOE_TACTICS`).
+        Cell(
+            why="dep8 pinned [16, 8]: 96 gathered rows (12 a rank), window 64",
+            spec=dict(tokens=96, tactic=(16, 8), **_window(64, 64)),
+        ),
+        Cell(
+            why="dep8 pinned [16, 8]: 192 gathered rows (24 a rank), window 448",
+            spec=dict(tokens=192, tactic=(16, 8), **_window(448, 64)),
+        ),
     )
 
     note = """
@@ -264,6 +331,15 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
       window       the whole stack; 128 wide at offsets 0, 128, 256 and 384 of 512, 256
                    wide at 0 and 256, 64 wide at 0, 192, 320 and 448
 
+    `tactic` (a `(token tile, config)` pair the runner lists valid for the call's token
+    count, `valid_tactics`) enters the upstream runner at that tactic instead of the
+    AutoTuner (a tuned entry or the cold fallback, the widest valid tile). Every tactic
+    computes the same sums in the same order: bitwise the AutoTuner's call (GB300: all 26
+    valid tactics at 8..192 rows of a 64-expert window, and the pinned [16, 8] at 64..256
+    rows in both the pre-routed and the logits-routed forms). Either form (the NVFP4 target's
+    dep8 draft enters the logits-routed one under `DP_DRAFTPACK_ENV`'s `route`); the AutoTuner is
+    never consulted, so the tactic needs no profiling cache.
+
     Not certified (measured, but not re-driven by the test): a window past the
     routing space's end, repeated or
     out-of-range ids, `gemm1_clamp_limit`, the inert arguments, `output=`, the
@@ -302,7 +378,36 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        tactic: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
+        if tactic is not None:
+            runner = _pinned_runner(
+                num_experts,
+                top_k,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                gemm1_clamp_limit,
+            )
+            out = runner.forward(
+                [
+                    routing_logits,
+                    routing_bias,
+                    hidden_states,
+                    hidden_states_scale,
+                    gemm1_weights,
+                    gemm1_weights_scale,
+                    gemm2_weights,
+                    gemm2_weights_scale,
+                    topk_weights,
+                    topk_ids,
+                ],
+                tactic=list(tactic),
+                output=output,
+            )
+            if output is not None:
+                return torch.empty(0, dtype=torch.bfloat16, device=hidden_states.device)
+            return out
         return torch.ops.trtllm.fp8_block_scale_moe_runner(
             routing_logits,
             routing_bias,
@@ -358,14 +463,15 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        tactic: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """The layer over bit-identical operands, fp32 GEMMs, bf16 store.
 
         Pre-routed only: `routing_logits` must be None. Ignored: `routing_bias`,
         `num_experts`, `top_k`, `num_fused_shared_experts`, `n_group`,
         `topk_group`, `routed_scaling_factor`, `routing_method_type`,
-        `act_type`, `output`, `tune_max_num_tokens`, `use_dp` -- each inert on
-        that path. Returns the `[T, H]` result even when `output` is given.
+        `act_type`, `output`, `tune_max_num_tokens`, `use_dp`, `tactic` -- each
+        inert on that path. Returns the `[T, H]` result even when `output` is given.
         """
         assert routing_logits is None and topk_ids is not None and topk_weights is not None, (
             "the reference models the pre-routed path only"
@@ -421,6 +527,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        tactic: Optional[Sequence[int]] = None,
     ) -> None:
         """Four inputs the op accepts and answers wrongly, each measured.
 
@@ -466,6 +573,23 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
             f"[0, num_experts={num_experts}); num_experts is every routed expert "
             "(512 for a 128-expert window of 512), not the window's count"
         )
+        # A pinned tactic the runner does not list for this token count reads past its
+        # workspaces; both routing forms were measured pinned.
+        if tactic is not None:
+            assert (topk_ids is None) != (routing_logits is None), (
+                "tactic= enters with the router logits or the pre-routed ids, one of them"
+            )
+            listed = valid_tactics(
+                top_k,
+                hidden_states.shape[1],
+                intermediate_size,
+                local_num_experts,
+                hidden_states.shape[0],
+            )
+            assert list(tactic) in listed, (
+                f"tactic {list(tactic)} is not valid at {hidden_states.shape[0]} tokens "
+                f"(valid: {listed})"
+            )
 
 
 fp8_block_scale_moe_runner = Fp8BlockScaleMoeRunner()

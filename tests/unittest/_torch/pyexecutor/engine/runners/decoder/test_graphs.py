@@ -1116,3 +1116,38 @@ def test_split_warmup_skipped_after_break_graph_capture_or_without_room():
     graphs, resource_manager, forwards_small = _split_warmup_graphs(True, max_num_tokens=32)
     graphs._warm_inforward_split(resource_manager)
     assert forwards == [] and forwards_small == []
+
+
+@pytest.mark.cpu_only
+def test_mrope_dummy_slot_fill_skips_rows_that_hold_it(monkeypatch) -> None:
+    """A replay without MRoPE read slots fills the static buffer with the dummy seq slot only
+    where it does not hold it already; a copy of real slots, another dummy slot value, more rows,
+    another buffer or a capture fill again. A skip writes nothing (the sentinel stays)."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    runner = object.__new__(CUDAGraphRunner)
+    runner._mrope_dummy_rows = None
+    buf = torch.zeros(16, dtype=torch.long)
+    fill = runner._fill_mrope_dummy_slots
+
+    fill(buf, 4, 7)
+    assert buf[:4].tolist() == [7] * 4 and int(buf[4]) == 0
+    assert runner._mrope_dummy_rows == (buf.data_ptr(), 7, 4)
+    buf[0] = -1  # a sentinel no real fill leaves
+    fill(buf, 4, 7)  # the rows hold the slot: skipped
+    fill(buf, 2, 7)  # fewer rows: skipped
+    assert int(buf[0]) == -1
+    fill(buf, 8, 7)  # more rows: filled
+    assert buf[:8].tolist() == [7] * 8
+    buf[0] = -1
+    runner._mrope_dummy_rows = None  # what replay()'s copy of real slots does
+    fill(buf, 4, 7)
+    assert buf[:4].tolist() == [7] * 4
+    fill(buf, 4, 9)  # another dummy slot value
+    assert buf[:4].tolist() == [9] * 4
+    other = torch.zeros(16, dtype=torch.long)
+    fill(other, 4, 9)  # another buffer
+    assert other[:4].tolist() == [9] * 4 and runner._mrope_dummy_rows[0] == other.data_ptr()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    other[0] = -1
+    fill(other, 4, 9)  # a capture always fills
+    assert int(other[0]) == 9

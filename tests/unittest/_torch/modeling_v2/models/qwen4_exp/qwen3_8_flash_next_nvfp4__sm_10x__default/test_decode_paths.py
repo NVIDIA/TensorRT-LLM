@@ -257,6 +257,8 @@ def _gdn_block(layer, x, si, int_idx, conv0, win0, p, captured, monkeypatch):
         head_v_dim=V,
         in_proj_split=(CONV, VD, HV, HV),
         decode_in_mm=cublas_mm,
+        # The kernel's own replay launch mapping (`DP_GDN_REPLAY_MAP_ENV` off).
+        gdn_replay_map=False,
         _bound=types.SimpleNamespace(
             pools=types.SimpleNamespace(
                 conv={0: conv0.clone()}, ssm={0: torch.zeros(1, dtype=BF16, device=DEV)}
@@ -274,7 +276,8 @@ def _gdn_block(layer, x, si, int_idx, conv0, win0, p, captured, monkeypatch):
     )
     target = object.__new__(M.DecodeTarget)
     target.core = core
-    target._gdn_epilogue = lambda out, z, L, num_tokens: z.clone()
+    # The verify step passes `normed` (whether the replay wrote the gated norm) positionally.
+    target._gdn_epilogue = lambda out, z, L, num_tokens, normed=False: z.clone()
     verify = (int_idx, None, None, False, None)
     z = target._gdn_block(x, 0, layer, si, verify, p, captured=captured)
     pools = core._bound.pools

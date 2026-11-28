@@ -95,7 +95,15 @@ def _weights(hidden: int, inter: int, experts: int, seed: int):
 
 
 def _args(
-    tokens, hidden, inter, num_experts, top_k, local_expert_offset=0, local_num_experts=None, seed=0
+    tokens,
+    hidden,
+    inter,
+    num_experts,
+    top_k,
+    local_expert_offset=0,
+    local_num_experts=None,
+    seed=0,
+    tactic=None,
 ):
     """The op's arguments by name, pre-routed over all `num_experts`.
 
@@ -138,6 +146,7 @@ def _args(
         topk_weights=weights.to(torch.bfloat16).contiguous(),
         topk_ids=ids.contiguous(),
         gemm1_clamp_limit=None,
+        **({} if tactic is None else dict(tactic=tactic)),
     )
 
 
@@ -292,6 +301,53 @@ def test_autotuned_tactic_matches_the_fallback_tactic(offset, local):
         _compare(warm, op.reference(**a))
     finally:
         AutoTuner.get().clear_cache()
+
+
+@pytest.mark.parametrize("tokens", [64, 96, 112, 160, 192, 256])
+def test_pinned_tactic_is_bitwise_the_autotuner_call(tokens):
+    """`tactic=` moves the tile, not the sums: every tactic the runner lists for a dep8
+    window's call is bitwise the AutoTuner's cold call (the target pins [16, 8] at 96..192
+    gathered rows, `_DRAFT_MOE_TACTICS`)."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+        valid_tactics,
+    )
+
+    a = _args(tokens, **CKPT, local_expert_offset=192, local_num_experts=64, seed=7)
+    AutoTuner.get().clear_cache()
+    cold = op(**a)
+    listed = valid_tactics(10, 2560, 640, 64, tokens)
+    assert listed, "the runner lists no tactic"
+    if 96 <= tokens <= 192:
+        assert [16, 8] in listed, f"the target's pinned tactic is not valid at {tokens}"
+    for tactic in listed:
+        with validating(op):
+            pinned = op(**dict(a, tactic=tuple(tactic)))
+        assert torch.equal(pinned, cold), f"tactic {tactic} at {tokens} rows changed the result"
+
+
+@pytest.mark.parametrize("tokens", [24, 96, 112, 192])
+def test_logits_routed_is_bitwise_renorm_then_prerouted(tokens):
+    """The runner's own Renormalize routing from the bf16 router logits is bitwise
+    `renorm_moe_routing_op` + the pre-routed entry over a dep8 window, at the AutoTuner's tactic
+    and at the pinned [16, 8] (the NVFP4 target's draft MoE under `DP_DRAFTPACK_ENV`'s `route`:
+    dep8 draft passes gather 24..224 rows)."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+        renorm_moe_routing_op,
+    )
+
+    a = _args(tokens, **CKPT, local_expert_offset=192, local_num_experts=64, seed=11)
+    g = torch.Generator(device=DEV).manual_seed(tokens)
+    logits = torch.randn(tokens, 512, device=DEV, generator=g).to(torch.bfloat16)
+    ids, weights = renorm_moe_routing_op(logits, topk=10, output_dtype=torch.bfloat16)
+    pre = dict(a, topk_ids=ids.contiguous(), topk_weights=weights.contiguous())
+    own = dict(a, routing_logits=logits, topk_ids=None, topk_weights=None)
+    for tactic in [None] + ([(16, 8)] if 96 <= tokens <= 192 else []):
+        pinned = {} if tactic is None else dict(tactic=tactic)
+        want = op(**pre, **pinned)
+        with validating(op):
+            got = op(**own, **pinned)
+        assert torch.equal(got, want), f"{tokens} rows, tactic {tactic}: the routing differs"
 
 
 # ── the guards ────────────────────────────────────────────────────────────

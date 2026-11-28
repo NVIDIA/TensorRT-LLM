@@ -54,11 +54,12 @@ def _build(m, n, k, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     certifying(op)
     s = cell.spec
-    assert plan(s["m"], s["n"], s["k"]).kind == s["kind"], plan(s["m"], s["n"], s["k"])
+    picked = plan(s["m"], s["n"], s["k"], s["wide"])
+    assert picked.kind == s["kind"], picked
     mat_a, mat_b = _build(s["m"], s["n"], s["k"], seed=zlib.crc32(cell.why.encode()) % 2**31)
-    out = op(mat_a, mat_b, s["pdl"])
+    out = op(mat_a, mat_b, s["pdl"], s["wide"])
     assert out.shape == (s["m"], s["n"]) and out.dtype == torch.bfloat16 and out.is_contiguous()
-    _compare(out, op.reference(mat_a, mat_b, s["pdl"]))
+    _compare(out, op.reference(mat_a, mat_b, s["pdl"], s["wide"]))
 
 
 #: `(M, N, K, branch)` of the table's shapes and M buckets the cells do not drive:
@@ -106,6 +107,61 @@ def test_plan_pins_the_branch_of_the_other_table_shapes() -> None:
     picked = [(m, n, k, want, plan(m, n, k).kind) for m, n, k, want in _PLAN_PINS]
     wrong = [p for p in picked if p[3] != p[4]]
     assert not wrong, f"(M, N, K, pinned, picked): {wrong}"
+
+
+#: `(M, N, K, wide, branch)`: the rows `wide` adds and those it leaves alone.
+_WIDE_PINS = (
+    (12, 4120, 2560, 1, "splitk"),
+    (16, 4352, 2560, 1, "splitk"),
+    (9, 2560, 1536, 1, "splitk"),
+    (17, 4352, 2560, 1, "cublas"),  # past WIDE_MAX_ROWS
+    (12, 2560, 2560, 1, "cublas"),  # not in _WIDE: wide 1 adds no default tactic
+    (4, 4352, 2560, 1, "splitk"),  # the table's own row first
+    (2, 4352, 2560, 1, "direct"),
+    (12, 10240, 2560, 0, "cublas"),
+    (17, 2560, 640, 2, "cublas"),
+    (4, 1296, 2560, 2, "splitk"),  # _WIDE_DEFAULT_FIRST: ahead of the table's direct row
+    (8, 1280, 2560, 2, "splitk"),
+    (4, 1296, 2560, 1, "direct"),  # wide 0 / 1 keep the table's row
+    (17, 1296, 2560, 2, "cublas"),
+)
+
+
+def test_plan_wide_2_runs_the_shared_gate_up_on_the_default_tactic() -> None:
+    """The measured form: split-K's own default tactic, not the table's (64, 8, 4, 10) row."""
+    from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as fi_splitk
+
+    for m in (4, 8, 12, 16):
+        picked = plan(m, 1296, 2560, 2)
+        assert picked.kind == "splitk", m
+        assert picked.tactic == fi_splitk.default_tactic(m, 1296, 2560), m
+
+
+def test_plan_wide_2_falls_back_to_cublas_when_split_k_refuses(monkeypatch) -> None:
+    """`wide` 2 at an unlisted shape of up to `WIDE_MAX_ROWS` rows tries split-K's default
+    tactic; when split-K refuses the shape, `plan` keeps it on cuBLAS."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm import low_m_bf16_mm as mod
+
+    shape = (2560, 640)  # the shared expert's down projection: in no table
+    assert shape not in mod._TABLE and shape not in mod._WIDE
+    assert shape not in mod._WIDE_DEFAULT_FIRST
+
+    def refuse(*args, **kwargs):
+        raise ValueError("split-K refused the shape")
+
+    plan.cache_clear()
+    try:
+        monkeypatch.setattr(mod._fi_splitk, "validate_tactic", refuse)
+        for m in (1, 12, mod.WIDE_MAX_ROWS):
+            assert plan(m, *shape, 2).kind == "cublas", m
+    finally:
+        plan.cache_clear()
+
+
+def test_plan_pins_the_wide_rows() -> None:
+    picked = [(m, n, k, w, want, plan(m, n, k, w).kind) for m, n, k, w, want in _WIDE_PINS]
+    wrong = [p for p in picked if p[4] != p[5]]
+    assert not wrong, f"(M, N, K, wide, pinned, picked): {wrong}"
 
 
 def test_graph_replay_after_warmup() -> None:

@@ -427,14 +427,28 @@ class GroupShardedVerify:
 
     @classmethod
     def create(
-        cls, mapping: Mapping, weight: torch.Tensor, group_size: int, max_rows: int
+        cls,
+        mapping: Mapping,
+        weight: torch.Tensor,
+        group_size: int,
+        max_rows: int,
+        transport: Optional[PeerTransport] = PeerTransport.IPC,
     ) -> Optional["GroupShardedVerify"]:
         """The sampler of this rank's group of ``group_size`` consecutive attention-DP ranks, or None where the group is
-        unsupported (the same answer on every rank). Collective over the attention-DP group."""
+        unsupported (the same answer on every rank). Collective over the attention-DP group.
+
+        ``transport``: how the members map each other's buffers. IPC (the default) needs a node-local group; None lets
+        the peer buffers pick, so a group of every attention-DP rank may also span the nodes of one NVLink domain
+        (MNNVL)."""
+        spans_nodes = group_size > mapping.gpus_per_node
         if (
             group_size not in (2, 4, 8)
             or mapping.tp_size % group_size
-            or mapping.gpus_per_node % group_size
+            or (
+                (transport is PeerTransport.IPC or group_size != mapping.tp_size)
+                if spans_nodes
+                else mapping.gpus_per_node % group_size
+            )
             or mapping.world_size != mapping.tp_size
             or weight.shape[0] % group_size
             or weight.shape[0] >= _NO_INDEX
@@ -451,7 +465,7 @@ class GroupShardedVerify:
             pp_size=mapping.world_size // group_size,
         )
         nbytes = cls.buffer_layout(group_size, max_rows, weight.shape[1])["end"]
-        buffers = PeerBuffers.create(group, nbytes, transport=PeerTransport.IPC)
+        buffers = PeerBuffers.create(group, nbytes, transport=transport)
         if buffers is None:
             return None
         return cls(group, weight, max_rows, buffers)

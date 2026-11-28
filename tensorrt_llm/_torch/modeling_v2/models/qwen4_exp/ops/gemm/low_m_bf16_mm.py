@@ -106,9 +106,41 @@ _TABLE: dict[tuple[int, int], tuple[tuple[int, tuple], ...]] = {
 # bf16 only) and its up projection [10240, 320] (K=320 tiles neither kernel).
 
 
+#: Rows a caller may move off cuBLAS on request (`wide`), past `_TABLE`'s bounds: a tep4 rank's
+#: decode projections at 9-16 rows (three or four requests of four verify rows), on split-K with
+#: the tactic measured at 16 rows (GB300, graph replay, PDL on; micro, -0.08 ms a step at
+#: 3-4 requests with the rest of its set). Same precision as every branch; asked for because those
+#: rows ran on cuBLAS before (another summation order).
+WIDE_MAX_ROWS = 16
+_WIDE: dict[tuple[int, int], tuple[tuple[int, tuple], ...]] = {
+    (4120, 2560): ((16, _s(64, 16, 2, 9)),),  # GDN in_proj at a tp4/tep4 rank
+    (4352, 2560): ((16, _s(64, 16, 2, 9)),),  # attention input at a tp4/tep4 rank
+    (2560, 1536): ((16, _s(64, 16, 2, 8)),),  # attention o / GDN out at a tp4/tep4 rank
+}
+
+
+#: Shapes `wide` 2 runs on split-K's own default tactic at every row up to `WIDE_MAX_ROWS`, ahead
+#: of `_TABLE`'s rows: the shared expert's gate|up (with or without its gate row), the shape a
+#: tep4 rank's measured shared expert ran that way at 4..16 rows (GB300 tep4, against cuBLAS:
+#: -0.037 / -0.073 / -0.013 / -0.047 ms a step at 1-4 requests). The table's own rows for it
+#: (direct at <= 4 rows, split-K (64, 8, 4, 10) at <= 8) were not measured in a step.
+_WIDE_DEFAULT_FIRST = frozenset({(1280, 2560), (1296, 2560)})
+
+
 @functools.lru_cache(maxsize=None)
-def plan(m: int, n: int, k: int) -> _Plan:
-    """The kernel and tactic `LowMBf16Mm` launches for an [M, K] x [K, N] product."""
+def plan(m: int, n: int, k: int, wide: int = 0) -> _Plan:
+    """The kernel and tactic `LowMBf16Mm` launches for an [M, K] x [K, N] product. `wide` 1 adds
+    `_WIDE`'s rows past the table; 2 also runs any other shape of up to `WIDE_MAX_ROWS` rows on
+    split-K's own default tactic where that tactic takes it (the shared expert, the PLE
+    projections), cuBLAS where it does not, and `_WIDE_DEFAULT_FIRST`'s shapes on that tactic
+    ahead of the table."""
+    if wide == 2 and (n, k) in _WIDE_DEFAULT_FIRST and m <= WIDE_MAX_ROWS:
+        try:
+            t = _fi_splitk.default_tactic(m, n, k)
+            _fi_splitk.validate_tactic(t, m, n, k)
+            return _Plan("splitk", t)
+        except Exception:  # noqa: BLE001 — a refused shape takes the table's rows below
+            pass
     for bound, choice in _TABLE.get((n, k), ()):
         if m <= bound:
             if choice[0] == "direct":
@@ -119,12 +151,24 @@ def plan(m: int, n: int, k: int) -> _Plan:
                 return _Plan("direct", tuple(choice[1:]) + (t.rows_per_block,))
             _fi_splitk.validate_tactic(_fi_splitk.SplitKTactic(*choice[1:]), m, n, k)
             return _Plan("splitk", tuple(choice[1:]))
+    if wide and m <= WIDE_MAX_ROWS:
+        for bound, choice in _WIDE.get((n, k), ()):
+            if m <= bound:
+                _fi_splitk.validate_tactic(_fi_splitk.SplitKTactic(*choice[1:]), m, n, k)
+                return _Plan("splitk", tuple(choice[1:]))
+        if wide == 2 and (n, k) not in _WIDE:
+            try:
+                t = _fi_splitk.default_tactic(m, n, k)
+                _fi_splitk.validate_tactic(t, m, n, k)
+            except Exception:  # noqa: BLE001 — any refusal of the shape keeps it on cuBLAS
+                return _Plan("cublas")
+            return _Plan("splitk", t)
     return _Plan("cublas")
 
 
-def _cell(why: str, m: int, n: int, k: int, kind: str, pdl: bool = False) -> Cell:
+def _cell(why: str, m: int, n: int, k: int, kind: str, pdl: bool = False, wide: int = 0) -> Cell:
     """`kind` is the branch `plan` must pick for this shape; the test holds it to that."""
-    return Cell(why=why, spec=dict(m=m, n=n, k=k, kind=kind, pdl=pdl))
+    return Cell(why=why, spec=dict(m=m, n=n, k=k, kind=kind, pdl=pdl, wide=wide))
 
 
 class LowMBf16Mm(OpWrapper):
@@ -186,6 +230,42 @@ class LowMBf16Mm(OpWrapper):
             "tp4 o / GDN out M=8 (2 requests): split-K 3-way, pdl on", 8, 2560, 1536, "splitk", True
         ),
         _cell("router M=1: one decode token, direct 2-row tile", 1, 512, 2560, "direct", True),
+        _cell(
+            "tep4 attention in M=16 (4 requests), wide 1: split-K, mma_n 16, pdl on",
+            16,
+            4352,
+            2560,
+            "splitk",
+            True,
+            wide=1,
+        ),
+        _cell(
+            "tep4 o / GDN out M=12 (3 requests), wide 1: split-K, mma_n 16, pdl on",
+            12,
+            2560,
+            1536,
+            "splitk",
+            True,
+            wide=1,
+        ),
+        _cell(
+            "tep4 shared expert gate|up M=4, wide 2: split-K default tactic ahead of the table",
+            4,
+            1296,
+            2560,
+            "splitk",
+            True,
+            wide=2,
+        ),
+        _cell(
+            "tep4 shared expert down M=16, wide 2: split-K default tactic, pdl on",
+            16,
+            2560,
+            640,
+            "splitk",
+            True,
+            wide=2,
+        ),
         _cell("router M=64: cuBLAS branch above M=32", 64, 512, 2560, "cublas", True),
     )
 
@@ -214,10 +294,12 @@ class LowMBf16Mm(OpWrapper):
       N*K  largest FlashInfer-branch weight 16480*2560 = 4.2e7 elements  boundary 2^31  not probed (48x below it)
     """
 
-    def __call__(self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = False) -> torch.Tensor:
+    def __call__(
+        self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = False, wide: int = 0
+    ) -> torch.Tensor:
         m, k = mat_a.shape
         n = mat_b.shape[1]
-        p = plan(m, n, k)
+        p = plan(m, n, k, wide)
         # `TRTLLM_ENABLE_PDL=0` turns programmatic dependent launch off, as for every PDL op.
         pdl = bool(pdl and get_env_enable_pdl())
         if p.kind == "direct":
@@ -227,19 +309,23 @@ class LowMBf16Mm(OpWrapper):
             )
         if p.kind == "splitk":
             out = torch.empty((m, n), dtype=mat_a.dtype, device=mat_a.device)
-            return _fi_splitk.run_splitk_dense(
-                mat_a, mat_b, None, out, pdl, _fi_splitk.SplitKTactic(*p.tactic)
-            )
+            tactic = p.tactic
+            if not isinstance(tactic, _fi_splitk.SplitKTactic):
+                tactic = _fi_splitk.SplitKTactic(*tactic)
+            return _fi_splitk.run_splitk_dense(mat_a, mat_b, None, out, pdl, tactic)
         return torch.ops.trtllm.cublas_mm(mat_a, mat_b, None, None, 0, None)
 
     def reference(
-        self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = False
+        self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = False, wide: int = 0
     ) -> torch.Tensor:
-        """fp32-accumulated, TF32 off; `pdl` is a launch attribute and is ignored."""
+        """fp32-accumulated, TF32 off; `pdl` is a launch attribute and `wide` a branch choice,
+        both ignored."""
         with true_fp32_matmul():
             return (mat_a.float() @ mat_b.float()).to(mat_a.dtype)
 
-    def is_valid(self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = False) -> None:
+    def is_valid(
+        self, mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool = False, wide: int = 0
+    ) -> None:
         # The cuBLAS branch ignores both leading dimensions: a row-padded
         # mat_a or a column-padded mat_b (a slice of a wider tensor) is read as
         # if dense -- silently a different product. The FlashInfer branches

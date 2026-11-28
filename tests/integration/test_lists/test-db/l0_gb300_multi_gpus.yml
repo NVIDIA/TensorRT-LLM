@@ -46,17 +46,36 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_push_cells.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_core_allreduce.py
   # qwen4_exp target, post-merge: three drafts over quantized KV -- NVFP4 KV at tp4 with the
-  # breakable prefill graph, FP8 KV at dep4 (MTP under attention DP), FP8 KV at tep4 on
-  # FlashInfer's ring replay, NVFP4 KV at tep4 without block reuse -- and dep2 context and
-  # generation engines on one node. tep4 over bf16 KV runs pre-merge (l0_gb300); mmmu runs in
-  # QA (llm_function_core).
+  # breakable prefill graph, FP8 KV at dep4 (MTP under attention DP; once more on the Lamport
+  # MoE round trip, once with host-indexed slots and the router front, once with every opt-in
+  # attention-DP decode form of the dep follow-ups, once with every opt-in attention-DP form
+  # together), FP8 KV at tep4 on FlashInfer's ring replay (and once more with the fused MoE
+  # finalize all-reduce, once with every opt-in tep4 form), NVFP4 KV at tep4 without block reuse
+  # -- and dep2 context and generation engines on one node. tep4 over bf16 KV runs pre-merge
+  # (l0_gb300); mmmu runs in QA (llm_function_core).
   # GLM-5.3-Flash FP8 modeling_v2 target on a GB300 tray: GSM8K with MTP-3, its acceptance length and the metadata
   # contract.
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k_mtp3
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_lamport] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_lamport_step_router_front] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_out_proj_bf16] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_opt_in] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_fuse] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_rows] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_front_stack] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_dep4_gdn_lean_replay_matches_stock TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_nvfp4_kv_no_reuse] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_finar] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_opt_in] TIMEOUT (60)
+  # qwen4_exp target, post-merge: FP8 KV at dep4 on the opt-in, lossy e4m3 QSA index anchors
+  # alone (TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1), apart from the stack cases that also set them.
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_index_key_fp8] TIMEOUT (60)
+  # qwen4_exp target, post-merge: FP8 KV at dep4 on the opt-in bitmap-union verify GQA with both
+  # opt-in attention-DP row ranges (another summation order), apart from the stack cases.
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_bitmap] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_disaggregated_dep2 TIMEOUT (90)
   # qwen4_exp FP8 target, post-merge: dep4 MTP3, dep2 disaggregated.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[dep4] TIMEOUT (60)
