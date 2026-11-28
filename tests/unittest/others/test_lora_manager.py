@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -140,6 +141,68 @@ def _create_dummy_hf_moe_lora_adapter(
         )
 
     save_file(weights, str(adapter_dir / "adapter_model.safetensors"))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "dtype,is_moe,use_dora",
+    [(torch.float16, False, True)]
+    + [
+        (dtype, is_moe, use_dora)
+        for dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        for is_moe in (False, True)
+        for use_dora in (False, None)
+    ],
+)
+def test_dora_is_rejected(
+    tmp_path: Path, dtype: torch.dtype, is_moe: bool, use_dora: bool | None
+) -> None:
+    """Reject DoRA metadata or magnitude weights before touching CUDA or registering an adapter."""
+    if is_moe:
+        _create_dummy_hf_moe_lora_adapter(tmp_path, dtype=dtype)
+        model_config = MockModelConfig(
+            lora_target_modules=["moe_h_to_4h"],
+            trtllm_modules_to_hf_modules={"moe_h_to_4h": "mlp.experts.gate_proj"},
+        )
+        weights_path = tmp_path / "adapter_model.safetensors"
+        weights = load_file(str(weights_path))
+        prefix = "base_model.model.model.layers.0.mlp.experts.0.gate_proj"
+        weights[f"{prefix}.lora_magnitude_vector"] = torch.ones(128)
+        save_file(weights, str(weights_path))
+    else:
+        _create_dummy_hf_lora_adapter(tmp_path, dtype=dtype, use_dora=True)
+        model_config = MockModelConfig()
+
+    config_path = tmp_path / "adapter_config.json"
+    config = json.loads(config_path.read_text())
+    if use_dora is None:
+        config.pop("use_dora", None)
+    else:
+        config["use_dora"] = use_dora
+    config_path.write_text(json.dumps(config))
+    if use_dora:
+        # The configuration alone must suffice, even without checkpoint weights.
+        (tmp_path / "adapter_model.safetensors").unlink()
+
+    manager = LoraManager(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        model_config=model_config,
+        cpp_peft_cache_manager=MagicMock(),
+    )
+    with (
+        patch.object(torch.Tensor, "cuda") as transfer,
+        patch.object(torch.cuda, "get_device_capability") as capability,
+        pytest.raises(NotImplementedError, match="DoRA adapters are not supported"),
+    ):
+        manager.load_from_hf([str(tmp_path)], model_config, uids=["dora"])
+
+    transfer.assert_not_called()
+    capability.assert_not_called()
+    assert manager.num_lora_adapters == 0
+    assert not manager.cpp_lora_weights
+    assert not manager.cpp_lora_config
+    assert not manager.lora_weights
+    assert not manager.lora_weights_pointers_list
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -258,35 +321,6 @@ class TestLoraManagerFp8(unittest.TestCase):
             loader = HfLoraLoader([str(adapter_dir)])
 
         self.assertEqual(loader.get_lora_dtype(), torch.float8_e4m3fn)
-
-    def test_fp8_dora_is_rejected(self):
-        model_config = MockModelConfig()
-        manager = LoraManager(
-            mapping=Mapping(world_size=1, rank=0, tp_size=1),
-            model_config=model_config,
-            cpp_peft_cache_manager=MagicMock(),
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            adapter_dir = Path(tmpdir) / "adapter"
-            adapter_dir.mkdir()
-            _create_dummy_hf_lora_adapter(
-                adapter_dir,
-                rank=16,
-                num_layers=1,
-                dtype=torch.float8_e4m3fn,
-                use_dora=True,
-            )
-
-            with self.assertRaisesRegex(
-                NotImplementedError,
-                "DoRA is not supported with FP8 LoRA weights on SM90/SM100",
-            ):
-                manager.load_from_hf(
-                    model_dirs=[str(adapter_dir)],
-                    model_config=model_config,
-                    uids=["fp8-dora"],
-                )
 
     def test_fp8_moe_weights_remain_fp8(self):
         model_config = MockModelConfig(
