@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -4952,6 +4953,69 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             assert_acceptance_length("TestGPTOSS::test_dflash",
                                      acceptance_length)
 
+    @pytest.mark.parametrize(
+        "v2_kv_cache,ep_size,moe_kwargs,kv_cache_dtype,gpqa_score,accepts_score",
+        [
+            (False, 1, {
+                "tactic": "cutlass"
+            }, "auto", 50.0, True),
+            (False, 1, {
+                "tactic": "cutlass"
+            }, "auto", 45.0, False),
+            (True, 1, {
+                "tactic": "cutlass"
+            }, "auto", 50.0, False),
+            (False, 4, {
+                "tactic": "cutlass"
+            }, "auto", 50.0, False),
+            (False, 1, {
+                "tactic": "trtllm_gen"
+            }, "auto", 50.0, False),
+            (False, 1, {
+                "backend": "TRITON"
+            }, "auto", 50.0, False),
+            (False, 1, {
+                "tactic": "cutlass"
+            }, "fp8", 50.0, False),
+        ],
+        ids=[
+            "target", "target-low-score", "v2-cache", "expert-parallel",
+            "other-tactic", "backend", "fp8-cache"
+        ])
+    def test_w4_gpqa_tolerance_scope(self, v2_kv_cache, ep_size, moe_kwargs,
+                                     kv_cache_dtype, gpqa_score, accepts_score,
+                                     mocker):
+        llm = mocker.MagicMock()
+        llm.__enter__.return_value = llm
+        llm.args.speculative_config = None
+        llm.args.dtype = "auto"
+        llm.args.quant_config.quant_algo = None
+        llm.args.quant_config.kv_cache_quant_algo = None
+        llm.tokenizer.get_chat_template.return_value = '{{ strftime_now("%Y-%m-%d") }}'
+        mocker.patch(f"{__name__}.LLM", return_value=llm)
+        mocker.patch.dict(os.environ, {"INTEGRATION_TEST": "0"})
+        references = mocker.Mock(spec=dict)
+        references.get.return_value = [{"accuracy": 60.0}]
+        mocker.patch("yaml.safe_load", return_value=references)
+        gsm8k_evaluator = mocker.patch.object(GSM8K, "EVALUATOR_CLS")
+        gsm8k_evaluator.return_value.evaluate.return_value = 60.0
+        gpqa_evaluator = mocker.patch.object(GPQADiamond, "EVALUATOR_CLS")
+        gpqa_evaluator.return_value.evaluate.return_value = gpqa_score
+        expectation = (nullcontext() if accepts_score else pytest.raises(
+            AssertionError, match="Reference accuracy"))
+        with expectation:
+            self.test_w4_4gpus(v2_kv_cache=v2_kv_cache,
+                               kv_cache_reuse=True,
+                               kv_cache_dtype=kv_cache_dtype,
+                               moe_kwargs=moe_kwargs,
+                               tp_size=4,
+                               pp_size=1,
+                               ep_size=ep_size,
+                               attention_dp=False,
+                               cuda_graph=True,
+                               overlap_scheduler=True,
+                               mocker=mocker)
+
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
@@ -4981,6 +5045,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+        if (not v2_kv_cache and ep_size == 1
+                and moe_kwargs.get("tactic") == "cutlass"
+                and kv_cache_dtype == "auto"):
+            mocker.patch.object(GPQADiamond, "ALPHA", 0.01)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
