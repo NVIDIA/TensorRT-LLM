@@ -2063,3 +2063,78 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     )[0]
     assert y.shape == (spec["tokens"], hidden), y.shape
     _compare(y, entry_ref.to(torch.bfloat16))
+
+
+# The (width, offset) windows a DeepSeek-R1 rank runs its gathered or received rows over
+# under attention DP: 64 and 32 of 256 experts at dep4 and dep8 (allgather), 72 and 36 of
+# 288 EPLB slots there, 16 of 256 at dep16 and 9 of 288 at dep32 (alltoall).
+_WIDE_WINDOWS = ((64, 0), (32, 96), (72, 216), (36, 36), (16, 32), (9, 63))
+#: Rows a rank receives at dep32 from ranks that each send 8192: the widest call the
+#: DeepSeek-R1 target issues (`_MOE_MAX_T`).
+WIDE_TOKENS = 32 * 8192
+
+
+def _alltoall_rows(num_tokens, num_experts, off, num_local, gen):
+    """Pre-routed rows as an alltoall delivers them to one rank: 40% hold a token with at
+    least one slot in the window, the rest are padding with every slot `-1`. A gathered
+    batch is the same with fewer padding rows; the kernel sees ids either way."""
+    ids = torch.rand(num_tokens, num_experts, device=DEV, generator=gen).topk(8, dim=1).indices
+    ids = ids.to(torch.int32)
+    valid = torch.rand(num_tokens, device=DEV, generator=gen) < 0.4
+    own = torch.randint(0, num_local, (int(valid.sum()),), device=DEV, generator=gen)
+    ids[valid, 0] = (off + own).to(torch.int32)
+    ids[~valid] = -1
+    wts = torch.rand(num_tokens, 8, device=DEV, generator=gen).to(torch.bfloat16)
+    return ids, wts
+
+
+@pytest.mark.parametrize("num_tokens", [16384, WIDE_TOKENS])
+@pytest.mark.parametrize("window", _WIDE_WINDOWS, ids=lambda w: f"{w[0]}at{w[1]}")
+def test_wide_calls_match_their_chunks(window, num_tokens):
+    """Calls past 8192 rows at the R1 geometry, over every attention-DP window of the target.
+
+    Above 8192 rows the kernel takes another permutation path, so a wide call is certified
+    against the certified column itself: bitwise equal to the same rows run 8192 at a time
+    into one output, the way the DeepSeek-R1 target chunked them. At 16384 rows it is also
+    held to the fp32 reference. Rows are independent through routing, quantization, the
+    expert GEMMs and finalize, so equality to the chunks is the whole contract.
+    """
+    num_local, off = window
+    num_experts = max(256, off + num_local)
+    args, ref = _dsr1()
+    win_args, win_ref = _window_args(args, 0, num_local), _window_ref(ref, 0, num_local)
+    gen = torch.Generator(device=DEV).manual_seed(num_tokens + num_local)
+    g1 = 137.0
+    data, sf, x = _rand_activation(num_tokens, 7168, g1, gen)
+    ids, wts = _alltoall_rows(num_tokens, num_experts, off, num_local, gen)
+    g2 = _calibrate_g2(x, torch.where(ids >= 0, ids - off, ids), win_ref)
+    s1, sg, s2 = _scalars(num_local, g1, g2)
+    kw = dict(
+        topk_weights=wts,
+        local_expert_offset=off,
+        local_num_experts=num_local,
+        output1_scale_scalar=s1,
+        output1_scale_gate_scalar=sg,
+        output2_scale_scalar=s2,
+        **win_args,
+    )
+    wide = _call(data, sf, win_args, num_experts, 8, topk_ids=ids, **kw)[0]
+
+    chunked = torch.empty_like(wide)
+    sf_rows = sf.view(num_tokens, -1)
+    for s in range(0, num_tokens, 8192):
+        e = s + 8192
+        _call(
+            data[s:e].contiguous(),
+            sf_rows[s:e].reshape(-1),
+            win_args,
+            num_experts,
+            8,
+            topk_ids=ids[s:e].contiguous(),
+            output=chunked[s:e],
+            **dict(kw, topk_weights=wts[s:e].contiguous()),
+        )
+    assert torch.equal(wide, chunked), "a wide call differs from its 8192-row chunks"
+    if num_tokens <= 16384:
+        exp = _ref_moe(x, ids, wts, win_ref, g2, offset=off, num_local=num_local)
+        _assert_moe_close(wide, exp.to(torch.bfloat16))
