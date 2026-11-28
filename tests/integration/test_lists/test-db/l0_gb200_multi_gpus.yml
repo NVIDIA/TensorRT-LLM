@@ -21,6 +21,7 @@ l0_gb200_multi_gpus:
   - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/multi_gpu/test_deterministic_allreduce.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
