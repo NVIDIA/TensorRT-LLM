@@ -158,3 +158,5 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
+
+.. Test only: check workflow approval for CodeRabbit-triggered runs (do not merge).
