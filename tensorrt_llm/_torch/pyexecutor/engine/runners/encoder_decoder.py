@@ -996,6 +996,7 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
                     request.py_batch_idx,
                     request._cached_tokens,
                     request._cached_tokens_set,
+                    request._reported_cached_tokens,
                 )
             )
             request.py_encoder_output = torch.ones(
@@ -1039,6 +1040,7 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
             batch_idx,
             cached_tokens,
             cached_tokens_set,
+            reported_cached_tokens,
         ) in saved_request_state:
             request.py_encoder_output = encoder_output
             request.py_skip_cross_kv_projection = skip_cross_kv_projection
@@ -1048,6 +1050,7 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
             request.py_batch_idx = batch_idx
             request._cached_tokens = cached_tokens
             request._cached_tokens_set = cached_tokens_set
+            request._reported_cached_tokens = reported_cached_tokens
 
     def _capture_additional_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm and capture reachable mixed encoder-decoder graph shapes.
