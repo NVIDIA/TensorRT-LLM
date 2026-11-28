@@ -45,6 +45,7 @@ from .beam_search import (
     BeamHistoryBuilder,
     BeamSearchHandler,
     BeamSearchParams,
+    BeamSearchRelayState,
     BeamSearchStep,
     BeamSearchStore,
     PendingBeamHistories,
@@ -279,6 +280,21 @@ class Sampler(ABC, Generic[GenericSampleState]):
     ) -> None:
         raise NotImplementedError
 
+    def prepare_pp_relay(self, state: GenericSampleState) -> None:
+        """Complete ``state.host`` before it is handed to the other pipeline-parallel ranks.
+
+        Called on the last pipeline-parallel rank, which is the only one that
+        samples, after ``state.sampler_event`` has completed and before the
+        state reaches any ``update_requests``. Those ranks only receive
+        ``state.host``.
+
+        This hook may run on the PP relay thread. The executor propagates
+        preparation errors to every pipeline rank.
+
+        Args:
+            state: A state this sampler's ``sample_async`` returned.
+        """
+
     @staticmethod
     def beam_width(requests: Iterable[LlmRequest]) -> int:
         for req in requests:
@@ -329,8 +345,12 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
     """Whether `new_tokens` uses the compact `(num_requests,)` layout instead of
     `[step, slot, beam]`. Describes these host tensors, so it must live here rather
     than on `SampleStateTorch`: under pipeline parallelism only this object crosses
-    the ring hand-off, and a receiving rank would otherwise pair the compact buffer
+    the PP relay, and a receiving rank would otherwise pair the compact buffer
     with an outer flag left at its default."""
+    beam_relay: BeamSearchRelayState | None = None
+    """Beam-search state for the pipeline-parallel ranks that do not sample;
+    None without beam search or pipeline parallelism. Lives here because this
+    object is what the PP relay carries to them."""
 
     def finish_reasons_list(self) -> FinishReasonsList:
         """`(num_seq_slots, num_steps)`"""
@@ -345,6 +365,8 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    beam_histories_deferred: bool = False
+    """The step skipped its snapshot; the PP relay can copy its finishing rows together."""
     sample_type: SampleType = SampleType.FULL
     """Tier this batch was sampled at.
 
@@ -438,6 +460,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
+        share_beam_search_state: bool = False
+        """Whether other pipeline-parallel ranks consume this sampler's
+        beam-search state (``SampleStateTensorsHostTorch.beam_relay``)."""
         watermark_config: "Optional[WatermarkConfig]" = None
 
     def __init__(self, args: Args):
@@ -608,6 +633,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._stable_greedy_seq_slots: list[int] = []
         self._stable_greedy_seq_slots_host: Optional[torch.Tensor] = None
         self._stable_greedy_seq_slots_cuda: Optional[torch.Tensor] = None
+
+        self._share_beam_search_state: bool = args.share_beam_search_state
 
         # BeamSearchHandler owns the lagged first_finish_reasons snapshots the
         # speculative predictor reads, so no separate host mirror is kept here.
@@ -1135,6 +1162,29 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # row (every position counts) or a row finishing at beam 0 (none do).
         return (unfinished.cumsum(dim=1) == 0).sum(dim=1).tolist()
 
+    @staticmethod
+    def _finalizes_beam_history(
+        request: LlmRequest, finished_beam_prefix_lengths: list[int]
+    ) -> bool:
+        """Whether the step finalizes ``request``, a beam-search request.
+
+        It does once all of its beams have finished, except for a context-only
+        (disaggregated prefill) request, which migrates to the generation server
+        instead.
+
+        Args:
+            request: The request.
+            finished_beam_prefix_lengths: The step's ``_finished_beam_prefix_lengths``.
+        """
+        assert request.py_seq_slot is not None
+        return (
+            request.state != LlmRequestState.GENERATION_COMPLETE
+            and request.py_beam_width > 1
+            and not request.is_context_only_request
+            and bool(finished_beam_prefix_lengths)
+            and finished_beam_prefix_lengths[request.py_seq_slot] >= request.py_beam_width
+        )
+
     def _handle_first_finish_reasons(
         self,
         request: LlmRequest,
@@ -1294,6 +1344,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Args:
             scheduled_requests: The scheduled requests to set up the sampler step for.
         """
+        if self._track_pending_steps:
+            # A reused slot can have an unapplied step if its previous request failed.
+            # Disaggregated generation also admits slots here, before its first sample.
+            for request in scheduled_requests.context_requests:
+                assert request.py_seq_slot is not None
+                self._pending_steps[request.py_seq_slot] = 0
+
         new_requests = self._collect_new_requests_for_setup(scheduled_requests)
 
         if not new_requests:
@@ -1378,6 +1435,52 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
     @override
+    @nvtx_range("prepare_pp_relay")
+    @torch.inference_mode()
+    def prepare_pp_relay(self, state: SampleStateTorch) -> None:
+        """Build the final beams of the requests the step finishes for the PP relay.
+
+        The builders stay on this rank, so the ranks that do not sample finalize
+        those requests from the beams built here. ``update_requests`` uses them
+        on this rank too, so every rank finalizes from the same beams.
+        """
+        host = state.host
+        beam_history_builders = state.beam_history_builders
+        if host is None or host.beam_relay is None or beam_history_builders is None:
+            return
+        beam_histories: dict[int, BeamHistory] = {}
+        first_finish_reasons_host = host.first_finish_reasons
+        assert first_finish_reasons_host is not None, (
+            "Beam-search relay requires first finish reasons"
+        )
+        finished_beam_prefix_lengths = self._finished_beam_prefix_lengths(first_finish_reasons_host)
+        finishing = [
+            (req_idx, req)
+            for req_idx, req in enumerate(state.requests)
+            if self._finalizes_beam_history(req, finished_beam_prefix_lengths)
+        ]
+        batched_histories = None
+        if state.beam_histories_deferred and len(finishing) > 1:
+            batched_histories = self._beam_search.build_deferred_beam_histories(
+                [req for _, req in finishing]
+            )
+        for row, (req_idx, req) in enumerate(finishing):
+            if batched_histories is not None:
+                beam_history = batched_histories[row]
+            else:
+                beam_history_builder = beam_history_builders[req_idx]
+                beam_history = beam_history_builder() if beam_history_builder is not None else None
+            if beam_history is None:
+                # Cancellation can finish the request while a deferred builder waits for copies.
+                if req.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                raise RuntimeError(
+                    f"Final beam builder returned no history for request {req.py_request_id}"
+                )
+            beam_histories[req.py_request_id] = beam_history
+        host.beam_relay.beam_histories = beam_histories
+
+    @override
     @nvtx_range("update_requests")
     @torch.inference_mode()
     def update_requests(
@@ -1434,9 +1537,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             finish_reasons = state.host.finish_reasons_list()
 
         beam_history_builders = state.beam_history_builders
-        assert (beam_history_builders is not None) == self._use_beam_search
+        beam_relay = state.host.beam_relay
+        # Only the last pipeline-parallel rank samples and has the builders. The
+        # other ranks update their requests from its host state, which hands
+        # them the step's beam-search state instead.
+        is_relay_receiver = beam_history_builders is None and beam_relay is not None
+        assert (beam_history_builders is not None or is_relay_receiver) == self._use_beam_search
+        beam_histories: dict[int, BeamHistory] | None = None
+        if beam_relay is not None:
+            beam_histories = beam_relay.beam_histories
+            if is_relay_receiver:
+                assert beam_histories is not None, "PP relay state is missing final beam histories"
+                self._beam_search.apply_relay(state.requests, beam_relay)
 
-        def _maybe_build_beam_history(req_idx: int) -> BeamHistory | None:
+        def _maybe_build_beam_history(req_idx: int, req: LlmRequest) -> BeamHistory | None:
+            if beam_histories is not None:
+                beam_history = beam_histories.get(req.py_request_id)
+                if beam_history is None:
+                    raise RuntimeError(
+                        f"Missing relayed final beam history for request {req.py_request_id}"
+                    )
+                return beam_history
             if (
                 beam_history_builders is not None
                 and (beam_history_builder := beam_history_builders[req_idx]) is not None
@@ -1507,14 +1628,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # The builder only produces a history when every beam has
                 # finished, checking it here first keeps the builder off
                 # for every step that does not end the request.
-                assert req.py_seq_slot is not None
-                request_finishing = bool(finished_beam_prefix_lengths) and (
-                    finished_beam_prefix_lengths[req.py_seq_slot] >= req.py_beam_width
-                )
                 if (
-                    not req.is_context_only_request
-                    and request_finishing
-                    and (beam_history := _maybe_build_beam_history(req_idx)) is not None
+                    self._finalizes_beam_history(req, finished_beam_prefix_lengths)
+                    and (beam_history := _maybe_build_beam_history(req_idx, req)) is not None
                 ):
                     finalize_beam(req, beam_history)
                 else:
@@ -1553,12 +1669,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     assert beam_search_store is not None
                     assert req.py_seq_slot is not None
                     beam_width = req.py_beam_width
-                    first_gen_scores = (
-                        beam_search_store.cum_log_probs[req.py_seq_slot, :beam_width]
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    )
+                    if beam_relay is not None:
+                        first_gen_scores = beam_relay.cum_log_probs[req_idx, :beam_width].tolist()
+                    else:
+                        first_gen_scores = (
+                            beam_search_store.cum_log_probs[req.py_seq_slot, :beam_width]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
                     first_gen_tokens = [
                         new_tokens_list[0][req.py_seq_slot][beam_idx]
                         for beam_idx in range(beam_width)
@@ -1682,15 +1801,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
-        if self._track_pending_steps:
-            # A context request claims a (possibly reused) slot: clear any
-            # counter leaked by a prior occupant that never got its final
-            # update_requests. Must happen before _process_requests, which
-            # reads the counters for bad-words staleness.
-            for r in scheduled_requests.context_requests:
-                assert r.py_seq_slot is not None
-                self._pending_steps[r.py_seq_slot] = 0
-
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.
         (
@@ -1716,6 +1826,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         finish_reasons_host: torch.Tensor | None = None
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+        beam_histories_deferred = False
+        beam_relay: BeamSearchRelayState | None = None
         # Forwarded to _record_sampler_event so SamplerEvent.synchronize
         # awaits any side-stream D2H copies host-side.
         side_stream_event: torch.cuda.Event | None = None
@@ -1743,15 +1855,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             if self._use_beam_search:
                 assert beam_search_store is not None
+                assert seq_lens_host is not None
                 assert seq_lens_cuda is not None
                 first_finish_reasons = beam_search_store.first_finish_reasons
                 first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
                 self._update_original_tokens(
                     beam_search_store.original_tokens, seq_slots_cuda, seq_lens_cuda, new_tokens
                 )
-                beam_history_builders, side_stream_event = self._beam_search.prepare_beam_histories(
-                    requests, finish_reasons=first_finish_reasons
+                beam_history_builders, side_stream_event, beam_histories_deferred = (
+                    self._beam_search.prepare_beam_histories(
+                        requests, finish_reasons=first_finish_reasons
+                    )
                 )
+                if self._share_beam_search_state:
+                    beam_relay = self._beam_search.start_relay(
+                        requests,
+                        seq_slots_cuda,
+                        seq_lens_host,
+                        len(scheduled_requests.context_requests_last_chunk),
+                    )
 
         # copy logprobs to host
         logprobs_state: LogProbsState | None = None
@@ -1784,9 +1906,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 first_finish_reasons=first_finish_reasons_host,
                 logprobs_state=logprobs_state,
                 single_step_greedy=single_step_greedy,
+                beam_relay=beam_relay,
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
+            beam_histories_deferred=beam_histories_deferred,
             sample_type=self._current_sample_type,
         )
 
