@@ -921,9 +921,7 @@ class RankFailureRecovery:
         agreed = agreed_placement(own_slots, record)
         try:
             plan = balancer.expert_restore.plan_expert_restore(
-                [record.is_active(r) for r in range(self.world_size)],
-                agreed,
-                rejoining=[record.is_joining(r) for r in range(self.world_size)],
+                [record.is_active(r) for r in range(self.world_size)], agreed
             )
         except ValueError as error:
             raise _ExpertsNotRestorable(str(error)) from error
