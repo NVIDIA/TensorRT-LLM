@@ -1750,7 +1750,7 @@ def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
         mapping=SimpleNamespace(world_size=1, tp_size=1),
         parallel=SimpleNamespace(parallel_vae_size=1),
         visual_gen_mapping=_ulysses_mapping(world_size),
-        attention=SimpleNamespace(backend="VANILLA"),
+        attention=SimpleNamespace(backend="VANILLA", quant_attention_config=None),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
         cuda_graph=SimpleNamespace(enable=False),

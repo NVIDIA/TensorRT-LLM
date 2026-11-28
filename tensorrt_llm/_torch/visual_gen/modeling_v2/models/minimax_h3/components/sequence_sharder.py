@@ -114,7 +114,7 @@ def shard_refiner_inputs(
         if not supports_key_padding_mask:
             raise NotImplementedError(
                 "Padded token-refiner sequences require key_padding_mask support; "
-                "use VANILLA, FA4, TRTLLM or FLASHINFER."
+                "use VANILLA, FA4, TRTLLM, FLASHINFER or CUTEDSL with deco_attention."
             )
         if backend != "TRTLLM":
             # Attention caches use the mask version to detect changes.
@@ -135,6 +135,7 @@ def shard_dit_inputs(
     sharder: H3SequenceSharder,
     backend: str,
     supports_key_padding_mask: bool,
+    requires_trailing_padding: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -142,7 +143,10 @@ def shard_dit_inputs(
     tuple[torch.Tensor, torch.Tensor],
     torch.Tensor | None,
     int | None,
+    torch.Tensor,
 ]:
+    """Pad and shard the DiT inputs. The returned token tags cover the whole padded sequence,
+    which each attention call sees."""
     sequence_length = token_tags.shape[0]
     pad = _padding_to_multiple(sequence_length, sharder.size)
     has_existing_padding = bool((token_tags < 0).any())
@@ -166,11 +170,10 @@ def shard_dit_inputs(
                 "Padded packed sequences (negative token_tags) need an attention "
                 "backend that honours key_padding_mask; the "
                 f"{backend} backend cannot express it. Use "
-                "VANILLA, FA4, TRTLLM or FLASHINFER."
+                "VANILLA, FA4, TRTLLM, FLASHINFER or CUTEDSL with deco_attention."
             )
-        # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
         # Ulysses appends padding in this layout.
-        if backend in ("FA4", "TRTLLM") and bool(
+        if requires_trailing_padding and bool(
             ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
         ):
             raise NotImplementedError(
@@ -201,4 +204,5 @@ def shard_dit_inputs(
         rotary_emb,
         key_padding_mask,
         valid_seq_len,
+        token_tags_for_mask,
     )

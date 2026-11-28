@@ -240,6 +240,7 @@ class MiniMaxH3Attention(nn.Module):
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
         vsa_metadata: H3VSAMetadata | None = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_async_ulysses:
             return self.forward_async(
@@ -248,6 +249,7 @@ class MiniMaxH3Attention(nn.Module):
                 key_padding_mask=key_padding_mask,
                 timestep=timestep,
                 valid_seq_len=valid_seq_len,
+                token_tags=token_tags,
             )
         query, key, value = self._project_qkv(hidden_states, rotary_emb)
         hidden_states = self._attn_impl(
@@ -258,6 +260,7 @@ class MiniMaxH3Attention(nn.Module):
             discard_padded_queries=True,
             valid_seq_len=valid_seq_len,
             timestep=timestep,
+            token_tags=token_tags,
         )
         return self.to_out[0](hidden_states)
 
@@ -300,6 +303,7 @@ class MiniMaxH3Attention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden_states.shape[:2]
         head_dim = self.head_dim
@@ -329,6 +333,7 @@ class MiniMaxH3Attention(nn.Module):
             discard_padded_queries=True,
             valid_seq_len=valid_seq_len,
             timestep=timestep,
+            token_tags=token_tags,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
@@ -370,6 +375,7 @@ class MiniMaxH3VSAAttention(MiniMaxH3Attention):
         timestep=None,
         valid_seq_len=None,
         vsa_metadata: H3VSAMetadata | None = None,
+        token_tags=None,
     ):
         if vsa_metadata is None:
             raise RuntimeError("MiniMax-H3 VSA requires packed-sequence metadata.")

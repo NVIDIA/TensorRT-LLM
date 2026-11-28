@@ -48,7 +48,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -1038,6 +1038,13 @@ def test_key_padding_mask_support_tracks_attention_backend(backend: str, support
     model = h3.MiniMaxH3Transformer3DModel(config)
 
     assert model._supports_key_padding_mask is supported
+
+
+def test_deco_attention_takes_the_key_padding_mask() -> None:
+    recipe = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True)
+    attention = AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe)
+
+    assert h3.takes_key_padding_mask(attention)
 
 
 @requires_cuda

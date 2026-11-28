@@ -29,7 +29,7 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pi
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
 
 
 def _run_rank(rank, world_size, rendezvous, check, args, kwargs):
@@ -65,7 +65,18 @@ def _make_model_config(
     parallel = (
         ParallelConfig(ulysses_size=2, async_ulysses=True) if async_ulysses else ParallelConfig()
     )
-    head_dim = 128 if backend in ("FA4", "TRTLLM", "FLASHINFER") else 16
+    # DECO is CUTEDSL under a DeCo-Attention recipe.
+    head_dim = 128 if backend in ("FA4", "TRTLLM", "FLASHINFER", "DECO") else 16
+    attention = (
+        AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
+            ),
+        )
+        if backend == "DECO"
+        else AttentionConfig(backend=backend)
+    )
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             num_attention_heads=2,
@@ -89,10 +100,33 @@ def _make_model_config(
         ),
         quant_config=QuantConfig(),
         mapping=Mapping(),
-        attention=AttentionConfig(backend=backend),
+        attention=attention,
         attention_metadata_state=create_attention_metadata_state(),
         parallel=parallel,
     )
+
+
+def _inputs(device: torch.device, num_video: int) -> dict[str, torch.Tensor]:
+    """The inputs of a packed sequence: one text row, one audio row and num_video video rows, so
+    that two ranks need padding for an odd num_video."""
+    n = num_video + 2
+    tags = torch.tensor([1, 2] + [0] * num_video, device=device)
+    return {
+        "hidden_states": torch.randn(1, num_video, 2, device=device),
+        "audio_hidden_states": torch.randn(1, 1, 3, device=device),
+        "encoder_hidden_states": torch.randn(1, 1, 5, device=device),
+        "timestep": torch.tensor([1.0], device=device),
+        "conditioning_timesteps": torch.tensor([0.0, 0.75], device=device),
+        "token_tags": tags,
+        "timestep_indices": torch.arange(n, device=device) % 2,
+        "position_ids": torch.stack(
+            (torch.arange(n, device=device) // 2, torch.arange(n, device=device) % 2, tags),
+            dim=1,
+        ),
+        "video_indices": torch.arange(2, n, device=device),
+        "audio_indices": torch.tensor([1], device=device),
+        "text_indices": torch.tensor([0], device=device),
+    }
 
 
 def _split_fused_qkv(state: dict[str, torch.Tensor], keys) -> dict[str, torch.Tensor]:
@@ -184,27 +218,38 @@ def _logic_h3_ulysses_and_parallel_vae(
         assert sum(p.numel() for p in candidate.parameters()) < sum(
             p.numel() for p in reference.parameters()
         )
-    # Five packed rows and one text row both require padding for two ranks.
-    inputs = {
-        "hidden_states": torch.randn(1, 3, 2, device=device),
-        "audio_hidden_states": torch.randn(1, 1, 3, device=device),
-        "encoder_hidden_states": torch.randn(1, 1, 5, device=device),
-        "timestep": torch.tensor([1.0], device=device),
-        "conditioning_timesteps": torch.tensor([0.0, 0.75], device=device),
-        "token_tags": torch.tensor([1, 0, 2, 0, 0], device=device),
-        "timestep_indices": torch.tensor([0, 1, 1, 0, 1], device=device),
-        "position_ids": torch.tensor(
-            [[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1], [2, 1, 1]], device=device
-        ),
-        "video_indices": torch.tensor([1, 3, 4], device=device),
-        "audio_indices": torch.tensor([2], device=device),
-        "text_indices": torch.tensor([0], device=device),
-    }
+    # Five packed rows and one text row both require padding for two ranks. DeCo-Attention takes
+    # sequences of at least 8192 rows, so its sequence has 8193. The ranks see the padded row in
+    # the mask and draw the basis rows from the padded tags, which the one-rank reference does
+    # not; the outputs then differ within the error of the quantized attention.
+    inputs = _inputs(device, 8191 if backend == "DECO" else 3)
+    tolerance = {"rtol": 0.0, "atol": 1e-2} if backend == "DECO" else {"rtol": 2e-3, "atol": 2e-3}
     with torch.inference_mode():
         expected = reference(**inputs)
-        actual = candidate(**inputs)
-    torch.testing.assert_close(actual.sample, expected.sample, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=2e-3, atol=2e-3)
+        if backend == "DECO":
+            from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+            prepare, calls = deco_attention.prepare, []
+
+            def recording(q, *args, **kwargs):
+                calls.append((tuple(q.shape), kwargs["valid_seq_lens"], kwargs["rows"]))
+                return prepare(q, *args, **kwargs)
+
+            deco_attention.prepare = recording
+            try:
+                actual = candidate(**inputs)
+            finally:
+                deco_attention.prepare = prepare
+            # Every joint block sees the whole padded sequence for its head shard; only the
+            # padded row is excluded, and the basis rows come from the tags.
+            assert len(calls) == len(candidate.transformer_blocks)
+            for shape, lens, rows in calls:
+                assert shape == (1, 8194, 4 // ulysses_size, 128)
+                assert lens.tolist() == [8193] and rows is not None and rows.numel() > 0
+        else:
+            actual = candidate(**inputs)
+    torch.testing.assert_close(actual.sample, expected.sample, **tolerance)
+    torch.testing.assert_close(actual.audio_sample, expected.audio_sample, **tolerance)
     # Exercise the same VAE group and real gathers, including an idle tail rank
     # (3x3 tiles) and the fewer-tiles-than-ranks fallback.
     torch.manual_seed(43)
@@ -221,12 +266,22 @@ def _logic_h3_ulysses_and_parallel_vae(
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
 @pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
-@pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER", "DECO"])
 def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool, run_h3_ranks) -> None:
     if backend == "TRTLLM" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
+    if backend == "DECO":
+        from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.deco_attention import (
+            deco_unavailable_reason,
+        )
+
+        reason = deco_unavailable_reason("nvfp4", "fp8")
+        if reason is not None:
+            pytest.skip(reason)
+        if torch.cuda.get_device_capability(1) != torch.cuda.get_device_capability(0):
+            pytest.skip("DeCo-Attention on two GPUs needs two GPUs of one model")
     if torch.cuda.device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs, only {torch.cuda.device_count()} available")
     run_h3_ranks(2, _logic_h3_ulysses_and_parallel_vae, backend, async_ulysses)

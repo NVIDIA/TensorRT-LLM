@@ -19,6 +19,33 @@ from .skip_softmax_threshold import (
 )
 
 
+def uses_deco_attention(attention) -> bool:
+    recipe = attention.quant_attention_config
+    return attention.backend == "CUTEDSL" and recipe is not None and recipe.deco_attention
+
+
+def _deco_unquantized(q, k, v, key_padding_mask, scale):
+    """SDPA with DeCo-Attention's padding semantics: each sample attends its count of leading
+    tokens, and padded rows return zero."""
+    padded = None
+    if key_padding_mask is not None:
+        counts = key_padding_mask.sum(dim=1, dtype=torch.int32)
+        positions = torch.arange(q.shape[1], dtype=torch.int32, device=q.device)
+        key_padding_mask = positions[None] < counts[:, None]
+        padded = ~key_padding_mask[:, :, None, None]
+        # SDPA spreads a NaN in a zero-weight V row over the valid rows.
+        k = k.masked_fill(padded, 0)
+        v = v.masked_fill(padded, 0)
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=None if key_padding_mask is None else key_padding_mask[:, None, None, :],
+        scale=scale,
+    ).transpose(1, 2)
+    return out if padded is None else out.masked_fill(padded, 0)
+
+
 def _cute_output(q, k, v, scale, *, recipe=None, threshold=None):
     from ....catalog.attention.cute_fmha import cute_fmha
 
@@ -77,6 +104,13 @@ class H3DenseAttention:
         self.runner = None
         self.sparse_params = sparse_params
         self.sol = None
+        self.deco = uses_deco_attention(config.attention)
+        if self.deco:
+            from ....catalog.attention.deco_attention import deco_unavailable_reason
+
+            reason = deco_unavailable_reason(self.recipe.qk_dtype, self.recipe.v_dtype)
+            if reason is not None:
+                raise ValueError(reason)
         if backend == "CUDNN":
             from ....catalog.attention.cudnn_sdpa import CudnnSdpaRunner
 
@@ -126,7 +160,31 @@ class H3DenseAttention:
             return phase == 0
         return dense_prefix(timestep, self.sol_params.disabled_until_timestep)
 
+    def _deco_forward(self, q, k, v, key_padding_mask, token_tags):
+        from ....catalog.attention.deco_attention import (
+            deco_attention,
+            deco_attention_ineligible_reason,
+        )
+
+        reason = deco_attention_ineligible_reason(q, k, v)
+        if reason is None:
+            return deco_attention(
+                q,
+                k,
+                v,
+                v_dtype=self.recipe.v_dtype,
+                key_padding_mask=key_padding_mask,
+                token_tags=token_tags,
+            )
+        logger.warning_once(
+            f"DeCo-Attention runs H3 attention unquantized because of {reason}.",
+            key=("h3_deco_unquantized", reason),
+        )
+        return _deco_unquantized(q, k, v, key_padding_mask, self.scale)
+
     def forward(self, q, k, v, *, key_padding_mask=None, timestep=None, **kwargs):
+        if self.deco:
+            return self._deco_forward(q, k, v, key_padding_mask, kwargs.get("token_tags"))
         if self.sol is not None:
 
             def dense(a, b, c):

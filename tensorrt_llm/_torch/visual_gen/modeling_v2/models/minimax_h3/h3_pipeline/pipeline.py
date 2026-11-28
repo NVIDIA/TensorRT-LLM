@@ -30,7 +30,11 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 from ..components.linear import TensorParallelSubgroup
-from ..components.transformer import MiniMaxH3Transformer3DModel, trunk_attention_for
+from ..components.transformer import (
+    MiniMaxH3Transformer3DModel,
+    takes_key_padding_mask,
+    trunk_attention_for,
+)
 from ..packing import resolve_canvas_size
 from ..pipeline import H3PipelineBase
 from .ref2va import load_references, prepare_references, validate_reference_order
@@ -67,15 +71,10 @@ class MiniMaxH3Pipeline(H3PipelineBase):
                     "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
                     "tp_size * ulysses_size=world_size."
                 )
-            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in (
-                "VANILLA",
-                "FA4",
-                "TRTLLM",
-                "FLASHINFER",
-            ):
+            if vgm.ulysses_size > 1 and not takes_key_padding_mask(pipeline_config.attention):
                 raise NotImplementedError(
-                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, or FLASHINFER attention. "
-                    "Other attention backends do not support the required "
+                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, FLASHINFER, or CUTEDSL "
+                    "with deco_attention. Other attention backends do not support the required "
                     "packed-row padding mask."
                 )
         self._setup_text_encoder_group(world_size)

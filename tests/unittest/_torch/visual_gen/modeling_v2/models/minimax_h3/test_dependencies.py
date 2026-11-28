@@ -91,6 +91,7 @@ _CATALOG_PROVIDERS = {
     "attention/trtllm_context_attention.py": {"tensorrt_llm.bindings.internal.thop.run_context"},
     "gemm/gate_up_swiglu_quack.py": {f"{_TORCH}.cute_dsl_utils.install_cutlass_dsl_compatibility"},
     "attention/sol_attention.py": {f"{_VG_CUTE}.blackwell.sol_attn.sol_attn"},
+    "attention/deco_attention.py": {f"{_VG_CUTE}.blackwell.deco_attention"},
     "attention/sol_predictor.py": {
         f"{_VG}.attention.backends.sparse.sol.kernels.visual_gen_sol_predictor"
     },
