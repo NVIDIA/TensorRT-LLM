@@ -28,6 +28,7 @@ class InferenceRequest(BaseModel):
     turns: Optional[List[str]] = None
     category: Optional[str] = None
     question_id: Optional[int] = None
+    cache_salt: Optional[str] = None
 
     @model_validator(mode="after")
     def verify_prompt_and_logits(self) -> InferenceRequest:
