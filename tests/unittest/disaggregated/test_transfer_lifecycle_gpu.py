@@ -68,7 +68,57 @@ _CASES = (
 _CONTEXT_FIRST_CASES = ("baseline", "cancel_late_kv", "source_fatal", "destination_fatal")
 _PHASE_TIMEOUT_S = 30.0
 _TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
+_EXPIRY_TIMEOUT_S = 30.0
 _WORKER_TIMEOUT_S = 600.0
+
+
+def _case_timeout_s(case: str) -> float:
+    """Select a short real clock only when expiry is part of the case's contract.
+
+    Args:
+        case: GPU lifecycle case shared by both endpoint worlds.
+
+    Returns:
+        Request/grace duration, independent of observer and startup wait limits.
+    """
+    if case in ("timeout_late_aux", "source_fatal", "destination_fatal"):
+        return _EXPIRY_TIMEOUT_S
+    return _TIMEOUT_S
+
+
+def _endpoint_timeout_s(case: str, role: str) -> float:
+    """Keep the independent fatal survivor alive beyond the target's expiry.
+
+    Args:
+        case: GPU lifecycle case shared by both endpoint worlds.
+        role: CTX or GEN endpoint receiving the native transfer configuration.
+
+    Returns:
+        Real request/grace duration for this endpoint.
+    """
+    timeout = _case_timeout_s(case)
+    fatal_role = "ctx" if case == "source_fatal" else "gen"
+    return 3 * timeout if case.endswith("fatal") and role != fatal_role else timeout
+
+
+def _assert_transition_budget(case: str, clocks: list[dict[str, float]]) -> None:
+    """Require clock-relative margins before releasing a real transfer transition.
+
+    Args:
+        case: Cancellation, request-timeout, or fatal-expiry case.
+        clocks: Every active endpoint's measured request deadline and timeout.
+
+    Raises:
+        AssertionError: Preparation or clock skew leaves insufficient grace.
+    """
+    margin = _case_timeout_s(case) / 4
+    assert min(clock["request_deadline"] for clock in clocks) - time.monotonic() > 2 * margin, (
+        clocks
+    )
+    if case == "timeout_late_aux":
+        assert max(clock["request_deadline"] for clock in clocks) + 2 * margin < min(
+            clock["request_deadline"] + clock["timeout"] for clock in clocks
+        ), clocks
 
 
 def _wait(
@@ -485,10 +535,8 @@ def _worker(args: argparse.Namespace) -> None:
         max_num_tokens=128,
         is_disagg=True,
     )
-    fatal_role = "ctx" if case == "source_fatal" else "gen"
-    fatal_case = case.endswith("fatal")
     # Asymmetric finite deadlines are fault isolation, not matching-config qualification.
-    timeout = _TIMEOUT_S if not fatal_case or role == fatal_role else 3 * _TIMEOUT_S
+    timeout = _endpoint_timeout_s(case, role)
     transceiver = KvCacheTransceiverV2(
         mapping,
         MPIDist(mapping),
@@ -702,6 +750,7 @@ def _worker(args: argparse.Namespace) -> None:
             assert request.context_phase_params.req_id == args.unique_id
             _record(directory, "ctx.published")
         assert session._enforce_physical_ownership and session._retirement is not None
+        assert session._retirement.timeout_s == timeout
         assert session._need_aux == (not context_first)
         _exercise_live_session(
             args,
@@ -759,6 +808,7 @@ def _exercise_live_session(
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 
     role, case = args.role, args.case
+    case_timeout = _case_timeout_s(case)
     context_first = args.context_first
     peer_rank = transceiver._mapping.rank if context_first else 0
     kv_masked = context_first or case == "cancel_late_kv"
@@ -811,8 +861,8 @@ def _exercise_live_session(
         assert worker._retirement_watchdog.fatal is event
         assert event.direction == ("send" if role == "ctx" else "receive")
         assert event.reason != "transfer timeout", event
-        assert event.deadline == event.started_at + _TIMEOUT_S
-        assert _TIMEOUT_S <= event.expired_at - event.started_at <= _TIMEOUT_S + 2.0
+        assert event.deadline == event.started_at + case_timeout
+        assert case_timeout <= event.expired_at - event.started_at <= case_timeout + 2.0
         with pytest.raises(RuntimeError, match="admission is closed"):
             worker.create_tx_session(_new_request("ctx", 5, rid + 2, "", context_first))
         with pytest.raises(RuntimeError, match="admission is closed"):
@@ -859,7 +909,7 @@ def _exercise_live_session(
             lambda: (directory / "transition.json").exists(), "both endpoints ready for transition"
         )
         if case.startswith("cancel_"):
-            assert retirement._request_deadline - time.monotonic() > _PHASE_TIMEOUT_S
+            assert retirement._request_deadline - time.monotonic() > case_timeout / 4
             # The other endpoint may already have sent cancellation after the gate.
             # Local cancellation must preserve that first drain, not restart grace.
             previous_drain = retirement._drain_started
@@ -1188,17 +1238,7 @@ def _run_transfer_lifecycle_gpu(case: str, tmp_path: Path, context_first: bool) 
                     for directory in evidence_dirs
                     for role in jobs
                 ]
-                # Preserve enough grace for both independent timeouts plus bounded rendezvous.
-                assert (
-                    min(clock["request_deadline"] for clock in clocks) - time.monotonic()
-                    > 2 * _PHASE_TIMEOUT_S
-                ), clocks
-                if case == "timeout_late_aux":
-                    assert max(
-                        clock["request_deadline"] for clock in clocks
-                    ) + 2 * _PHASE_TIMEOUT_S < min(
-                        clock["request_deadline"] + clock["timeout"] for clock in clocks
-                    ), clocks
+                _assert_transition_budget(case, clocks)
                 release_gate("transition")
                 _wait(
                     lambda: all_recorded("retained"),
@@ -1232,8 +1272,10 @@ def _run_transfer_lifecycle_gpu(case: str, tmp_path: Path, context_first: bool) 
                     ),
                     "independent peer survives",
                 )
-                assert jobs[survivor].poll() is None
                 _wait_for_rank_exit(tmp_path, fatal_role)
+                assert jobs[survivor].poll() is None, (
+                    "independent peer exited before target exit observation completed"
+                )
             else:
                 for role, job in jobs.items():
                     job.wait(timeout=60)
