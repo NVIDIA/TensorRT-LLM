@@ -28,9 +28,6 @@ import uuid
 from contextlib import ExitStack
 from types import SimpleNamespace
 
-# Do not inherit a NIC pin from the host: the selected interface may not exist
-# in the test container and would prevent the NIXL agent from initializing.
-os.environ.pop("UCX_NET_DEVICES", None)
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
@@ -39,7 +36,7 @@ os.environ.pop("UCX_NET_DEVICES", None)
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import pytest
 import torch
@@ -78,6 +75,21 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _pin_ucx_to_loopback() -> Iterator[None]:
+    """Pin UCX to the loopback interface, which every container has, while these tests run.
+
+    Every rank runs in this process on one GPU, so UCX needs no NIC. A NIC pin inherited from
+    the host may name an interface the test container lacks, and letting UCX open every
+    interface of a multi-NIC node slows down creating and connecting each NIXL agent. UCX reads
+    the variable when each agent creates its context, which happens inside the tests.
+    """
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("UCX_NET_DEVICES", "lo")
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1377,43 +1389,57 @@ def run_transfer_test(
 # ---------------------------------------------------------------------------
 # Test configurations
 # ---------------------------------------------------------------------------
+# Each topology pairs ctx and gen ranks differently in PeerRegistrar.get_peer_overlap (equal,
+# fan-in or fan-out along TP and PP, attention DP on either side) or has the property noted
+# above it. The MLA entries have one KV head, replicated across TP ranks, and are listed with
+# their own pairings.
+# A larger TP or PP size with a pairing already listed only adds ranks, so it is not listed.
+# BOUNDARY_CONFIGS (tp2_pp1, tp1_pp2, tp2_to_pp2) and UNEVEN_PP_CONFIGS (tp4_to_pp4 and
+# pp4_to_tp4 with uneven layers) run under every window, so those topologies are not repeated.
 TEST_CONFIGS = [
     # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, is_mla, test_id)
-    # --- Basic symmetric ---
+    # --- Symmetric: each gen rank pairs with one ctx rank ---
     (1, 1, 1, 1, False, False, False, "tp1_pp1"),
-    (2, 1, 2, 1, False, False, False, "tp2_pp1"),
-    (1, 2, 1, 2, False, False, False, "tp1_pp2"),
+    # TP and PP both split: each rank holds a head slice of a layer slice.
     (2, 2, 2, 2, False, False, False, "tp2_pp2"),
+    # One KV head per rank.
     (4, 1, 4, 1, False, False, False, "tp4_pp1"),
+    # One layer per rank: under vswa each PP rank holds a single layer group.
     (1, 4, 1, 4, False, False, False, "tp1_pp4"),
-    (4, 2, 4, 2, False, False, False, "tp4_pp2"),
-    (2, 4, 2, 4, False, False, False, "tp2_pp4"),
-    (4, 4, 4, 4, False, False, False, "tp4_pp4"),
     # --- Asymmetric TP/PP between ctx and gen ---
+    # PP fan-in.
     (1, 2, 1, 1, False, False, False, "pp2_to_pp1"),
-    (2, 1, 1, 2, False, False, False, "tp2_to_pp2"),
+    # TP fan-in, PP fan-out.
     (4, 1, 2, 2, False, False, False, "tp4_to_tp2pp2"),
-    (4, 1, 1, 4, False, False, False, "tp4_to_pp4"),
+    # TP fan-out, PP fan-in.
     (2, 2, 4, 1, False, False, False, "tp2pp2_to_tp4"),
-    (1, 4, 4, 1, False, False, False, "pp4_to_tp4"),
+    # TP fan-in and PP fan-out with both axes split on both sides.
     (4, 2, 2, 4, False, False, False, "tp4pp2_to_tp2pp4"),
     # --- DP (attention data parallelism) ---
-    (2, 1, 2, 1, True, True, False, "tp2_dp_both"),
+    # Requests go to DP ranks round-robin over the three REQUEST_LENGTHS, so every DP4 side
+    # (here and in the MLA block) leaves one DP rank idle, and a DP2 side puts two requests on
+    # one DP rank.
     (4, 1, 4, 1, True, True, False, "tp4_dp_both"),
+    # ctx DP into a gen PP split without DP.
     (2, 1, 1, 2, True, False, False, "ctx_dp_gen_pp2"),
+    # ctx DP into a gen TP and PP split without DP.
     (4, 1, 2, 2, True, False, False, "tp4_dp_to_tp2pp2"),
+    # DP on both sides with PP: DP2 puts two requests on one gen DP rank, DP4 leaves one idle.
     (2, 2, 2, 2, True, True, False, "tp2_pp2_dp_both"),
     (4, 2, 4, 2, True, True, False, "tp4_pp2_dp_both"),
     # --- MLA (Multi-head Latent Attention / SELFKONLY) ---
     (1, 1, 1, 1, False, False, True, "mla_tp1_pp1"),
+    # Symmetric TP.
     (2, 1, 2, 1, False, False, True, "mla_tp2"),
-    (4, 1, 4, 1, False, False, True, "mla_tp4"),
+    # Symmetric TP and PP.
     (2, 2, 2, 2, False, False, True, "mla_tp2_pp2"),
-    (4, 2, 4, 2, False, False, True, "mla_tp4_pp2"),
+    # ctx DP into gen TP without DP.
     (2, 1, 2, 1, True, False, True, "mla_tp2_ctx_dp"),
+    # DP4 on both sides (one DP rank idle).
     (4, 1, 4, 1, True, True, True, "mla_tp4_dp_both"),
+    # TP fan-in, PP fan-out.
     (2, 1, 1, 2, False, False, True, "mla_tp2_to_pp2"),
-    # --- MLA asymmetric TP ---
+    # --- MLA asymmetric TP: gen TP above ctx TP with the KV head replicated ---
     (4, 1, 8, 1, True, False, True, "mla_ctx_dp4_gen_tp8"),
     (4, 1, 8, 1, False, False, True, "mla_ctx_tp4_gen_tp8"),
 ]
@@ -1425,22 +1451,66 @@ WINDOW_CONFIGS = [
     ([MAX_SEQ_LEN, 24], "vswa"),
 ]
 
+# Each rank lists a request's blocks per layer group from its own block table
+# (KvCacheTransceiverV2._describe_local). The window and the speculative tail shape that list;
+# the TP/PP/DP pairing only decides which peers, layers and heads exchange it. So every
+# topology runs once, under vswa (a full-attention and a sliding-window layer group) with
+# speculation off. The topologies below also run every other window and speculation setting:
+# the MHA and MLA baselines, and tp4_to_tp2pp2, where each gen rank gathers from several ctx
+# ranks.
+WINDOW_SPEC_TOPOLOGIES = ("tp1_pp1", "tp4_to_tp2pp2", "mla_tp1_pp1")
+SPEC_CONFIGS = [
+    # (gen_scratch_tokens, test_id)
+    (0, "spec_off"),
+    (TOKENS_PER_BLOCK, "spec_on"),
+]
+
+
+def _transfer_test_cases() -> list:
+    """Parameters of test_cache_transceiver (see WINDOW_SPEC_TOPOLOGIES).
+
+    Ids read ``<spec>-v2-<window>-<topology>``.
+    """
+    topology_ids = {topology_id for *_, topology_id in TEST_CONFIGS}
+    unknown = set(WINDOW_SPEC_TOPOLOGIES) - topology_ids
+    if unknown:
+        raise ValueError(f"WINDOW_SPEC_TOPOLOGIES names topologies not in TEST_CONFIGS: {unknown}")
+    cases = []
+    topologies_run = set()
+    for *topology, topology_id in TEST_CONFIGS:
+        runs_every_setting = topology_id in WINDOW_SPEC_TOPOLOGIES
+        for window, window_id in WINDOW_CONFIGS:
+            for scratch_tokens, spec_id in SPEC_CONFIGS:
+                is_default_setting = window_id == "vswa" and spec_id == "spec_off"
+                if not (runs_every_setting or is_default_setting):
+                    continue
+                cases.append(
+                    pytest.param(
+                        *topology,
+                        window,
+                        True,  # use_v2
+                        scratch_tokens,
+                        id=f"{spec_id}-v2-{window_id}-{topology_id}",
+                    )
+                )
+                topologies_run.add(topology_id)
+    missing = topology_ids - topologies_run
+    if missing:
+        raise ValueError(f"TEST_CONFIGS topologies with no test_cache_transceiver case: {missing}")
+    return cases
+
+
 # --- Uneven PP layer configs ---
 # These test configurations use num_layers not evenly divisible by pp_size,
 # so the first (num_layers % pp_size) PP ranks get one extra layer.
 # Mirrors the C++ getLayerNumPPRank pattern in cacheTransceiverTest.cpp.
-# Format: (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, is_mla, num_layers, test_id)
+# Equal PP sizes split the layers identically, so each gen PP rank pairs with one ctx PP rank
+# whatever the TP sizes; 7L_tp1_pp4 (MHA) and 7L_mla_tp1_pp3 (MLA) cover that pairing. The
+# other entries use different PP sizes, so one side's layer range spans several PP ranks of the
+# other side, split at uneven boundaries. TEST_CONFIGS leaves out tp4_to_pp4 and pp4_to_tp4
+# because 7L_tp4_to_pp4 and 7L_pp4_to_tp4 run them here.
 UNEVEN_PP_CONFIGS = [
-    # 5 layers, pp=2 → [3, 2]
-    (1, 2, 1, 2, False, False, False, 5, "5L_tp1_pp2"),
-    (2, 2, 2, 2, False, False, False, 5, "5L_tp2_pp2"),
-    # 5 layers, pp=3 → [2, 2, 1]
-    (1, 3, 1, 3, False, False, False, 5, "5L_tp1_pp3"),
-    # 7 layers, pp=2 → [4, 3]
-    (1, 2, 1, 2, False, False, False, 7, "7L_tp1_pp2"),
-    (2, 2, 2, 2, False, False, False, 7, "7L_tp2_pp2"),
-    # 7 layers, pp=3 → [3, 2, 2]
-    (1, 3, 1, 3, False, False, False, 7, "7L_tp1_pp3"),
+    # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, is_mla, num_layers, test_id)
     # 7 layers, pp=4 → [2, 2, 2, 1]
     (1, 4, 1, 4, False, False, False, 7, "7L_tp1_pp4"),
     # Asymmetric TP/PP with uneven layers
@@ -1449,9 +1519,7 @@ UNEVEN_PP_CONFIGS = [
     (4, 1, 1, 4, False, False, False, 7, "7L_tp4_to_pp4"),
     (1, 4, 4, 1, False, False, False, 7, "7L_pp4_to_tp4"),
     (2, 2, 1, 4, False, False, False, 7, "7L_tp2pp2_to_pp4"),
-    # Uneven layers + MLA
-    (1, 2, 1, 2, False, False, True, 5, "5L_mla_tp1_pp2"),
-    (2, 2, 2, 2, False, False, True, 5, "5L_mla_tp2_pp2"),
+    # Uneven layers + MLA: 7 layers, pp=3 → [3, 2, 2]
     (1, 3, 1, 3, False, False, True, 7, "7L_mla_tp1_pp3"),
 ]
 
@@ -1461,17 +1529,10 @@ UNEVEN_PP_CONFIGS = [
 # ---------------------------------------------------------------------------
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in TEST_CONFIGS],
-    ids=[c[7] for c in TEST_CONFIGS],
+    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla,"
+    "max_attention_window_vec,use_v2,gen_scratch_tokens",
+    _transfer_test_cases(),
 )
-@pytest.mark.parametrize(
-    "max_attention_window_vec",
-    [w[0] for w in WINDOW_CONFIGS],
-    ids=[w[1] for w in WINDOW_CONFIGS],
-)
-@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
-@pytest.mark.parametrize("gen_scratch_tokens", [0, TOKENS_PER_BLOCK], ids=["spec_off", "spec_on"])
 def test_cache_transceiver(
     ctx_tp,
     ctx_pp,
@@ -1484,20 +1545,14 @@ def test_cache_transceiver(
     use_v2,
     gen_scratch_tokens,
 ):
-    """Test KvCacheTransceiverV2 with V2 cache managers.
+    """Test KvCacheTransceiverV2 with V2 cache managers (cases: _transfer_test_cases).
 
-    The ``gen_scratch_tokens`` dimension (id ``spec_off`` / ``spec_on``) adds a
-    speculative-decoding tail: the generation cache is sized
-    prompt_len + TOKENS_PER_BLOCK so a surplus block sits past the prompt,
-    exercising the manager+transceiver combinations *with speculation* -- the
-    tail is generic (any spec mode, e.g. MTP or Eagle), including the
-    sliding-window case that regressed GSM8K under MTP (bug 6676406). Every prior
-    run was spec_off (gen_scratch_tokens=0). The transfer must still cover exactly
-    the prompt blocks the receiver needs; a count-based slice would let the
-    surplus shift or drop a live prompt block.
+    ``spec_on`` sizes the generation cache to prompt_len + TOKENS_PER_BLOCK, which
+    leaves one speculative tail block (as MTP or Eagle does) past the prompt; under
+    uniform_window and vswa that block is in a sliding-window group too. The transfer
+    must still cover exactly the prompt blocks the receiver needs; a count-based slice
+    would let the surplus shift or drop a live prompt block.
     """
-    # Speculative scratch materialisation (resize past history_length) is V2-only
-
     print(
         f"\nRunning transfer test: "
         f"ctx_tp={ctx_tp} ctx_pp={ctx_pp} gen_tp={gen_tp} gen_pp={gen_pp} "
@@ -1590,16 +1645,39 @@ def _pool_has_holes(manager: KVCacheManagerV2) -> bool:
     return False
 
 
+_LOCALITY_DOMAIN_ATTENTION_IS_MLA = {"mha": False, "mla": True}
+_LOCALITY_DOMAIN_SIDES = {"ld_both": (True, True), "ld_ctx": (True, False), "ld_gen": (False, True)}
+_LOCALITY_DOMAIN_TP = {"tp1_tp1": (1, 1), "tp2_tp1": (2, 1), "tp1_tp2": (1, 2)}
+# Each row is (attention, sides, TP), the order its test id uses. Every (sides, TP) pair runs
+# once. Attention types are assigned so that each sides value meets both MHA and MLA, and a
+# localized pool on either side meets every TP pair (tp1_tp1, fan-in tp2_tp1, fan-out tp1_tp2)
+# under both.
+_LOCALITY_DOMAIN_CASES = [
+    ("mla", "ld_both", "tp1_tp1"),
+    ("mha", "ld_both", "tp2_tp1"),
+    ("mha", "ld_both", "tp1_tp2"),
+    ("mha", "ld_ctx", "tp1_tp1"),
+    ("mla", "ld_ctx", "tp2_tp1"),
+    ("mla", "ld_ctx", "tp1_tp2"),
+    ("mha", "ld_gen", "tp1_tp1"),
+    ("mla", "ld_gen", "tp2_tp1"),
+    ("mla", "ld_gen", "tp1_tp2"),
+]
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "ctx_tp,gen_tp", [(1, 1), (2, 1), (1, 2)], ids=["tp1_tp1", "tp2_tp1", "tp1_tp2"]
+    "ctx_tp,gen_tp,ctx_locality_domains,gen_locality_domains,is_mla",
+    [
+        pytest.param(
+            *_LOCALITY_DOMAIN_TP[tp_id],
+            *_LOCALITY_DOMAIN_SIDES[sides_id],
+            _LOCALITY_DOMAIN_ATTENTION_IS_MLA[attention_id],
+            id=f"{attention_id}-{sides_id}-{tp_id}",
+        )
+        for attention_id, sides_id, tp_id in _LOCALITY_DOMAIN_CASES
+    ],
 )
-@pytest.mark.parametrize(
-    "ctx_locality_domains,gen_locality_domains",
-    [(True, True), (True, False), (False, True)],
-    ids=["ld_both", "ld_ctx", "ld_gen"],
-)
-@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
 def test_cache_transceiver_locality_domains(
     monkeypatch, ctx_tp, gen_tp, ctx_locality_domains, gen_locality_domains, is_mla
 ):
@@ -1732,7 +1810,8 @@ def test_cache_transceiver_with_draft_layers():
 #   32, 33    : first stale_end=1 transition for win=24
 BOUNDARY_REQUEST_LENGTHS = [1, 7, 8, 9, 23, 24, 25, 32, 33]
 
-# Use a focused set of topologies to keep test count reasonable.
+# A focused set of topologies, each run under every window. TEST_CONFIGS leaves out tp2_pp1,
+# tp1_pp2 and tp2_to_pp2 because they run here.
 BOUNDARY_CONFIGS = [
     # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, is_mla, test_id)
     (1, 1, 1, 1, False, False, False, "tp1_pp1"),
