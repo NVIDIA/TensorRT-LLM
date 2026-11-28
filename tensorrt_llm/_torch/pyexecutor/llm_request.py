@@ -690,9 +690,9 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+        self._mrope_position_ids = SharedTensorContainer.from_tensor_bytes(
             mrope_position_ids).dump_to_dict()
-        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor_bytes(
             mrope_position_deltas).dump_to_dict()
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
@@ -1069,6 +1069,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
+        # Staging (including side-stream prefetch) can replace both request tensors.
+        self._host_mrope_positions: tuple[torch.Tensor,
+                                          torch.Tensor] | None = None
+        if mm_data and self.is_context_only_request:
+            mrope = mm_data.get("mrope_config") or {}
+            ids = mrope.get("mrope_position_ids")
+            deltas = mrope.get("mrope_position_deltas")
+            if ids is not None and deltas is not None:
+                self._host_mrope_positions = (ids.cpu(), deltas.cpu())
         self.py_min_length = self.sampling_config.min_tokens
         # Whether the sampler's in-graph fast tier can sample this request;
         # decided on first use (TorchSampler._can_use_fast_path) because it

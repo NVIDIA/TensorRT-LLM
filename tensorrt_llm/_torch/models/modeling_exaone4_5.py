@@ -111,6 +111,9 @@ except ImportError:
 
 
 class Exaone4_5InputProcessor(Qwen2VLInputProcessorBase):
+    # Plain RoPE: no mRoPE state (see get_mrope_config below).
+    uses_mrope = False
+
     def __init__(
         self,
         model_path: str,

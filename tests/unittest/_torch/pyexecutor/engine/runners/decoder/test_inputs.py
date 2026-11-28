@@ -47,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInpu
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.utils import (
@@ -54,9 +55,11 @@ from tensorrt_llm._torch.utils import (
     set_per_request_prefill_cuda_graph_flag,
 )
 from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalParams,
     strip_mm_data_for_generation,
 )
 from tensorrt_llm.llmapi import (
@@ -417,6 +420,51 @@ def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
     # back to the token the target just sampled.
     request.context_chunk_size = 3
     assert _get_context_prompt_lookahead_token(request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN
+
+
+@pytest.mark.cpu_only
+def test_context_only_mrope_is_exported_once_on_last_chunk() -> None:
+    """A chunked context-only prefill copies its mRoPE state for decode only once."""
+    position_ids = torch.arange(15).reshape(3, 1, 5)
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[10, 11, 12, 13, 14],
+        sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        py_multimodal_data={
+            "mrope_config": {
+                "mrope_position_ids": position_ids,
+                "mrope_position_deltas": torch.tensor([[-2]]),
+            }
+        },
+    )
+    export = Mock(wraps=request.py_result.set_mrope_position)
+    request.py_result.set_mrope_position = export
+    preparer = _input_preparer()
+    host = HostInputs(
+        use_mrope=True, mrope_dummy_seq_slot=0, extra_inputs=None, context_prompt_lookahead=None
+    )
+
+    # Prefetched tensors can already be staged before the first chunk. Meta
+    # tensors exercise that path on CPU-only CI and cannot be copied back.
+    request.py_multimodal_params.to_device("multimodal_data", "meta")
+    with (
+        patch.object(MultimodalParams, "to_device"),
+        patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected host copy")),
+    ):
+        for begin, end in ((0, 2), (2, 4), (4, 5)):
+            request.context_current_position = begin
+            request.context_chunk_size = end - begin
+            prompt_tokens = request.get_tokens(0)[begin:end]
+            preparer._pack_context_multimodal(host, request, begin, end, begin, prompt_tokens, 0)
+            assert export.call_count == (1 if end == 5 else 0)
+
+    exported = SharedTensorContainer.from_dict(request.py_result.mrope_position_ids_handle)
+    assert torch.equal(exported.get_local_view(), position_ids)
+    delta = SharedTensorContainer.from_dict(request.py_result.mrope_position_deltas_handle)
+    assert torch.equal(delta.get_local_view(), torch.tensor([[-2]]))
 
 
 @pytest.mark.cpu_only

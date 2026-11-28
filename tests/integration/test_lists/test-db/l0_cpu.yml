@@ -382,6 +382,8 @@ l0_cpu:
   - unittest/executor/test_undelivered_exports.py
   - unittest/grpc/openengine/test_coordinator.py
   - unittest/_torch/test_shared_tensor_cpu.py
+  - unittest/_torch/test_shared_tensor_bytes.py
+  - unittest/llmapi/test_generation_only_multimodal.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
   - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_image_routing.py
@@ -424,6 +426,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
   - unittest/llmapi/apps/test_musespark_tool_parser.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
+  - unittest/llmapi/apps/test_openai_disagg_multimodal_handoff.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_input_metrics.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
