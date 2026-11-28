@@ -218,6 +218,11 @@ public:
         DropRecorder const& dropRecorder = {}, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Dynamic cache level resizing. A localized GPU level is resized one domain at a time.
+    // The slot counts adjustCacheLevel(level, newQuota, ratioList, ...) would set (per domain on a
+    // localized level). adjustCacheLevel uses this too, so a caller can act on the plan (e.g.
+    // deregister a shrinking tail) before the resize and rely on it matching.
+    TypedVec<PoolGroupIndex, SlotCount> planCacheLevel(
+        CacheLevel level, std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList) const;
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
         TypedVec<PoolGroupIndex, float> const& ratioList,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages);
