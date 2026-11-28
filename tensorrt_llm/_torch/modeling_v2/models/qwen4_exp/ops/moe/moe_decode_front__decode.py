@@ -63,6 +63,9 @@ def compile_front(rows: int, hidden: int, row_stride: int, num_local: int, tile:
         and rows * TOP_K <= 32 * K_WARPS
         and row_stride % 8 == 0
         and row_stride >= hidden
+        # the kernel's tile: a power of two in [8, 256]
+        and 8 <= tile <= 256
+        and tile & (tile - 1) == 0
     ):
         _COMPILED[key] = None
         return False
@@ -115,11 +118,29 @@ def staging_buffer(device) -> torch.Tensor:
     return torch.zeros([32 * NUM_EXPERTS], dtype=torch.int32, device=device)
 
 
+def round_to_bf16(x: torch.Tensor) -> torch.Tensor:
+    """float64 `x` rounded once to the nearest bf16 (ties to even), as fp32. torch's own
+    float64 -> bf16 conversion goes through fp32 and so rounds twice: `1 + 2^-8 + 2^-25` comes
+    back as 1 (fp32 drops the `2^-25`, the midpoint left then rounds to even) instead of
+    `1 + 2^-7`."""
+    near = x.to(torch.bfloat16)  # within one bf16 step of the correct result
+    bits = near.view(torch.int16).to(torch.int32)
+    best = near.double()
+    for step in (-1, 1):
+        other = (bits + step).to(torch.int16).view(torch.bfloat16).double()
+        closer = (other - x).abs() < (best - x).abs()
+        tie = ((other - x).abs() == (best - x).abs()) & ((bits + step) % 2 == 0)
+        # only finite neighbours of the same sign are candidates
+        ok = torch.isfinite(other) & (torch.sign(other) * torch.sign(best) >= 0)
+        best = torch.where(ok & (closer | tie), other, best)
+    return torch.where(torch.isfinite(x), best, x).float()
+
+
 def reference_logits(x: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
     """The router logits `x @ router.T` (`x` `[T, H]`, `router` `[512, H]`) summed exactly
     (float64: an fp32 GEMM is TF32 under the containers' `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`)
-    and rounded once to bf16, returned as fp32."""
-    return (x.double() @ router.double().t()).float().to(torch.bfloat16).float()
+    and rounded once to bf16 (`round_to_bf16`), returned as fp32."""
+    return round_to_bf16(x.double() @ router.double().t())
 
 
 def logits_off_bound(logits: torch.Tensor, x: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
@@ -131,7 +152,11 @@ def logits_off_bound(logits: torch.Tensor, x: torch.Tensor, router: torch.Tensor
     ref = reference_logits(x, router)
     step = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0**-100))) - 7)
     sum_bound = (x.double().abs() @ router.double().abs().t()).float() * 2.0**-16
-    return (logits.float() - ref).abs() > 2 * step + sum_bound
+    got = logits.float()
+    # A NaN or infinite logit where the exact one is finite is off the bound (a comparison
+    # with NaN is false, so the difference test alone would let it through).
+    off_class = torch.isfinite(ref) & ~torch.isfinite(got)
+    return off_class | ((got - ref).abs() > 2 * step + sum_bound)
 
 
 def _cell(rows: int, offset: int, tile: int, why: str) -> Cell:
