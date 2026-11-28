@@ -1,0 +1,60 @@
+# Hyperdrive config: NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 on one B200, max throughput.
+# Stock-settings subset of the Hyperdrive B200 tuning (no source patches needed). Notes:
+# - CUDA graphs on up to batch 128 (the model card recipe ships cuda_graph_config: null).
+# - MTP with 3 draft tokens and lossless rejection sampling (non-greedy requests keep more drafts).
+# - 64K-token prefill chunks: fewer mixed prefill/decode steps at high concurrency.
+# - Block reuse with Mamba snapshots 1 and 576 tokens from the prompt end, for multi-turn chat. For traffic with no
+#   shared prefixes, enable_block_reuse: false is faster (the snapshot offsets split each prompt's prefill).
+stream_interval: 4
+trust_remote_code: true
+dtype: bfloat16
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+max_batch_size: 128
+max_num_tokens: 65536
+max_seq_len: 131072
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 6
+  - 8
+  - 12
+  - 16
+  - 24
+  - 32
+  - 48
+  - 64
+  - 96
+  - 128
+attn_backend: TRTLLM
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 0
+  mamba_ssm_cache_dtype: float16
+  mamba_ssm_stochastic_rounding: false
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  mamba_state_config:
+    enable_branch_snapshot: true
+    additional_snapshot_offsets_from_end:
+    - 1
+    - 576
+nvfp4_gemm_config:
+  allowed_backends:
+  - cutlass
+  - cublaslt
+  - cuda_core
+moe_config:
+  backend: CUTEDSL
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  use_rejection_sampling: true
+guided_decoding_backend: xgrammar
